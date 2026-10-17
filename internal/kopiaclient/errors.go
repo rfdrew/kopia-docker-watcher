@@ -40,8 +40,12 @@ var (
 	// ErrUnavailable: 408, 429, 502, 503, 504 or STORAGE_CONNECTION.
 	ErrUnavailable = errors.New("kopia server unavailable")
 	// ErrUnexpectedResponse: a successful status with a body that does not
-	// decode, or a null where an object is required.
+	// decode.
 	ErrUnexpectedResponse = errors.New("unexpected response from kopia server")
+
+	// ErrInvalidArgument: the call was rejected by the client before
+	// anything was sent.
+	ErrInvalidArgument = errors.New("invalid argument")
 )
 
 // API error codes, from kopia's internal/serverapi.
@@ -127,10 +131,10 @@ func (e *CertificateMismatchError) Error() string {
 }
 
 // IsRetryable reports whether a failed call may succeed later without a
-// configuration change: network errors, timeouts, NOT_CONNECTED, 5xx other
-// than a rejected policy. Credentials, CSRF, access, TLS verification and
-// request errors are not retryable. A canceled context is not retryable
-// either: the caller is shutting down.
+// configuration change: network errors and timeouts, NOT_CONNECTED, 5xx
+// other than a rejected policy. Credentials, CSRF, access, TLS verification,
+// request and argument errors are not retryable. A canceled context is not
+// retryable either: the caller is shutting down.
 func IsRetryable(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false
@@ -142,6 +146,11 @@ func IsRetryable(err error) bool {
 			errors.Is(apiErr.kind, ErrUnavailable)
 	}
 
+	var te *transportError
+	if !errors.As(err, &te) {
+		return false
+	}
+
 	var (
 		mismatch    *CertificateMismatchError
 		certVerify  *tls.CertificateVerificationError
@@ -150,15 +159,16 @@ func IsRetryable(err error) bool {
 		invalid     x509.CertificateInvalidError
 	)
 
-	if errors.As(err, &mismatch) || errors.As(err, &certVerify) || errors.As(err, &unknownAuth) ||
-		errors.As(err, &hostname) || errors.As(err, &invalid) {
-		return false
-	}
-
-	// Anything else is a transport problem: connection refused, reset,
-	// DNS, timeout.
-	return true
+	return !errors.As(err, &mismatch) && !errors.As(err, &certVerify) && !errors.As(err, &unknownAuth) &&
+		!errors.As(err, &hostname) && !errors.As(err, &invalid)
 }
+
+// transportError marks a failure to exchange a request with the server:
+// connection refused or reset, DNS, TLS, timeout.
+type transportError struct{ err error }
+
+func (e *transportError) Error() string { return e.err.Error() }
+func (e *transportError) Unwrap() error { return e.err }
 
 type errorBody struct {
 	Code  string `json:"code"`

@@ -258,13 +258,13 @@ func (c *Client) do(req *http.Request) (*response, error) {
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.DebugContext(req.Context(), "kopia request failed", "method", req.Method, "path", req.URL.Path, "error", err)
-		return nil, err
+		return nil, &transportError{err}
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
 	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		return nil, &transportError{fmt.Errorf("read response: %w", err)}
 	}
 
 	if len(body) > maxResponseSize {
