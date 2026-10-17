@@ -4,8 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
+	"net/http"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/version"
 )
@@ -19,41 +24,134 @@ func env(kv ...string) func(string) string {
 	return func(k string) string { return m[k] }
 }
 
-func TestRunVersion(t *testing.T) {
-	var stdout, stderr bytes.Buffer
+// validEnv points at a closed loopback port so the startup check of
+// kopia server fails fast without leaving the machine.
+func validEnv(extra ...string) func(string) string {
+	return env(append([]string{
+		"KOPIA_SERVER_URL", "http://127.0.0.1:1",
+		"KOPIA_SERVER_PASSWORD", "secret",
+	}, extra...)...)
+}
 
-	if code := run(t.Context(), []string{"version"}, env(), &stdout, &stderr); code != 0 {
-		t.Fatalf("exit code = %d, stderr: %s", code, stderr.String())
+// syncBuffer collects output written from several goroutines.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.b.String()
+}
+
+// memListener is an in-memory listener; the sandbox the tests may run in
+// does not allow binding ports.
+type memListener struct {
+	conns  chan net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newMemListener() *memListener {
+	return &memListener{conns: make(chan net.Conn), closed: make(chan struct{})}
+}
+
+func (l *memListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *memListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *memListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080} }
+
+func (l *memListener) dial(ctx context.Context, _, _ string) (net.Conn, error) {
+	client, server := net.Pipe()
+
+	select {
+	case l.conns <- server:
+		return client, nil
+	case <-l.closed:
+		return nil, syscall.ECONNREFUSED
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+type testDeps struct {
+	deps
+
+	stdout, stderr *syncBuffer
+	ln             *memListener
+	listenAddr     string
+}
+
+func newTestDeps(getenv func(string) string) *testDeps {
+	td := &testDeps{stdout: &syncBuffer{}, stderr: &syncBuffer{}, ln: newMemListener()}
+	td.deps = deps{
+		getenv: getenv,
+		stdout: td.stdout,
+		stderr: td.stderr,
+		listen: func(_, addr string) (net.Listener, error) {
+			td.listenAddr = addr
+			return td.ln, nil
+		},
+		httpClient: &http.Client{Transport: &http.Transport{DialContext: td.ln.dial}, Timeout: 5 * time.Second},
 	}
 
-	if got := strings.TrimSpace(stdout.String()); got != version.Version {
+	return td
+}
+
+func TestRunVersion(t *testing.T) {
+	td := newTestDeps(env())
+
+	if code := run(t.Context(), []string{"version"}, td.deps); code != 0 {
+		t.Fatalf("exit code = %d, stderr: %s", code, td.stderr)
+	}
+
+	if got := strings.TrimSpace(td.stdout.String()); got != version.Version {
 		t.Fatalf("stdout = %q, want %q", got, version.Version)
 	}
 }
 
 func TestRunUnknownCommand(t *testing.T) {
-	var stdout, stderr bytes.Buffer
+	td := newTestDeps(env())
 
-	if code := run(t.Context(), []string{"bogus"}, env(), &stdout, &stderr); code != 2 {
+	if code := run(t.Context(), []string{"bogus"}, td.deps); code != 2 {
 		t.Fatalf("exit code = %d, want 2", code)
 	}
 
-	if !strings.Contains(stderr.String(), `unknown command "bogus"`) {
-		t.Fatalf("stderr = %q", stderr.String())
+	if !strings.Contains(td.stderr.String(), `unknown command "bogus"`) {
+		t.Fatalf("stderr = %q", td.stderr)
 	}
 }
 
 func TestRunInvalidConfigLogsEachProblem(t *testing.T) {
-	var stdout, stderr bytes.Buffer
+	td := newTestDeps(env("KOPIA_EXEC_CONTAINER", "kopia", "LOG_LEVEL", "loud"))
 
-	code := run(t.Context(), nil, env("KOPIA_EXEC_CONTAINER", "kopia", "LOG_LEVEL", "loud"), &stdout, &stderr)
-	if code != 1 {
+	if code := run(t.Context(), nil, td.deps); code != 1 {
 		t.Fatalf("exit code = %d, want 1", code)
 	}
 
-	lines := jsonLines(t, stderr.Bytes())
+	lines := jsonLines(t, td.stderr.String())
 	if len(lines) != 3 {
-		t.Fatalf("got %d log lines, want 3 (url, exec container, log level):\n%s", len(lines), stderr.String())
+		t.Fatalf("got %d log lines, want 3 (url, exec container, log level):\n%s", len(lines), td.stderr)
 	}
 
 	for _, l := range lines {
@@ -64,43 +162,123 @@ func TestRunInvalidConfigLogsEachProblem(t *testing.T) {
 }
 
 func TestRunWatcherStartsAndStops(t *testing.T) {
-	var stdout, stderr bytes.Buffer
+	td := newTestDeps(validEnv("KOPIA_PASSWORD", "repo", "LISTEN_ADDR", "127.0.0.1:9090"))
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	code := run(ctx, []string{"run"}, env(
-		"KOPIA_SERVER_URL", "http://kopia:51515",
-		"KOPIA_SERVER_PASSWORD", "secret",
-		"KOPIA_PASSWORD", "repo",
-	), &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("exit code = %d, stderr: %s", code, stderr.String())
+	if code := run(ctx, []string{"run"}, td.deps); code != 0 {
+		t.Fatalf("exit code = %d, stderr: %s", code, td.stderr)
 	}
 
-	if strings.Contains(stderr.String(), "secret") {
-		t.Errorf("log leaks the password: %s", stderr.String())
+	if td.listenAddr != "127.0.0.1:9090" {
+		t.Errorf("listened on %q", td.listenAddr)
+	}
+
+	if strings.Contains(td.stderr.String(), "secret") {
+		t.Errorf("log leaks the password: %s", td.stderr)
 	}
 
 	var msgs []string
-	for _, l := range jsonLines(t, stderr.Bytes()) {
+	for _, l := range jsonLines(t, td.stderr.String()) {
 		msgs = append(msgs, l["level"].(string)+" "+l["msg"].(string))
 	}
 
-	if len(msgs) != 3 || !strings.HasPrefix(msgs[0], "WARN KOPIA_PASSWORD is ignored") ||
-		msgs[1] != "INFO starting kopia-docker-watcher" || msgs[2] != "INFO stopped" {
-		t.Errorf("unexpected log: %q", msgs)
+	want := []string{"WARN KOPIA_PASSWORD is ignored", "INFO starting kopia-docker-watcher", "INFO serving HTTP", "INFO stopped"}
+	if len(msgs) != len(want) {
+		t.Fatalf("log = %q, want %q", msgs, want)
+	}
+
+	for i := range want {
+		if !strings.HasPrefix(msgs[i], want[i]) {
+			t.Errorf("log line %d = %q, want %q", i, msgs[i], want[i])
+		}
 	}
 }
 
-func jsonLines(t *testing.T, b []byte) []map[string]any {
+func TestRunWatcherListenError(t *testing.T) {
+	td := newTestDeps(validEnv())
+	td.listen = func(string, string) (net.Listener, error) { return nil, syscall.EADDRINUSE }
+
+	if code := run(t.Context(), nil, td.deps); code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+
+	if !strings.Contains(td.stderr.String(), "cannot listen") {
+		t.Errorf("stderr = %s", td.stderr)
+	}
+}
+
+// The healthcheck subcommand probes the running watcher end to end.
+func TestHealthcheckAgainstRunningWatcher(t *testing.T) {
+	td := newTestDeps(validEnv())
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan int, 1)
+
+	go func() { done <- run(ctx, nil, td.deps) }()
+
+	var (
+		code int
+		hc   *testDeps
+	)
+
+	// The server starts serving right after Listen; retry briefly.
+	for range 50 {
+		hc = newTestDeps(env())
+		hc.httpClient = td.httpClient
+
+		if code = run(t.Context(), []string{"healthcheck"}, hc.deps); code == 0 {
+			break
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if code != 0 {
+		t.Errorf("healthcheck exit code = %d: %s", code, hc.stderr)
+	}
+
+	cancel()
+
+	if code := <-done; code != 0 {
+		t.Fatalf("watcher exit code = %d: %s", code, td.stderr)
+	}
+
+	// After shutdown nothing answers.
+	hc = newTestDeps(env())
+	hc.httpClient = td.httpClient
+
+	if code := run(t.Context(), []string{"healthcheck"}, hc.deps); code != 1 {
+		t.Errorf("healthcheck after shutdown exit code = %d", code)
+	}
+}
+
+func TestHealthcheckFailures(t *testing.T) {
+	td := newTestDeps(env("LISTEN_ADDR", "8080"))
+
+	if code := run(t.Context(), []string{"healthcheck"}, td.deps); code != 1 || !strings.Contains(td.stderr.String(), "invalid listen address") {
+		t.Errorf("bad LISTEN_ADDR: exit %d, stderr %s", code, td.stderr)
+	}
+
+	td = newTestDeps(env())
+	td.httpClient = &http.Client{Transport: &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) { return nil, syscall.ECONNREFUSED },
+	}}
+
+	if code := run(t.Context(), []string{"healthcheck"}, td.deps); code != 1 || !strings.Contains(td.stderr.String(), "127.0.0.1:8080") {
+		t.Errorf("nothing listening: exit %d, stderr %s", code, td.stderr)
+	}
+}
+
+func jsonLines(t *testing.T, s string) []map[string]any {
 	t.Helper()
 
 	var out []map[string]any
 
-	for _, line := range bytes.Split(bytes.TrimSpace(b), []byte("\n")) {
+	for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
 		var m map[string]any
-		if err := json.Unmarshal(line, &m); err != nil {
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
 			t.Fatalf("not a JSON log line: %q", line)
 		}
 

@@ -6,10 +6,12 @@ PKG     := github.com/rfdrew/kopia-docker-watcher
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X $(PKG)/internal/version.Version=$(VERSION)
 
+IMAGE   ?= kopia-docker-watcher:dev
+
 # Integration tests start kopia/kopia in Docker; KOPIA_IMAGE picks the release.
 KOPIA_IMAGE ?= kopia/kopia:0.23.1
 
-.PHONY: all build test test-integration lint fmt tidy clean
+.PHONY: all build test test-integration lint fmt tidy docker clean
 
 all: lint test build
 
@@ -30,6 +32,9 @@ fmt:
 
 tidy:
 	$(GO) mod tidy
+
+docker:
+	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE) .
 
 clean:
 	rm -rf bin
