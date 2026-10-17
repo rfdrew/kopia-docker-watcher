@@ -3,14 +3,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/config"
+	"github.com/rfdrew/kopia-docker-watcher/internal/kopiaclient"
 	"github.com/rfdrew/kopia-docker-watcher/internal/version"
 )
 
@@ -71,11 +74,47 @@ func runWatcher(ctx context.Context, getenv func(string) string, stderr io.Write
 
 	log.Info("starting kopia-docker-watcher", "version", version.Version, "config", cfg)
 
+	kopia, err := kopiaclient.New(kopiaclient.Options{
+		URL:                cfg.Kopia.URL,
+		Username:           cfg.Kopia.Username,
+		Password:           cfg.Kopia.Password,
+		CertFingerprint:    cfg.Kopia.CertFingerprint,
+		CAFile:             cfg.Kopia.CAFile,
+		InsecureSkipVerify: cfg.Kopia.InsecureSkipVerify,
+		UserAgent:          version.UserAgent(),
+		Logger:             log,
+	})
+	if err != nil {
+		log.Error("cannot create kopia server client", "error", err.Error())
+		return 1
+	}
+
+	checkKopia(ctx, log, kopia)
+
 	<-ctx.Done()
 
 	log.Info("stopped")
 
 	return 0
+}
+
+// checkKopia logs whether kopia server is reachable. Waiting for it with
+// retries is part of the reconcile loop.
+func checkKopia(ctx context.Context, log *slog.Logger, kopia *kopiaclient.Client) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	st, err := kopia.RepoStatus(ctx)
+
+	switch {
+	case errors.Is(err, context.Canceled):
+	case err != nil:
+		log.Warn("kopia server check failed", "error", err.Error(), "retryable", kopiaclient.IsRetryable(err))
+	case !st.Connected:
+		log.Warn("kopia server has no connected repository yet")
+	default:
+		log.Info("connected to kopia server", "hostname", st.Hostname, "username", st.Username, "storage", st.Storage)
+	}
 }
 
 // logConfigError logs every configuration problem on its own line.
