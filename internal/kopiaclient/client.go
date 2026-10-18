@@ -67,6 +67,10 @@ type Options struct {
 	UserAgent string
 	// Logger receives debug logs of requests; nothing is logged if nil.
 	Logger *slog.Logger
+
+	// Transport replaces the HTTP transport, for tests of packages that use
+	// the client. The TLS options must then be left empty.
+	Transport http.RoundTripper
 }
 
 // Client talks to one kopia server. It is safe for concurrent use.
@@ -84,6 +88,14 @@ type Client struct {
 
 // New creates a client. It does not contact the server.
 func New(opts Options) (*Client, error) {
+	if opts.Transport != nil {
+		if opts.CertFingerprint != "" || opts.CAFile != "" || opts.InsecureSkipVerify {
+			return nil, errors.New("kopia server client: TLS options cannot be combined with a custom transport")
+		}
+
+		return newClient(opts, opts.Transport)
+	}
+
 	tlsCfg, err := tlsConfig(opts)
 	if err != nil {
 		return nil, err

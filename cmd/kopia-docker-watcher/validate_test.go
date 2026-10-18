@@ -39,8 +39,14 @@ kopia.snapshot-on-stop   false
 kopia.description        (container name)
 kopia.tags               env:prod, app:web
 
+sources:
+  /data/ -> /data
+  /logs -> /logs
+
 warning: kopia.bogus: unknown label, ignored
 warning: kopia.snapshot-on-stop: "yes" is not a boolean, treated as false; use true or false
+
+kopia server checks skipped: KOPIA_SERVER_URL is not set, so cron expressions and the paths as kopia server sees them were not checked
 `
 	if stdout != want {
 		t.Errorf("stdout:\n%s\nwant:\n%s", stdout, want)
@@ -171,8 +177,43 @@ func TestValidate(t *testing.T) {
 			stdout: []string{`kopia.description "x\nerror: kopia.path: fake"`},
 		},
 		{name: "control character in name", args: []string{"kopia.enable\n=true"}, code: 2, stderr: []string{"invalid label name"}},
-		{name: "help", args: []string{"--help"}, code: 0, stdout: []string{"Usage: kopia-docker-watcher validate [--strict] label=value... | -"}},
-		{name: "short help", args: []string{"-h"}, code: 0, stdout: []string{"Usage: kopia-docker-watcher validate [--strict] label=value... | -"}},
+		{name: "help", args: []string{"--help"}, code: 0, stdout: []string{"kopia-docker-watcher validate [--strict] label=value... | -"}},
+		{name: "short help", args: []string{"-h"}, code: 0, stdout: []string{"kopia-docker-watcher validate [--strict] --all"}},
+		{
+			name:   "host prefix",
+			env:    env("HOST_PREFIX", "/host/"),
+			args:   []string{"kopia.enable=true", "kopia.path=/srv/app/,data"},
+			stdout: []string{"/srv/app/ -> /host/srv/app", "data -> /host/data"},
+		},
+		{
+			name:   "relative path without host prefix",
+			args:   []string{"kopia.enable=true", "kopia.path=/srv/app,data"},
+			code:   1,
+			stdout: []string{"/srv/app -> /srv/app", `error: kopia.path: "data" is not an absolute path; set an absolute path or HOST_PREFIX`},
+		},
+		{
+			name:   "path out of the host prefix",
+			env:    env("HOST_PREFIX", "/host"),
+			args:   []string{"kopia.enable=true", "kopia.path=../etc"},
+			code:   1,
+			stdout: []string{`error: kopia.path: "../etc" leads out of HOST_PREFIX /host`},
+		},
+		{
+			name:   "invalid host prefix",
+			env:    env("HOST_PREFIX", "host"),
+			args:   []string{"kopia.enable=true", "kopia.path=/data"},
+			code:   2,
+			stderr: []string{"HOST_PREFIX", "not an absolute path"},
+		},
+		{
+			name:   "server checks skipped",
+			args:   []string{"kopia.enable=true", "kopia.path=/data"},
+			stdout: []string{"kopia server checks skipped: KOPIA_SERVER_URL is not set, so cron expressions and the paths as kopia server sees them were not checked"},
+		},
+		{name: "all and container", args: []string{"--all", "--container", "web"}, code: 2, stderr: []string{"--all and --container cannot be combined"}},
+		{name: "labels and container", args: []string{"--container", "web", "kopia.enable=true"}, code: 2, stderr: []string{"labels cannot be given together with --all or --container"}},
+		{name: "labels and all", args: []string{"--all", "-"}, code: 2, stderr: []string{"labels cannot be given together"}},
+		{name: "empty container name", args: []string{"--container", " "}, code: 2, stderr: []string{"empty container name"}},
 	}
 
 	for _, tt := range tests {

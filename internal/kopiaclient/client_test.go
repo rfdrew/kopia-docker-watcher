@@ -295,6 +295,21 @@ func TestCanceledContextIsNotRetryable(t *testing.T) {
 	}
 }
 
+func TestNewWithTransport(t *testing.T) {
+	f := newFakeKopia()
+	f.handle("GET repo/status", statusRoute)
+
+	c, err := New(Options{URL: "http://kopia:51515", Username: "admin", Password: "secret", Transport: handlerTransport{f}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := c.RepoStatus(t.Context())
+	if err != nil || !st.Connected {
+		t.Fatalf("RepoStatus = %+v, %v", st, err)
+	}
+}
+
 func TestNewRejectsBadOptions(t *testing.T) {
 	for _, opts := range []Options{
 		{URL: "kopia:51515"},
@@ -303,6 +318,7 @@ func TestNewRejectsBadOptions(t *testing.T) {
 		{URL: "https://kopia", CertFingerprint: "abcd"},
 		{URL: "https://kopia", CertFingerprint: strings.Repeat("a", 64), InsecureSkipVerify: true},
 		{URL: "https://kopia", CAFile: "/nonexistent/ca.pem"},
+		{URL: "https://kopia", InsecureSkipVerify: true, Transport: errTransport{syscall.ECONNREFUSED}},
 	} {
 		if _, err := New(opts); err == nil {
 			t.Errorf("New(%+v): expected error", opts)

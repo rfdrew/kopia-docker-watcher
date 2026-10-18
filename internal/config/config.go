@@ -132,7 +132,12 @@ func Load(getenv func(string) string) (*Config, error) {
 	l.loadKopia(&cfg.Kopia)
 
 	if v := l.get(EnvHostPrefix); v != "" {
-		cfg.HostPrefix = l.absPath(EnvHostPrefix, strings.TrimRight(v, "/"))
+		p, err := ParseHostPrefix(v)
+		if err != nil {
+			l.errorf("%s: %v", EnvHostPrefix, err)
+		}
+
+		cfg.HostPrefix = p
 	}
 
 	if v := l.get(EnvLogLevel); v != "" {
@@ -319,6 +324,21 @@ func ParseLabelPrefix(s string) (string, error) {
 	}
 
 	return s, nil
+}
+
+// ParseHostPrefix checks a HOST_PREFIX value: empty, or an absolute path.
+// The result is clean and has no trailing slash, so "/" means no prefix.
+func ParseHostPrefix(s string) (string, error) {
+	s = strings.TrimRight(strings.TrimSpace(s), "/")
+	if s == "" {
+		return "", nil
+	}
+
+	if !path.IsAbs(s) {
+		return s, fmt.Errorf("%q is not an absolute path", s)
+	}
+
+	return path.Clean(s), nil
 }
 
 // LogValue implements slog.LogValuer. Secrets are never logged: only whether

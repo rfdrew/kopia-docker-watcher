@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/config"
+	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
 	"github.com/rfdrew/kopia-docker-watcher/internal/kopiaclient"
 	"github.com/rfdrew/kopia-docker-watcher/internal/metrics"
 	"github.com/rfdrew/kopia-docker-watcher/internal/version"
@@ -46,6 +47,11 @@ type deps struct {
 	listen func(network, address string) (net.Listener, error)
 	// httpClient is used by the healthcheck subcommand.
 	httpClient *http.Client
+	// newDocker connects to the Docker Engine, for validate.
+	newDocker func() (docker.Engine, io.Closer, error)
+	// kopiaTransport replaces the HTTP transport of the kopia server client
+	// of validate; nil means the default one.
+	kopiaTransport http.RoundTripper
 }
 
 func main() {
@@ -58,6 +64,7 @@ func main() {
 		listen: net.Listen,
 		// The probe goes to loopback; never through HTTP_PROXY.
 		httpClient: &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: healthcheckTimeout},
+		newDocker:  newDocker,
 	})
 
 	stop()
@@ -76,7 +83,7 @@ func run(ctx context.Context, args []string, d deps) int {
 	case "healthcheck":
 		return runHealthcheck(ctx, d)
 	case "validate":
-		return runValidate(args[1:], d)
+		return runValidate(ctx, args[1:], d)
 	case "version", "--version", "-version":
 		_, _ = fmt.Fprintln(d.stdout, version.Version)
 		return 0
@@ -87,6 +94,15 @@ func run(ctx context.Context, args []string, d deps) int {
 		_, _ = fmt.Fprintf(d.stderr, "unknown command %q\n\n%s", cmd, usage)
 		return 2
 	}
+}
+
+func newDocker() (docker.Engine, io.Closer, error) {
+	c, err := docker.New(version.UserAgent())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return c, c, nil
 }
 
 func newLogger(w io.Writer, level slog.Level) *slog.Logger {
