@@ -160,6 +160,11 @@ const (
 	// writes the same policy with PUT /api/v1/policy: the POST does not
 	// refresh kopia server, whose scheduler would not see the source's
 	// schedule for hours.
+	//
+	// An ErrConfig error of a registration means that kopia server stored
+	// nothing, so the reconciler forgets the intent it stored. Only the
+	// POST can fail that way: the PUT after it writes the policy the POST
+	// has just stored, so an error of that PUT is never ErrConfig.
 	ActionRegister
 
 	// ActionUpdate: the source is known and its policy has to be written,
