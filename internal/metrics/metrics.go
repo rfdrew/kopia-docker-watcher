@@ -36,7 +36,6 @@ func Handler() http.Handler {
 type Server struct {
 	srv *http.Server
 	ln  net.Listener
-	log *slog.Logger
 }
 
 // NewServer serves on ln until Shutdown.
@@ -50,15 +49,13 @@ func NewServer(ln net.Listener, log *slog.Logger) *Server {
 			IdleTimeout:       time.Minute,
 			ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 		},
-		ln:  ln,
-		log: log,
+		ln: ln,
 	}
 }
 
-// Serve blocks until Shutdown; it returns nil after a shutdown.
+// Serve blocks until Shutdown; it returns nil after a shutdown, also when
+// Shutdown came first.
 func (s *Server) Serve() error {
-	s.log.Info("serving HTTP", "addr", s.ln.Addr().String())
-
 	if err := s.srv.Serve(s.ln); !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("serve HTTP: %w", err)
 	}

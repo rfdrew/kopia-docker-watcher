@@ -127,6 +127,8 @@ func runWatcher(ctx context.Context, d deps) int {
 	srv := metrics.NewServer(ln, log)
 	serveErr := make(chan error, 1)
 
+	log.Info("serving HTTP", "addr", ln.Addr().String())
+
 	go func() { serveErr <- srv.Serve() }()
 
 	checkKopia(ctx, log, kopia)
@@ -136,6 +138,8 @@ func runWatcher(ctx context.Context, d deps) int {
 	select {
 	case <-ctx.Done():
 	case err := <-serveErr:
+		serveErr = nil
+
 		log.Error("HTTP server failed", "error", err.Error())
 
 		code = 1
@@ -146,6 +150,15 @@ func runWatcher(ctx context.Context, d deps) int {
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Warn("HTTP server shutdown", "error", err.Error())
+	}
+
+	// Nothing started here outlives runWatcher.
+	if serveErr != nil {
+		if err := <-serveErr; err != nil {
+			log.Error("HTTP server failed", "error", err.Error())
+
+			code = 1
+		}
 	}
 
 	log.Info("stopped")
