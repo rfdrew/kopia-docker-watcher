@@ -225,8 +225,8 @@ func (s TaskStatus) IsFinished() bool {
 }
 
 // TaskInfo describes a running or finished task. Kopia keeps the 50 most
-// recent finished tasks in memory; IDs restart from 1 when kopia server
-// restarts.
+// recent finished tasks in memory; IDs, a counter in hexadecimal, restart
+// from 1 when kopia server restarts.
 type TaskInfo struct {
 	ID        string     `json:"id"`
 	StartTime time.Time  `json:"startTime"`

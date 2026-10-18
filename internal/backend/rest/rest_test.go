@@ -1095,7 +1095,9 @@ func TestTriggerSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := backend.SnapshotTicket{Source: s, TriggeredAt: now, LastSnapshotStart: start, TasksBefore: []string{"3", "6"}}
+	// The newest task of any kind marks the trigger: task IDs are
+	// hexadecimal.
+	want := backend.SnapshotTicket{Source: s, TriggeredAt: now, LastSnapshotStart: start, TasksBefore: []string{"3", "6"}, LastTaskID: "7"}
 	if !reflect.DeepEqual(ticket, want) {
 		t.Errorf("ticket = %+v\nwant %+v", ticket, want)
 	}

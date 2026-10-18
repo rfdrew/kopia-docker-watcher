@@ -327,6 +327,22 @@ func TestIntegrationSnapshots(t *testing.T) {
 			t.Skip("no task from the first subtest")
 		}
 
+		// A run queued before the restart, still without a task: the
+		// ticket marks the newest task kopia server listed.
+		tasks, err := c.ListTasks(ctx)
+		if err != nil || len(tasks) == 0 {
+			t.Fatalf("tasks = %+v, %v", tasks, err)
+		}
+
+		queued := backend.SnapshotTicket{Source: source("/data/snap"), TriggeredAt: time.Now(),
+			LastTaskID: tasks[0].ID, LastTaskStart: tasks[0].StartTime}
+
+		for _, tk := range tasks {
+			if isTaskOf(tk, queued.Source) {
+				queued.TasksBefore = append(queued.TasksBefore, tk.ID)
+			}
+		}
+
 		s.Restart(t)
 		waitConnected(t, c)
 
@@ -334,6 +350,12 @@ func TestIntegrationSnapshots(t *testing.T) {
 		res, err := b.WaitSnapshot(ctx, known, nil)
 		if err != nil || res.Outcome != backend.SnapshotUnknown {
 			t.Errorf("result = %+v, %v", res, err)
+		}
+
+		// And the queued run, which the new kopia server has not heard of.
+		res, err = b.WaitSnapshot(ctx, queued, nil)
+		if err != nil || res.Outcome != backend.SnapshotUnknown || !strings.Contains(res.Error, "restarted since the trigger") {
+			t.Errorf("queued before the restart: %+v, %v", res, err)
 		}
 
 		// Snapshots survive, and so does the lifecycle.

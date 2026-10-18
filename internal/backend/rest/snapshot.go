@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,11 +22,10 @@ const (
 	defaultPollMin = time.Second
 	defaultPollMax = 30 * time.Second
 
-	// idlePolls is how many polls in a row must find the source neither
-	// pending nor uploading, and no task of the run, before WaitSnapshot
-	// takes the run for dropped. Between the end of one run and the start
-	// of the run queued after it, kopia server shows the source idle for a
-	// moment.
+	// idlePolls is how many polls in a row must find no task of the run
+	// and nothing the run could be queued behind before WaitSnapshot takes
+	// the run for dropped. Between the end of one run and the start of the
+	// run queued after it, kopia server shows the source idle for a moment.
 	idlePolls = 2
 
 	// clockSkew is how much earlier than the ticket's TriggeredAt, by the
@@ -39,15 +39,19 @@ const (
 	maxErrorLines = 5
 )
 
-// incompleteCheckpoint is the incomplete reason of the intermediate
-// snapshots kopia server saves during a long upload.
-const incompleteCheckpoint = "checkpoint"
+// Incomplete reasons of kopia server's snapshots: intermediate snapshots of
+// a long upload, and what a canceled upload had read.
+const (
+	incompleteCheckpoint = "checkpoint"
+	incompleteCanceled   = "canceled"
+)
 
 // TriggerSnapshot implements backend.Backend with sources/upload, which
 // queues a run of the source and returns no task ID. Before the upload the
-// ticket records the start of the source's last snapshot and the IDs of the
-// source's snapshot tasks kopia server lists, so that WaitSnapshot can tell
-// the run's task from earlier ones.
+// ticket records the start of the source's last snapshot, the IDs of the
+// source's snapshot tasks kopia server lists, and the newest task of any
+// kind, so that WaitSnapshot can tell the run's task from earlier ones and
+// notice a restart of kopia server.
 //
 // While the source is pending or uploading, kopia server queues at most one
 // run after the current one, so a trigger then may merge with a run queued
@@ -56,25 +60,21 @@ const incompleteCheckpoint = "checkpoint"
 // after the trigger all the same.
 //
 // A source kopia server has not picked up yet is ErrTemporary, as after a
-// policy write whose refresh failed. A source kopia server does not
-// snapshot is an error of neither kind: its repository is connected
-// read-only (status REMOTE), or the source is paused through the control
-// API (PAUSED), which makes kopia server drop a queued run.
+// policy write whose refresh failed. A source of a repository connected
+// read-only (status REMOTE) is an error of neither kind: kopia server does
+// not snapshot it. A source paused through the control API is triggered all
+// the same, since its status does not tell: kopia server shows PAUSED only
+// once it has dropped a run, and still after the source is resumed. A run it
+// drops is SnapshotUnknown to WaitSnapshot.
 func (b *Backend) TriggerSnapshot(ctx context.Context, src backend.Source) (backend.SnapshotTicket, error) {
 	status, err := b.lookup(ctx, opTriggerSnapshot, src)
 	if err != nil {
 		return backend.SnapshotTicket{}, err
 	}
 
-	if status != nil {
-		switch status.Status {
-		case kopiaclient.SourceStatusRemote:
-			return backend.SnapshotTicket{}, &backend.Error{Op: opTriggerSnapshot, Source: src,
-				Err: errors.New("kopia server does not snapshot the source: its repository is connected read-only")}
-		case backend.StatusPaused:
-			return backend.SnapshotTicket{}, &backend.Error{Op: opTriggerSnapshot, Source: src,
-				Err: errors.New("kopia server does not snapshot the source: it is paused through the control API")}
-		}
+	if status != nil && status.Status == kopiaclient.SourceStatusRemote {
+		return backend.SnapshotTicket{}, &backend.Error{Op: opTriggerSnapshot, Source: src,
+			Err: errors.New("kopia server does not snapshot the source: its repository is connected read-only")}
 	}
 
 	tasks, err := b.client.ListTasks(ctx)
@@ -82,15 +82,22 @@ func (b *Backend) TriggerSnapshot(ctx context.Context, src backend.Source) (back
 		return backend.SnapshotTicket{}, fail(ctx, opTriggerSnapshot, src, reqRead, err)
 	}
 
-	ticket := backend.SnapshotTicket{Source: src, TriggeredAt: b.now()}
+	ticket := backend.SnapshotTicket{Source: src, TriggeredAt: b.now(), LastTaskID: "0"}
 
 	if status != nil && status.LastSnapshot != nil {
 		ticket.LastSnapshotStart = status.LastSnapshot.StartTime
 	}
 
+	var newest uint64
+
 	for _, t := range tasks {
 		if isTaskOf(t, src) {
 			ticket.TasksBefore = append(ticket.TasksBefore, t.ID)
+		}
+
+		if id, ok := taskNumber(t.ID); ok && id > newest {
+			newest = id
+			ticket.LastTaskID, ticket.LastTaskStart = t.ID, t.StartTime
 		}
 	}
 
@@ -120,6 +127,14 @@ func isTaskOf(t kopiaclient.TaskInfo, src backend.Source) bool {
 	return err == nil
 }
 
+// taskNumber returns the number of a task ID: kopia server numbers its
+// tasks with a counter it prints in hexadecimal.
+func taskNumber(id string) (uint64, bool) {
+	n, err := strconv.ParseUint(id, 16, 64)
+
+	return n, err == nil
+}
+
 // WaitSnapshot implements backend.Backend by polling kopia server, at
 // intervals that grow from one second to 30 seconds.
 //
@@ -127,29 +142,43 @@ func isTaskOf(t kopiaclient.TaskInfo, src backend.Source) bool {
 // (GET /api/v1/sources) and then the task list (GET /api/v1/tasks), in this
 // order, so that a run which starts in between shows in the list. The run's
 // task is the earliest snapshot task of the source that is not one of the
-// ticket's TasksBefore and started at TriggeredAt or later, give or take
-// clockSkew between the watcher's clock and kopia server's. The source's
-// currentTask is not used: it names whatever run is uploading, which may
-// have started before the trigger. While there is no such task, the run is
-// queued if the source is pending (waiting for an upload slot, with no task
-// yet) or uploading (the run before it). When idlePolls polls in a row find
-// the source in another state, or unknown to kopia server, kopia server has
-// dropped the run, as it does when it restarts, and the outcome is
-// SnapshotUnknown.
+// ticket's TasksBefore, is newer than LastTaskID and started at TriggeredAt
+// or later, give or take clockSkew between the watcher's clock and kopia
+// server's. The source's currentTask is not used: it names whatever run is
+// uploading, which may have started before the trigger.
+//
+// kopia server keeps queued runs in memory only and numbers its tasks anew
+// when it restarts. A list without LastTaskID or a newer task, with another
+// task under that ID, or whose run's task is numbered below it shows a
+// restart, and the outcome is SnapshotUnknown. So it is when the list has
+// lost tasks newer than LastTaskID (it keeps the 50 latest finished ones)
+// and the source has a snapshot that started after the trigger but before
+// the task found: the run's own task is among the lost ones.
+//
+// Without the run's task, the run is queued while the source is pending
+// (waiting for an upload slot, with no task yet) or uploading (the run
+// before it). The other states of a source between two runs (FAILED after a
+// failed refresh, INITIALIZING) can hide a pending run too, but only while a
+// snapshot task holds an upload slot. When idlePolls polls in a row find
+// neither, kopia server has dropped the run, as it does for a source paused
+// through the control API, and the outcome is SnapshotUnknown.
 //
 // Once found, the task goes into the ticket, which is passed to save, and
-// later polls read the task alone (GET /api/v1/tasks/{id}). kopia server
-// keeps the 50 latest finished tasks and numbers tasks anew when it
-// restarts, so a task that is gone, or whose ID has another description
-// now, is SnapshotUnknown too.
+// later polls read the task alone (GET /api/v1/tasks/{id}). A task that is
+// gone, or whose ID has another description now, is SnapshotUnknown too.
 //
 // The snapshot of a task that succeeded is looked up among the source's
 // snapshots (GET /api/v1/snapshots with all=1): the earliest that is not a
-// checkpoint and started between the start and the end of the task. None
-// means that kopia server skipped a snapshot identical to the last one
-// (SnapshotIdentical). One that is incomplete, or has errors the policy
-// does not ignore, is SnapshotIncomplete. The error message of a failed
-// task comes with the error lines of its log (GET
+// checkpoint and started between the start and the end of the task. One
+// that is incomplete, or has errors the policy does not ignore, is
+// SnapshotIncomplete; one of an upload canceled through sources/upload's
+// cancel or a pause, SnapshotCanceled. None means that kopia server
+// skipped a snapshot identical to the last one (SnapshotIdentical), unless
+// the task never uploaded (kopia server stopped the source before the run
+// could start) or the source has no earlier snapshot the run could be
+// identical to (the snapshot was deleted since): those are SnapshotUnknown.
+// A canceled task's snapshot is looked up the same way. The error message
+// of a failed task comes with the error lines of its log (GET
 // /api/v1/tasks/{id}/logs), if the log can be read.
 //
 // A request that fails ends the wait with its error, of the kinds of a
@@ -175,21 +204,27 @@ func (b *Backend) WaitSnapshot(ctx context.Context, ticket backend.SnapshotTicke
 				return backend.SnapshotResult{}, fail(ctx, opWaitSnapshot, src, reqRead, err)
 			}
 
-			task = runTask(tasks, ticket)
+			var lost string
+
+			if task, lost, err = b.findRun(ctx, tasks, ticket); err != nil {
+				return backend.SnapshotResult{}, err
+			}
 
 			switch {
+			case lost != "":
+				return backend.SnapshotResult{Outcome: backend.SnapshotUnknown, Error: lost}, nil
 			case task != nil:
 				ticket.TaskID, ticket.TaskDescription = task.ID, task.Description
 
 				if save != nil {
 					save(ticket)
 				}
-			case isQueued(status):
+			case isQueued(status, tasks):
 				idle = 0
 			default:
 				if idle++; idle >= idlePolls {
 					return backend.SnapshotResult{Outcome: backend.SnapshotUnknown,
-						Error: "kopia server dropped the run: no task of it, and the source is neither pending nor uploading"}, nil
+						Error: "kopia server dropped the run: no task of it, and nothing it could be queued behind"}, nil
 				}
 			}
 		} else {
@@ -228,10 +263,100 @@ func (b *Backend) WaitSnapshot(ctx context.Context, ticket backend.SnapshotTicke
 	}
 }
 
-// runTask returns the task of the ticket's run from a task list: the
-// earliest snapshot task of the source that is not one of TasksBefore and
-// did not start before the trigger. Of tasks that started at the same time,
-// the one kopia server created first, listed later, is taken.
+// findRun returns the task of the ticket's run from a task list, nil if
+// the run has not started; lost says why the run cannot be followed any
+// more.
+func (b *Backend) findRun(ctx context.Context, tasks []kopiaclient.TaskInfo, ticket backend.SnapshotTicket) (run *kopiaclient.TaskInfo, lost string, err error) {
+	anchor, anchored := taskNumber(ticket.LastTaskID)
+
+	if anchored && anchor > 0 {
+		if lost := restarted(tasks, anchor, ticket); lost != "" {
+			return nil, lost, nil
+		}
+	}
+
+	run = runTask(tasks, ticket)
+	if run == nil || !anchored {
+		return run, "", nil
+	}
+
+	id, ok := taskNumber(run.ID)
+
+	switch {
+	case !ok:
+		return run, "", nil
+	case id <= anchor:
+		return nil, fmt.Sprintf("kopia server restarted since the trigger and lost the run: the task %s of the source is numbered below the trigger's %s",
+			run.ID, ticket.LastTaskID), nil
+	case !gap(tasks, anchor, id):
+		return run, "", nil
+	}
+
+	// kopia server no longer lists every task since the trigger: the
+	// run's own task may be among those, and run a later run's.
+	snaps, err := b.snapshots(ctx, opWaitSnapshot, ticket.Source)
+	if err != nil {
+		return nil, "", err
+	}
+
+	since := ticket.TriggeredAt.Add(-clockSkew)
+
+	for _, s := range snaps {
+		if s.IncompleteReason != incompleteCheckpoint && !s.StartTime.Before(since) && s.StartTime.Before(run.StartTime) {
+			return nil, fmt.Sprintf("kopia server no longer lists the run's task: the source has a snapshot of %s, before task %s",
+				s.StartTime.Format(time.RFC3339), run.ID), nil
+		}
+	}
+
+	return run, "", nil
+}
+
+// restarted returns why a task list shows that kopia server restarted
+// since a trigger whose newest task was anchor; "" if it does not. Within
+// one run of kopia server the anchor task stays listed until 50 newer
+// tasks have finished, and nothing gets its ID.
+func restarted(tasks []kopiaclient.TaskInfo, anchor uint64, ticket backend.SnapshotTicket) string {
+	var newest uint64
+
+	for _, t := range tasks {
+		id, ok := taskNumber(t.ID)
+		if !ok {
+			continue
+		}
+
+		if id == anchor && !t.StartTime.Equal(ticket.LastTaskStart) {
+			return fmt.Sprintf("kopia server restarted since the trigger and lost the run: task %s is another task now", t.ID)
+		}
+
+		newest = max(newest, id)
+	}
+
+	if newest < anchor {
+		return fmt.Sprintf("kopia server restarted since the trigger and lost the run: it lists no task as new as task %s", ticket.LastTaskID)
+	}
+
+	return ""
+}
+
+// gap reports whether some task numbered between from and to, both
+// excluded, is missing from the list: kopia server dropped it with the
+// oldest finished tasks.
+func gap(tasks []kopiaclient.TaskInfo, from, to uint64) bool {
+	var listed uint64
+
+	for _, t := range tasks {
+		if id, ok := taskNumber(t.ID); ok && id > from && id < to {
+			listed++
+		}
+	}
+
+	return listed < to-from-1
+}
+
+// runTask returns the earliest snapshot task of the ticket's source that is
+// not one of TasksBefore and did not start before the trigger. Of tasks
+// that started at the same time, the one kopia server created first,
+// listed later, is taken.
 func runTask(tasks []kopiaclient.TaskInfo, ticket backend.SnapshotTicket) *kopiaclient.TaskInfo {
 	since := ticket.TriggeredAt.Add(-clockSkew)
 
@@ -252,22 +377,28 @@ func runTask(tasks []kopiaclient.TaskInfo, ticket backend.SnapshotTicket) *kopia
 	return run
 }
 
-// isQueued reports whether a run triggered before may still start: the
-// source waits for an upload slot or uploads. Any state but those of an
-// idle or stopped source counts, since kopia server passes through others,
-// such as FAILED when it cannot refresh the source's status, on its way
-// from one run to the next.
-func isQueued(status *backend.SourceStatus) bool {
+// isQueued reports whether a run triggered before may still start. It may
+// while the source waits for an upload slot or uploads the run before. A
+// source idle, paused, stopped, read-only or unknown to kopia server has
+// no run queued. Any other state is one kopia server shows between runs,
+// or after a refresh of the source's status failed, which hides a pending
+// run until it starts: a run can only be pending while a snapshot task
+// holds an upload slot.
+func isQueued(status *backend.SourceStatus, tasks []kopiaclient.TaskInfo) bool {
 	if status == nil {
 		return false
 	}
 
 	switch status.Status {
+	case backend.StatusPending, backend.StatusUploading:
+		return true
 	case backend.StatusIdle, backend.StatusPaused, backend.StatusStopped, kopiaclient.SourceStatusRemote:
 		return false
-	default:
-		return true
 	}
+
+	return slices.ContainsFunc(tasks, func(t kopiaclient.TaskInfo) bool {
+		return t.Kind == kopiaclient.TaskKindSnapshot && (t.Status == kopiaclient.TaskRunning || t.Status == kopiaclient.TaskCanceling)
+	})
 }
 
 // gone is the outcome of a run whose task kopia server no longer lists.
@@ -289,19 +420,32 @@ func (b *Backend) outcome(ctx context.Context, src backend.Source, task *kopiacl
 	case kopiaclient.TaskFailed:
 		return backend.SnapshotResult{Outcome: backend.SnapshotFailed, TaskID: task.ID, Error: b.failure(ctx, src, task)}, true, nil
 	case kopiaclient.TaskCanceled:
-		return backend.SnapshotResult{Outcome: backend.SnapshotCanceled, TaskID: task.ID, Error: "the task was canceled"}, true, nil
+		// Canceled through tasks/{id}/cancel; the upload saved what it had
+		// read, as when canceled through sources/cancel.
+		snap, _, err := b.taskSnapshot(ctx, src, task)
+		if err != nil {
+			return backend.SnapshotResult{}, true, err
+		}
+
+		res = backend.SnapshotResult{Outcome: backend.SnapshotCanceled, TaskID: task.ID, Error: "the task was canceled"}
+		if snap != nil {
+			res.Snapshot = fromSnapshot(*snap)
+		}
+
+		return res, true, nil
 	default:
 		return backend.SnapshotResult{}, true, &backend.Error{Op: opWaitSnapshot, Source: src,
 			Err: fmt.Errorf("%w: task %s has the status %q", kopiaclient.ErrUnexpectedResponse, task.ID, task.Status)}
 	}
 }
 
-// saved returns the outcome of a task that succeeded, from the snapshot it
-// saved.
-func (b *Backend) saved(ctx context.Context, src backend.Source, task *kopiaclient.TaskInfo) (backend.SnapshotResult, error) {
+// taskSnapshot returns the snapshot a task saved: the earliest that is not
+// a checkpoint and started within the task, nil if none did. It returns
+// the source's snapshots too.
+func (b *Backend) taskSnapshot(ctx context.Context, src backend.Source, task *kopiaclient.TaskInfo) (*kopiaclient.Snapshot, []kopiaclient.Snapshot, error) {
 	snaps, err := b.snapshots(ctx, opWaitSnapshot, src)
 	if err != nil {
-		return backend.SnapshotResult{}, err
+		return nil, nil, err
 	}
 
 	var snap *kopiaclient.Snapshot
@@ -319,13 +463,27 @@ func (b *Backend) saved(ctx context.Context, src backend.Source, task *kopiaclie
 		}
 	}
 
+	return snap, snaps, nil
+}
+
+// saved returns the outcome of a task that succeeded, from the snapshot it
+// saved.
+func (b *Backend) saved(ctx context.Context, src backend.Source, task *kopiaclient.TaskInfo) (backend.SnapshotResult, error) {
+	snap, snaps, err := b.taskSnapshot(ctx, src, task)
+	if err != nil {
+		return backend.SnapshotResult{}, err
+	}
+
 	if snap == nil {
-		return backend.SnapshotResult{Outcome: backend.SnapshotIdentical, TaskID: task.ID}, nil
+		return unsaved(task, snaps), nil
 	}
 
 	res := backend.SnapshotResult{Outcome: backend.SnapshotSucceeded, TaskID: task.ID, Snapshot: fromSnapshot(*snap)}
 
 	switch {
+	case snap.IncompleteReason == incompleteCanceled:
+		res.Outcome = backend.SnapshotCanceled
+		res.Error = "the upload was canceled: the snapshot is incomplete"
 	case snap.IncompleteReason != "":
 		res.Outcome = backend.SnapshotIncomplete
 		res.Error = "the snapshot is incomplete: " + snap.IncompleteReason
@@ -337,10 +495,34 @@ func (b *Backend) saved(ctx context.Context, src backend.Source, task *kopiaclie
 	return res, nil
 }
 
-// entryErrors describes the errors of a snapshot with the first failed
-// entries.
+// unsaved returns the outcome of a task that succeeded without a snapshot.
+// kopia server skips a snapshot identical to the latest one, but a run
+// whose source it stopped while the run waited for an upload slot ends the
+// same way without uploading anything, and so it reports no counters; and
+// a snapshot may have been deleted since, by the retention of a later run.
+func unsaved(task *kopiaclient.TaskInfo, snaps []kopiaclient.Snapshot) backend.SnapshotResult {
+	res := backend.SnapshotResult{Outcome: backend.SnapshotUnknown, TaskID: task.ID}
+
+	switch {
+	case len(task.Counters) == 0:
+		res.Error = "the task ended without uploading: kopia server stopped the source before the run"
+	case !slices.ContainsFunc(snaps, func(s kopiaclient.Snapshot) bool { return s.StartTime.Before(task.StartTime) }):
+		res.Error = "the task saved no snapshot, and the source has none it could be identical to: the snapshot has been deleted since"
+	default:
+		res.Outcome = backend.SnapshotIdentical
+	}
+
+	return res
+}
+
+// entryErrors describes the errors of a snapshot. kopia server lists the
+// entries that failed with the errors the policy ignores, and tells them
+// apart only by count.
 func entryErrors(sum *kopiaclient.DirectorySummary) string {
-	msg := fmt.Sprintf("the snapshot has %d errors", sum.FatalErrorCount)
+	msg := "the snapshot has " + count(sum.FatalErrorCount, "error")
+	if sum.IgnoredErrorCount > 0 {
+		msg += fmt.Sprintf(" and %d ignored", sum.IgnoredErrorCount)
+	}
 
 	lines := make([]string, 0, maxErrorLines)
 
@@ -353,10 +535,24 @@ func entryErrors(sum *kopiaclient.DirectorySummary) string {
 	}
 
 	if len(lines) > 0 {
-		msg += ": " + strings.Join(lines, "; ")
+		which := "failed entries"
+		if sum.IgnoredErrorCount > 0 {
+			which += ", ignored ones included"
+		}
+
+		msg += "; " + which + ": " + strings.Join(lines, "; ")
 	}
 
 	return msg
+}
+
+// count returns n and noun, in the plural unless n is 1.
+func count(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+
+	return fmt.Sprintf("%d %ss", n, noun)
 }
 
 // failure returns the error of a failed task: its error message and the

@@ -263,7 +263,7 @@ func (c *Client) DeleteSnapshots(ctx context.Context, req DeleteSnapshotsRequest
 	return c.call(ctx, request{method: http.MethodPost, path: "snapshots/delete", body: req}, nil)
 }
 
-// taskIDRE matches kopia task IDs, decimal counters, and keeps anything
+// taskIDRE matches kopia task IDs, hexadecimal counters, and keeps anything
 // that would need escaping out of the URL path.
 var taskIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
