@@ -11,9 +11,12 @@ import (
 // it meanwhile marks it, and done queues it again, so a change seen during
 // a pass is never lost and two passes over one path never overlap.
 //
-// addAfter queues a path later. Of several delayed adds of one path the
-// earliest wins; a delayed add is never canceled, since an extra pass does
-// no harm.
+// A path can also wait for a delayed add, one per path. addAfter queues a
+// path later; of several delayed adds of one path the earliest wins. A
+// retry after a temporary error (retryAfter) takes precedence: until it is
+// due, delayed and full-reconcile adds of the path wait for it, so events
+// do not cut the growing retry delay short; the retry pass reads
+// everything afresh anyway.
 type queue struct {
 	mu sync.Mutex
 	// ready holds the queued paths in order; queued is the same set.
@@ -37,6 +40,8 @@ type queue struct {
 type delayed struct {
 	due   time.Time
 	timer *time.Timer
+	// retry marks the retry after a temporary error.
+	retry bool
 }
 
 func newQueue() *queue {
@@ -69,37 +74,64 @@ func (q *queue) addLocked(p string) {
 	}
 }
 
-// addAfter queues p after d, unless an earlier delayed add of p is
-// pending. A d of zero or less queues p now.
-func (q *queue) addAfter(p string, d time.Duration) {
-	if d <= 0 {
-		q.add(p)
-		return
-	}
-
+// addUnlessRetrying queues p now, unless p waits for a retry: a full
+// reconcile does not cut a retry delay short. A path whose pass is running
+// is marked to be queued again, since that pass may have read the
+// containers before the change the full reconcile is about; done drops
+// the mark if the pass ends in a retry.
+func (q *queue) addUnlessRetrying(p string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if q.closed {
+	if w, ok := q.waiting[p]; ok && w.retry {
 		return
 	}
 
-	due := time.Now().Add(d)
+	q.addLocked(p)
+}
 
+// addAfter queues p after d, unless an earlier delayed add of p or a retry
+// is pending. A d of zero or less queues p now, unless it waits for a
+// retry.
+func (q *queue) addAfter(p string, d time.Duration) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	w, ok := q.waiting[p]
+
+	switch {
+	case q.closed:
+	case ok && w.retry:
+	case d <= 0:
+		q.addLocked(p)
+	case !ok || time.Now().Add(d).Before(w.due):
+		q.arm(p, d, false)
+	}
+}
+
+// retryAfter queues p after d for a retry, in place of any delayed add of
+// p.
+func (q *queue) retryAfter(p string, d time.Duration) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if !q.closed {
+		q.arm(p, max(d, time.Nanosecond), true)
+	}
+}
+
+// arm sets the delayed add of p. q.mu is held.
+func (q *queue) arm(p string, d time.Duration, retry bool) {
 	if w, ok := q.waiting[p]; ok {
-		if !due.Before(w.due) {
-			return
-		}
-
 		w.timer.Stop()
 	}
 
-	w := &delayed{due: due}
+	w := &delayed{due: time.Now().Add(d), retry: retry}
 	w.timer = time.AfterFunc(d, func() { q.fire(p, w) })
 	q.waiting[p] = w
 }
 
-// fire queues p when its delayed add w is due, unless an earlier one has
+// fire queues p when its delayed add w is due, unless another one has
 // replaced it: a timer that Stop could not stop any more must not drop the
 // one that replaced it.
 func (q *queue) fire(p string, w *delayed) {
@@ -120,7 +152,7 @@ func (q *queue) get(ctx context.Context) (string, bool) {
 	for {
 		q.mu.Lock()
 
-		if q.closed {
+		if q.closed || ctx.Err() != nil {
 			// Pass the signal on to the next waiting worker.
 			q.signal()
 			q.mu.Unlock()
@@ -154,15 +186,21 @@ func (q *queue) get(ctx context.Context) (string, bool) {
 	}
 }
 
-// done ends the pass over p and queues p again if it was added meanwhile.
+// done ends the pass over p and queues p again if it was added meanwhile,
+// unless p now waits for a retry, whose pass reads everything afresh.
 func (q *queue) done(p string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	delete(q.processing, p)
 
-	if q.dirty[p] {
-		delete(q.dirty, p)
+	if !q.dirty[p] {
+		return
+	}
+
+	delete(q.dirty, p)
+
+	if w, ok := q.waiting[p]; !ok || !w.retry {
 		q.addLocked(p)
 	}
 }

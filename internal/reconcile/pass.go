@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
@@ -85,12 +84,13 @@ func (r *Reconciler) reconcile(ctx context.Context, p string) passResult {
 		res.retry = ps.fail(err)
 	}
 
-	if res.retry {
+	if err != nil {
 		r.restorePending(p, ps.events)
 	}
 
-	// A temporary error says nothing about the problems of the path.
-	if !res.retry && r.setReported(p, ps.reported) && len(ps.reported) == 0 && err == nil {
+	// A temporary error says nothing about whether the problems of the
+	// path are resolved.
+	if r.setReported(p, ps.reported, res.retry) && !res.retry && len(ps.reported) == 0 && err == nil {
 		ps.log.Info("the problems of the path are resolved", "source", ps.src.String())
 	}
 
@@ -427,9 +427,13 @@ func (ps *pass) storeApplied(a backend.Applied) error {
 	return storeErr(err)
 }
 
-// restoreRecord puts the source's record back as the pass found it.
+// restoreRecord puts the source's record back as the pass found it, after
+// a registration that kopia server refused. A record that holds nothing
+// confirmed, only the intent of an earlier registration that never went
+// through, is removed instead.
 func (ps *pass) restoreRecord() error {
-	if ps.had {
+	confirmed := !ps.last.Patch.IsZero() || ps.last.SavedScheduling != nil || ps.last.StoredHash != ""
+	if ps.had && confirmed {
 		return ps.storeApplied(ps.last)
 	}
 
@@ -490,23 +494,34 @@ func (ps *pass) reportedBefore(key string) bool {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	rs := ps.reportedErrors[ps.path]
+	scan, ok := ps.reportedErrors[ps.path][key]
 
-	return rs.scan == ps.scans && slices.Contains(rs.keys, key)
+	return ok && scan == ps.scans
 }
 
-// setReported remembers the errors a pass over p reported, and returns
-// whether the pass before reported any.
-func (r *Reconciler) setReported(p string, keys []string) (hadBefore bool) {
+// setReported remembers the errors a pass over p reported, in place of
+// those of the pass before, and returns whether that one reported any.
+// A pass that is retried adds its errors instead: it found them again, so
+// its retry must not report them once more.
+func (r *Reconciler) setReported(p string, keys []string, retried bool) (hadBefore bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	hadBefore = len(r.reportedErrors[p].keys) > 0
+	hadBefore = len(r.reportedErrors[p]) > 0
 
-	if len(keys) == 0 {
+	m := r.reportedErrors[p]
+	if !retried || m == nil {
+		m = make(map[string]uint64, len(keys))
+	}
+
+	for _, k := range keys {
+		m[k] = r.scans
+	}
+
+	if len(m) == 0 {
 		delete(r.reportedErrors, p)
 	} else {
-		r.reportedErrors[p] = reportedSet{keys: keys, scan: r.scans}
+		r.reportedErrors[p] = m
 	}
 
 	return hadBefore

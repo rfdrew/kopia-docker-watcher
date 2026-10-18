@@ -458,3 +458,272 @@ func TestScanKeepsRetryDelay(t *testing.T) {
 		t.Errorf("%d passes over a path that waits for its retry", n)
 	}
 }
+
+// A problem found again by the retries of a temporary error is reported
+// once.
+func TestProblemNotRecountedOnRetry(t *testing.T) {
+	h := newHarness(t)
+	h.engine.run("web", enable, pathLabel(app))
+	h.mustPass(app)
+	h.engine.run("worker", enable, pathLabel(app), scheduleLabel("30 2 * * *"))
+
+	for range 3 {
+		h.fake.FailNext(backendtest.PlanSource, temporary("PlanSource"))
+
+		if res := h.pass(app); !res.retry {
+			t.Fatalf("err %v", res.err)
+		}
+	}
+
+	h.mustPass(app)
+
+	if n := h.metrics.count(app, ReasonOwnersDisagree); n != 1 {
+		t.Errorf("counted %d times", n)
+	}
+}
+
+// A refused registration also drops a record that held only the intent of
+// an earlier registration that never reached kopia server.
+func TestRefusedRegistrationDropsIntentOnlyRecord(t *testing.T) {
+	h := newHarness(t)
+	h.engine.run("app", enable, pathLabel(app))
+	h.fake.FailNext(backendtest.ApplyPlan, &backend.Error{Op: "ApplyPlan", Kind: backend.ErrUnavailable, Err: errors.New("connection refused")})
+
+	if res := h.pass(app); !res.retry {
+		t.Fatalf("err %v", res.err)
+	}
+
+	if _, ok := h.applied(app); !ok {
+		t.Fatal("no intent stored")
+	}
+
+	h.fake.SetPathMissing(app)
+
+	if res := h.pass(app); !backend.IsConfig(res.err) {
+		t.Fatalf("err %v", res.err)
+	}
+
+	if a, ok := h.applied(app); ok {
+		t.Errorf("record kept: %+v", a)
+	}
+}
+
+// While a path waits for a retry, its events and restart rechecks do not
+// bring passes before the retry is due.
+func TestEventsDoNotCutRetry(t *testing.T) {
+	h := newHarness(t, func(o *Options) {
+		o.MinBackoff, o.MaxBackoff, o.RestartRecheck = time.Hour, time.Hour, time.Millisecond
+	})
+	id := h.engine.create("app", docker.StateRestarting, enable, pathLabel(app))
+	h.fake.FailNext(backendtest.PlanSource, temporary("PlanSource"))
+
+	passes := h.start()
+	h.r.Enqueue(app)
+	waitPass(t, passes, app, func(res passResult) bool { return res.retry })
+
+	for range 5 {
+		h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+	}
+
+	h.r.ReconcileAll()
+	time.Sleep(50 * time.Millisecond)
+
+	if n := len(h.fake.CallsFor(h.src(app), backendtest.PlanSource)); n != 1 {
+		t.Errorf("%d passes while the retry waits", n)
+	}
+}
+
+// A full reconcile that comes while a retry pass runs queues the path
+// again: the pass may have read the containers before the change.
+func TestScanDuringRetryPass(t *testing.T) {
+	h := newHarness(t)
+	id := h.engine.create("app", docker.StateExited, enable, pathLabel(app))
+	h.engine.setState(id, docker.StateRunning)
+	h.mustPass(app)
+	h.engine.setState(id, docker.StateExited)
+
+	h.fake.FailNext(backendtest.PlanSource, temporary("PlanSource"))
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	first := true
+
+	h.fake.SetHook(func(c backendtest.Call) error {
+		if c.Method == backendtest.PlanSource && !first && c.Desired.Paused {
+			select {
+			case <-entered:
+			default:
+				close(entered)
+				<-release
+			}
+		}
+
+		if c.Method == backendtest.PlanSource {
+			first = false
+		}
+
+		return nil
+	})
+
+	passes := h.start()
+	h.r.Enqueue(app)
+	waitPass(t, passes, app, func(res passResult) bool { return res.retry })
+
+	// The retry pass has read the owner as exited; it starts again, and
+	// the event is lost, so a resync scans.
+	<-entered
+	h.engine.setState(id, docker.StateRunning)
+	h.r.ReconcileAll()
+
+	eventually(t, "the scan marked the path", func() bool {
+		h.r.queue.mu.Lock()
+		defer h.r.queue.mu.Unlock()
+
+		return h.r.queue.dirty[app]
+	})
+
+	close(release)
+
+	eventually(t, "the source runs", func() bool {
+		p, _ := h.fake.Policy(h.src(app))
+		return string(p) == `{"scheduling":{"cron":["0 * * * *"]}}`
+	})
+}
+
+// Run starts no pass after its context is done.
+func TestRunTakesNoPathAfterCancel(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.Workers, o.ShutdownGrace = 1, time.Second })
+	h.engine.run("a", enable, pathLabel("/data/a"))
+	h.engine.run("b", enable, pathLabel("/data/b"))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	h.r.afterPass = func(string, passResult) { cancel() }
+
+	h.r.Enqueue("/data/a", "/data/b")
+	h.r.Run(ctx)
+
+	if h.fake.Known(h.src("/data/b")) {
+		t.Error("a pass ran after Run's context ended")
+	}
+}
+
+// hookDocker runs a hook after it lists the containers and before it
+// returns them, as when events arrive while a full reconcile lists.
+type hookDocker struct {
+	Docker
+	hook func()
+}
+
+func (d *hookDocker) Containers(ctx context.Context) ([]docker.Container, error) {
+	list, err := d.Docker.Containers(ctx)
+	if d.hook != nil {
+		d.hook()
+	}
+
+	return list, err
+}
+
+// The label reports of events that come while a full reconcile lists are
+// neither dropped nor repeated by it.
+func TestLabelReportsRaceWithScan(t *testing.T) {
+	h := newHarness(t)
+	hd := &hookDocker{Docker: h.engine}
+	h.r.docker = hd
+
+	// A container created after the listing.
+	var created string
+
+	hd.hook = func() {
+		hd.hook = nil
+		created = h.engine.run("new", enable, pathLabel("data/new"))
+		h.r.HandleEvent(h.engine.event(docker.KindChanged, created))
+	}
+
+	if _, err := h.r.paths(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	h.r.HandleEvent(h.engine.event(docker.KindStarted, created))
+
+	// A container removed after the listing.
+	old := h.engine.run("old", enable, pathLabel("data/old"))
+
+	hd.hook = func() {
+		hd.hook = nil
+		h.r.HandleEvent(h.engine.remove(old))
+	}
+
+	if _, err := h.r.paths(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := h.metrics.count("", ReasonLabels); n != 1 {
+		t.Errorf("label errors counted %d times, want 1 (new)", n)
+	}
+
+	if _, err := h.r.paths(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	h.r.mu.Lock()
+	_, kept := h.r.reported[old]
+	h.r.mu.Unlock()
+
+	if kept {
+		t.Error("the removed container is still remembered")
+	}
+}
+
+// A host prefix of / is no prefix.
+func TestRootHostPrefix(t *testing.T) {
+	h := newHarness(t, withHostPrefix("/"))
+	h.engine.run("app", enable, pathLabel(app))
+
+	paths, err := h.r.paths(t.Context())
+	if err != nil || strings.Join(paths, ",") != app {
+		t.Errorf("paths %v, %v", paths, err)
+	}
+}
+
+// A retry that fails before it gets to a problem keeps the report of the
+// pass before: the problem is not reported again when it is found again.
+func TestRetryKeepsReportedProblems(t *testing.T) {
+	h := newHarness(t)
+	h.engine.run("web", enable, pathLabel(app))
+	h.mustPass(app)
+	h.engine.run("worker", enable, pathLabel(app), scheduleLabel("30 2 * * *"))
+
+	h.fake.FailNext(backendtest.PlanSource, temporary("PlanSource"))
+
+	if res := h.pass(app); !res.retry {
+		t.Fatalf("err %v", res.err)
+	}
+
+	h.engine.failNext(errors.New("cannot connect to the Docker daemon"))
+
+	if res := h.pass(app); !res.retry {
+		t.Fatalf("err %v", res.err)
+	}
+
+	h.mustPass(app)
+
+	if n := h.metrics.count(app, ReasonOwnersDisagree); n != 1 {
+		t.Errorf("counted %d times", n)
+	}
+}
+
+// The events of a pass that ends with an error that is not retried stay
+// for the next pass.
+func TestPendingEventsKeptAfterConfigError(t *testing.T) {
+	h := newHarness(t)
+	id := h.engine.run("app", enable, pathLabel(app))
+	h.fake.SetPathMissing(app)
+	h.r.HandleEvent(h.engine.event(docker.KindStarted, id))
+
+	if res := h.pass(app); res.err == nil || res.retry {
+		t.Fatalf("err %v, retry %v", res.err, res.retry)
+	}
+
+	if got := eventNames(h.r.takePending(app)); strings.Join(got, ",") != "start app" {
+		t.Errorf("pending = %v", got)
+	}
+}

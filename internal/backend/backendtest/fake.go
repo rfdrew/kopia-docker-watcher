@@ -398,7 +398,14 @@ func (f *Fake) FailNextAfter(m Method, err error) {
 }
 
 // FailNextAfterFor is FailNextAfter for the next call of m about src only.
+// It panics on an ErrConfig error of ApplyPlan: kopia server checks a
+// policy before it stores it, so a write that took effect is never
+// refused (see backend.ActionRegister).
 func (f *Fake) FailNextAfterFor(src backend.Source, m Method, err error) {
+	if m == ApplyPlan && backend.IsConfig(err) {
+		panic("backendtest: an ApplyPlan that took effect cannot fail with ErrConfig")
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 

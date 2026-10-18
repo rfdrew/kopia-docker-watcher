@@ -26,10 +26,7 @@ func (r *Reconciler) scanLoop(ctx context.Context) {
 			paths, err := r.paths(ctx)
 			if err == nil {
 				for _, p := range paths {
-					// A full reconcile does not cut a retry delay short.
-					if !r.backingOff(p) {
-						r.queue.add(p)
-					}
+					r.queue.addUnlessRetrying(p)
 				}
 
 				r.log.Debug("queued every path", "paths", len(paths))
@@ -91,6 +88,11 @@ func (r *Reconciler) RunOnce(ctx context.Context) error {
 // state. It reports label problems on the way, once per container and set
 // of labels.
 func (r *Reconciler) paths(ctx context.Context) ([]string, error) {
+	// Reports made after the listing, by events, are newer than it.
+	r.mu.Lock()
+	listed := r.reports
+	r.mu.Unlock()
+
 	containers, err := r.containers(ctx)
 	if err != nil {
 		return nil, err
@@ -117,8 +119,8 @@ func (r *Reconciler) paths(ctx context.Context) ([]string, error) {
 	}
 
 	r.mu.Lock()
-	for id := range r.reported {
-		if !seen[id] {
+	for id, rep := range r.reported {
+		if !seen[id] && rep.seq <= listed {
 			delete(r.reported, id)
 		}
 	}
@@ -162,10 +164,18 @@ func (r *Reconciler) reportLabels(pc parsed) {
 
 	r.mu.Lock()
 	last, had := r.reported[pc.container.ID]
-	r.reported[pc.container.ID] = key
+
+	if last.gone {
+		// Removed after the listing this report comes from.
+		r.mu.Unlock()
+		return
+	}
+
+	r.reports++
+	r.reported[pc.container.ID] = labelReport{key: key, seq: r.reports}
 	r.mu.Unlock()
 
-	if had && last == key || len(lines) == 0 {
+	if had && last.key == key || len(lines) == 0 {
 		return
 	}
 

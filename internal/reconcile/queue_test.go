@@ -274,3 +274,56 @@ func TestQueueReplacedTimer(t *testing.T) {
 		t.Fatalf("got %s", p)
 	}
 }
+
+// A retry replaces an earlier delayed add, and later delayed and full
+// reconcile adds wait for it.
+func TestQueueRetryTakesPrecedence(t *testing.T) {
+	q := newQueue()
+	q.addAfter("/a", time.Millisecond)
+	q.retryAfter("/a", time.Hour)
+	q.addAfter("/a", time.Millisecond)
+	q.addAfter("/a", 0)
+	q.addUnlessRetrying("/a")
+	time.Sleep(20 * time.Millisecond)
+	assertEmpty(t, q)
+
+	// An explicit add does not wait.
+	q.add("/a")
+
+	if p := getNow(t, q); p != "/a" {
+		t.Fatalf("got %s", p)
+	}
+}
+
+// A full reconcile during the pass of a path that waits for nothing queues
+// it again; one during a pass that ends in a retry leaves it to the retry.
+func TestQueueAddUnlessRetryingDuringPass(t *testing.T) {
+	q := newQueue()
+	q.add("/a")
+
+	p := getNow(t, q)
+	q.addUnlessRetrying(p)
+	q.done(p)
+
+	if p := getNow(t, q); p != "/a" {
+		t.Fatalf("got %s", p)
+	}
+
+	q.addUnlessRetrying(p)
+	q.retryAfter(p, time.Hour)
+	q.done(p)
+	assertEmpty(t, q)
+}
+
+// get hands out nothing once its context is done.
+func TestQueueGetAfterCancelWithReadyPaths(t *testing.T) {
+	q := newQueue()
+	q.add("/a")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, ok := q.get(ctx); ok {
+		t.Error("handed out a path after cancel")
+	}
+}

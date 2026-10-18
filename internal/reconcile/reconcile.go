@@ -16,14 +16,19 @@
 //   - the policy patch the labels ask for: those of the running owners, or
 //     of all owners when none runs. A stopped container keeps the labels it
 //     was created with, so a leftover one (an old one-off container of
-//     docker compose run, the old container of a recreate that is still
-//     stopping) does not hold back the labels of the containers that run;
+//     docker compose run, the old version of a blue/green deploy) does not
+//     hold back the labels of the containers that run. While docker compose
+//     recreates a container, the new one is only created until the old one
+//     has stopped, so the old labels stay until then;
 //   - the names of all owners, sorted.
 //
 // The owners that decide the patch have to agree on it. When they do not,
-// or when the labels of one of them cannot be applied, the error is logged
-// and counted, and the source keeps the last applied patch while the pause
-// still follows the owners. A path that has lost all its owners (the
+// or when the labels of one of them cannot be applied, the source keeps
+// the last applied patch while the pause still follows the owners. With a
+// running owner that is an error, logged and counted. When all owners are
+// stopped it is only a warning: the source is paused, only its saved
+// section would change, and the labels of whichever owner starts first
+// decide then. A path that has lost all its owners (the
 // containers were removed, or no longer enable the backup) is paused with
 // its last applied patch if the watcher manages it; a path the watcher
 // never managed is left alone. A source kopia server does not know is
@@ -125,7 +130,7 @@ type Reason string
 
 // Reasons.
 const (
-	// ReasonLabels: an owner's labels cannot be applied.
+	// ReasonLabels: a container's labels cannot be applied.
 	ReasonLabels Reason = "labels"
 	// ReasonOwnersDisagree: owners of a path ask for different policies.
 	ReasonOwnersDisagree Reason = "owners_disagree"
@@ -148,8 +153,10 @@ const (
 // Metrics counts what goes wrong. The no-op default stands in until the
 // watcher serves /metrics.
 type Metrics interface {
-	// ReconcileError counts one problem with a path; path is empty for a
-	// problem with labels that name no valid path.
+	// ReconcileError counts one problem with a path. The path is empty for
+	// a problem that is not about one source: the label errors of a
+	// container, counted once per container and set of labels, and a full
+	// reconcile that cannot list the containers.
 	ReconcileError(path string, reason Reason)
 }
 
@@ -232,14 +239,16 @@ type Reconciler struct {
 	// identity is kopia server's user name and host; known is false until
 	// asked and after ErrWrongIdentity.
 	identity identity
-	// reported holds what was last reported about each container's labels.
-	reported map[string]string
+	// reported holds what was last reported about each container's labels;
+	// reports counts the changes to it.
+	reported map[string]labelReport
+	reports  uint64
 	// pending holds per path the events that queued it since its last
 	// pass began, at most maxPending, the latest ones.
 	pending map[string][]docker.Event
-	// reportedErrors holds per path the errors its last pass reported, and
-	// the full reconcile they were reported after.
-	reportedErrors map[string]reportedSet
+	// reportedErrors holds per path the errors its last pass reported,
+	// with the number of the full reconcile they were last reported after.
+	reportedErrors map[string]map[string]uint64
 	// scans counts full reconciles.
 	scans uint64
 
@@ -250,9 +259,14 @@ type Reconciler struct {
 	afterPass func(path string, res passResult)
 }
 
-type reportedSet struct {
-	keys []string
-	scan uint64
+// labelReport is what was reported about a container's labels.
+type labelReport struct {
+	key string
+	// seq is the value of Reconciler.reports when it was reported.
+	seq uint64
+	// gone marks a container that was removed; its labels are not reported
+	// again.
+	gone bool
 }
 
 type identity struct {
@@ -275,6 +289,11 @@ func New(opts Options) (*Reconciler, error) {
 		return nil, fmt.Errorf("reconcile: host prefix %q is not a clean absolute path", opts.HostPrefix)
 	}
 
+	// A prefix of / is no prefix, as config.ParseHostPrefix has it.
+	if opts.HostPrefix == "/" {
+		opts.HostPrefix = ""
+	}
+
 	r := &Reconciler{
 		backend:        opts.Backend,
 		docker:         opts.Docker,
@@ -295,9 +314,9 @@ func New(opts Options) (*Reconciler, error) {
 		queue:          newQueue(),
 		scan:           make(chan struct{}, 1),
 		failures:       map[string]int{},
-		reported:       map[string]string{},
+		reported:       map[string]labelReport{},
 		pending:        map[string][]docker.Event{},
-		reportedErrors: map[string]reportedSet{},
+		reportedErrors: map[string]map[string]uint64{},
 		dockerTimeout:  dockerTimeout,
 	}
 
@@ -402,20 +421,13 @@ func (r *Reconciler) schedule(ctx context.Context, p string, res passResult) {
 
 	if res.retry {
 		r.log.Debug("retrying the path later", "path", p, "delay", delay.String())
-		r.queue.addAfter(p, delay)
+		r.queue.retryAfter(p, delay)
 	}
 
+	// A pending retry comes first; it looks at the restarting owner too.
 	if res.restarting {
 		r.queue.addAfter(p, r.restartRecheck)
 	}
-}
-
-// backingOff reports whether p waits for a retry after a temporary error.
-func (r *Reconciler) backingOff(p string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	return r.failures[p] > 0
 }
 
 // backoff returns the delay before retry n (1 for the first): min doubled
@@ -450,9 +462,9 @@ func (r *Reconciler) Enqueue(paths ...string) {
 // The paths come from the labels in the event, the only ones left after a
 // destroy. They are queued whether or not the labels enable the backup, so
 // a container recreated without it frees its paths. The event is kept with
-// each path until its next pass, which logs it. Problems with the labels
-// of a container that is not gone are logged here already, once per set
-// of labels.
+// each path until a pass over it ends without an error, and that pass logs
+// it. Problems with the labels of a container that is not gone are logged
+// here already, once per set of labels.
 func (r *Reconciler) HandleEvent(ev docker.Event) {
 	if ev.Kind == docker.KindResync {
 		r.ReconcileAll()
@@ -463,7 +475,8 @@ func (r *Reconciler) HandleEvent(ev docker.Event) {
 
 	if ev.Kind == docker.KindRemoved {
 		r.mu.Lock()
-		delete(r.reported, ev.ContainerID)
+		r.reports++
+		r.reported[ev.ContainerID] = labelReport{seq: r.reports, gone: true}
 		r.mu.Unlock()
 	} else {
 		r.reportLabels(pc)
@@ -491,7 +504,7 @@ func (r *Reconciler) takePending(p string) []docker.Event {
 	return evs
 }
 
-// restorePending puts back events taken for a pass that is retried, before
+// restorePending puts back events taken for a pass that failed, before
 // those that came meanwhile.
 func (r *Reconciler) restorePending(p string, evs []docker.Event) {
 	if len(evs) == 0 {

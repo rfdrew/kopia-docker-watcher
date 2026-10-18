@@ -119,9 +119,8 @@ func anyRestarting(owners []owner) bool {
 // policyOwners returns the owners whose labels decide the policy: the
 // running ones, or all of them when none runs. A stopped container keeps
 // the labels it was created with, so a leftover one (an old one-off of
-// docker compose run, the old container of a recreate that is still
-// stopping, the old version of a blue/green deploy) must not hold back the
-// labels of the containers that run.
+// docker compose run, the old version of a blue/green deploy) must not
+// hold back the labels of the containers that run.
 func policyOwners(owners []owner) []owner {
 	var running []owner
 
