@@ -1184,6 +1184,10 @@ func TestEveryRequestNamesTheSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if _, err := b.ListSnapshots(t.Context(), s); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := b.DeletePolicy(t.Context(), s); err != nil {
 		t.Fatal(err)
 	}
@@ -1274,6 +1278,9 @@ func TestContextDone(t *testing.T) {
 
 		err = b.AnnotateSnapshot(ctx, s, time.Now(), "d", nil)
 		assertError(t, err, opAnnotateSnapshot, s, nil)
+
+		_, err = b.ListSnapshots(ctx, s)
+		assertError(t, err, opListSnapshots, s, nil)
 
 		if !errors.Is(err, context.Canceled) {
 			t.Errorf("err = %v, want context.Canceled", err)
@@ -1763,6 +1770,10 @@ func TestWrongIdentityEverywhere(t *testing.T) {
 				return err
 			},
 			opAnnotateSnapshot: func() error { return b.AnnotateSnapshot(t.Context(), other, time.Now(), "d", nil) },
+			opListSnapshots: func() error {
+				_, err := b.ListSnapshots(t.Context(), other)
+				return err
+			},
 		}
 
 		for name, call := range calls {
@@ -1816,6 +1827,10 @@ func TestRelativePathRefused(t *testing.T) {
 				return err
 			},
 			opAnnotateSnapshot: func() error { return b.AnnotateSnapshot(t.Context(), s, time.Now(), "d", nil) },
+			opListSnapshots: func() error {
+				_, err := b.ListSnapshots(t.Context(), s)
+				return err
+			},
 		}
 
 		for op, call := range calls {
@@ -1879,6 +1894,10 @@ func TestReadRequestKinds(t *testing.T) {
 		}},
 		{"snapshots of an annotation", "GET snapshots", opAnnotateSnapshot, s, func(t *testing.T, b *Backend) error {
 			return b.AnnotateSnapshot(t.Context(), s, t0, "d", nil)
+		}},
+		{"snapshots", "GET snapshots", opListSnapshots, s, func(t *testing.T, b *Backend) error {
+			_, err := b.ListSnapshots(t.Context(), s)
+			return err
 		}},
 	}
 

@@ -232,6 +232,14 @@ func TestIntegrationSnapshots(t *testing.T) {
 		if res.TaskID == known.TaskID {
 			t.Errorf("the second wait followed the first task %s", res.TaskID)
 		}
+
+		// Both snapshots, in the order they started, the first with its
+		// description.
+		list, err := b.ListSnapshots(ctx, src)
+		if err != nil || len(list) != 2 || !list[0].StartTime.Equal(start) || list[0].Description != "snap [env=test]" ||
+			!list[1].StartTime.Equal(res.Snapshot.StartTime) || list[1].Incomplete != "" {
+			t.Errorf("ListSnapshots = %+v, %v", list, err)
+		}
 	})
 
 	t.Run("an unchanged source with ignoreIdenticalSnapshots", func(t *testing.T) {

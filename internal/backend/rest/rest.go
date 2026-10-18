@@ -22,7 +22,8 @@
 // tasks anew when it restarts, and gives a snapshot a new ID when its
 // description or pins change. So a run is followed by the snapshot tasks of
 // the source that appear after the trigger, and a snapshot is found by its
-// start time; see TriggerSnapshot, WaitSnapshot and AnnotateSnapshot.
+// start time; see TriggerSnapshot, WaitSnapshot, AnnotateSnapshot and
+// ListSnapshots.
 package rest
 
 import (
@@ -89,6 +90,7 @@ const (
 	opTriggerSnapshot  = "TriggerSnapshot"
 	opWaitSnapshot     = "WaitSnapshot"
 	opAnnotateSnapshot = "AnnotateSnapshot"
+	opListSnapshots    = "ListSnapshots"
 )
 
 // ServerIdentity implements backend.Backend with GET /api/v1/sources.

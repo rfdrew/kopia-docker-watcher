@@ -299,15 +299,15 @@ func (b *Backend) outcome(ctx context.Context, src backend.Source, task *kopiacl
 // saved returns the outcome of a task that succeeded, from the snapshot it
 // saved.
 func (b *Backend) saved(ctx context.Context, src backend.Source, task *kopiaclient.TaskInfo) (backend.SnapshotResult, error) {
-	resp, err := b.client.ListSnapshots(ctx, toInfo(src), true)
+	snaps, err := b.snapshots(ctx, opWaitSnapshot, src)
 	if err != nil {
-		return backend.SnapshotResult{}, fail(ctx, opWaitSnapshot, src, reqRead, err)
+		return backend.SnapshotResult{}, err
 	}
 
 	var snap *kopiaclient.Snapshot
 
-	for i := range resp.Snapshots {
-		s := &resp.Snapshots[i]
+	for i := range snaps {
+		s := &snaps[i]
 
 		if s.IncompleteReason == incompleteCheckpoint || s.StartTime.Before(task.StartTime) ||
 			task.EndTime != nil && s.StartTime.After(*task.EndTime) {
@@ -413,15 +413,15 @@ func (b *Backend) AnnotateSnapshot(ctx context.Context, src backend.Source, star
 		return err
 	}
 
-	resp, err := b.client.ListSnapshots(ctx, toInfo(src), true)
+	snaps, err := b.snapshots(ctx, opAnnotateSnapshot, src)
 	if err != nil {
-		return fail(ctx, opAnnotateSnapshot, src, reqRead, err)
+		return err
 	}
 
 	var snap *kopiaclient.Snapshot
 
-	for i := range resp.Snapshots {
-		s := &resp.Snapshots[i]
+	for i := range snaps {
+		s := &snaps[i]
 
 		if !s.StartTime.Equal(startTime) || s.IncompleteReason == incompleteCheckpoint {
 			continue
@@ -458,6 +458,49 @@ func (b *Backend) AnnotateSnapshot(ctx context.Context, src backend.Source, star
 	}
 
 	return nil
+}
+
+// ListSnapshots implements backend.Backend with GET /api/v1/snapshots and
+// all=1: every manifest of the source, checkpoints and snapshots of the
+// same content as an earlier one included. They are sorted by start time,
+// those that started at once by end time, as kopia server sorts them.
+func (b *Backend) ListSnapshots(ctx context.Context, src backend.Source) ([]backend.SnapshotInfo, error) {
+	if _, err := b.lookup(ctx, opListSnapshots, src); err != nil {
+		return nil, err
+	}
+
+	snaps, err := b.snapshots(ctx, opListSnapshots, src)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []backend.SnapshotInfo
+
+	for _, s := range snaps {
+		out = append(out, *fromSnapshot(s))
+	}
+
+	slices.SortStableFunc(out, func(x, y backend.SnapshotInfo) int {
+		if c := x.StartTime.Compare(y.StartTime); c != 0 {
+			return c
+		}
+
+		return x.EndTime.Compare(y.EndTime)
+	})
+
+	return out, nil
+}
+
+// snapshots returns every manifest of src (GET /api/v1/snapshots with
+// all=1): without all, kopia server merges snapshots of the same content
+// into the oldest of them.
+func (b *Backend) snapshots(ctx context.Context, op string, src backend.Source) ([]kopiaclient.Snapshot, error) {
+	resp, err := b.client.ListSnapshots(ctx, toInfo(src), true)
+	if err != nil {
+		return nil, fail(ctx, op, src, reqRead, err)
+	}
+
+	return resp.Snapshots, nil
 }
 
 func fromSnapshot(s kopiaclient.Snapshot) *backend.SnapshotInfo {

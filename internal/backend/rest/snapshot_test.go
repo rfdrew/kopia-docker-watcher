@@ -1195,3 +1195,80 @@ func TestAnnotateSnapshotEditedInBetween(t *testing.T) {
 		t.Errorf("edits = %+v", got)
 	}
 }
+
+// ListSnapshots lists every manifest of the source, checkpoints and
+// snapshots of the same content included, sorted by start and then end
+// time, whatever order the answer has.
+func TestListSnapshots(t *testing.T) {
+	f := newFakeKopia()
+	b := newBackend(t, f)
+	s := src("/data/app")
+	si := info("/data/app")
+
+	f.addSource(si, nil)
+
+	same := snapshot("same", t0.Add(time.Hour), t0.Add(time.Hour), "")
+	same.RootID = "root-a"
+	described := snapshot("a", t0, t0.Add(time.Minute), "")
+	described.Description = "app"
+
+	f.set(func(f *fakeKopia) {
+		f.snapshots[si] = []kopiaclient.Snapshot{
+			same, described,
+			snapshot("cp", t0, t0.Add(time.Second), incompleteCheckpoint),
+			snapshot("x", t0.Add(2*time.Hour), t0.Add(3*time.Hour), "canceled"),
+		}
+		f.snapshots[info("/data/app2")] = []kopiaclient.Snapshot{snapshot("other", t0, t0, "")}
+	})
+
+	want := []backend.SnapshotInfo{
+		{StartTime: t0, EndTime: t0.Add(time.Second), Incomplete: incompleteCheckpoint},
+		{StartTime: t0, EndTime: t0.Add(time.Minute), Description: "app"},
+		{StartTime: t0.Add(time.Hour), EndTime: t0.Add(time.Hour)},
+		{StartTime: t0.Add(2 * time.Hour), EndTime: t0.Add(3 * time.Hour), Incomplete: "canceled"},
+	}
+
+	got, err := b.ListSnapshots(t.Context(), s)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("ListSnapshots = %+v, %v\nwant %+v", got, err, want)
+	}
+
+	if r := f.requestsTo("GET snapshots"); len(r) != 1 || target(r[0].Query) != si || r[0].Query.Get("all") != "1" {
+		t.Errorf("listing = %+v", r)
+	}
+
+	// kopia server sorts the answer; the backend does not count on it.
+	f.inject("GET snapshots", injection{status: http.StatusOK, body: `{"snapshots":[` +
+		`{"id":"c","startTime":"2026-10-18T10:00:00Z","endTime":"2026-10-18T10:00:01Z"},` +
+		`{"id":"b","startTime":"2026-10-18T09:00:00Z","endTime":"2026-10-18T09:00:02Z"},` +
+		`{"id":"a","startTime":"2026-10-18T09:00:00Z","endTime":"2026-10-18T09:00:01Z","incomplete":"checkpoint"}]}`})
+
+	got, err = b.ListSnapshots(t.Context(), s)
+	want = []backend.SnapshotInfo{
+		{StartTime: t0, EndTime: t0.Add(time.Second), Incomplete: incompleteCheckpoint},
+		{StartTime: t0, EndTime: t0.Add(2 * time.Second)},
+		{StartTime: t0.Add(time.Hour), EndTime: t0.Add(time.Hour + time.Second)},
+	}
+
+	if err != nil || len(got) != len(want) {
+		t.Fatalf("ListSnapshots = %+v, %v", got, err)
+	}
+
+	for i := range want {
+		if !got[i].StartTime.Equal(want[i].StartTime) || !got[i].EndTime.Equal(want[i].EndTime) || got[i].Incomplete != want[i].Incomplete {
+			t.Errorf("ListSnapshots[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	// No snapshots, or a source kopia server does not know: none.
+	for _, p := range []string{"/data/empty", "/data/none"} {
+		if p == "/data/empty" {
+			f.addSource(info(p), nil)
+		}
+
+		got, err := b.ListSnapshots(t.Context(), src(p))
+		if err != nil || got != nil {
+			t.Errorf("%s: ListSnapshots = %+v, %v", p, got, err)
+		}
+	}
+}

@@ -206,6 +206,12 @@ type Backend interface {
 	// first. Snapshots are found by start time because an edit gives a
 	// snapshot a new ID. No such snapshot is ErrSnapshotNotFound.
 	AnnotateSnapshot(ctx context.Context, src Source, startTime time.Time, description string, addPins []string) error
+
+	// ListSnapshots returns the snapshots of src, checkpoints and
+	// incomplete ones included, sorted by start time (GET
+	// /api/v1/snapshots with all=1, so that snapshots of identical
+	// content are listed one by one).
+	ListSnapshots(ctx context.Context, src Source) ([]SnapshotInfo, error)
 }
 
 // SchedulePreview is the answer of PreviewSchedule.
