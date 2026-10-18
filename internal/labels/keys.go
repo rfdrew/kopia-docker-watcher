@@ -39,9 +39,9 @@ var keys = []key{
 }
 
 // plannedKeys are labels of later releases. They are ignored with a "not
-// supported yet" warning rather than reported as unknown, and the schema
-// tests check them together with keys, so that a key added now cannot clash
-// with one of them later.
+// supported by this version" warning rather than reported as unknown, and
+// the schema tests check them together with keys, so that a key added now
+// cannot clash with one of them later.
 var plannedKeys = []string{
 	// Snapshot pacing and cleanup.
 	"min-interval",
@@ -129,7 +129,7 @@ func suggest(prefix, rel string) string {
 		return "did you mean " + Name(prefix, known[i]) + "?"
 	}
 
-	if i := slices.IndexFunc(known, func(k string) bool { return strings.HasPrefix(k, rel+".") }); i >= 0 {
+	if i := slices.IndexFunc(known, func(k string) bool { return strings.HasPrefix(norm(k), norm(rel)+".") }); i >= 0 {
 		return "it is a group of labels such as " + Name(prefix, known[i])
 	}
 

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"unicode"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/config"
 	"github.com/rfdrew/kopia-docker-watcher/internal/labels"
@@ -36,13 +37,16 @@ const maxLabelLine = 1 << 20
 func runValidate(args []string, d deps) int {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
-	fs.Usage = func() { _, _ = fmt.Fprint(d.stderr, validateUsage) }
+	fs.Usage = func() {} // printed below: to stdout on request, to stderr on errors
 	strict := fs.Bool("strict", false, "treat warnings as errors")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
+			_, _ = fmt.Fprint(d.stdout, validateUsage)
 			return 0
 		}
+
+		_, _ = fmt.Fprintf(d.stderr, "\n%s", validateUsage)
 
 		return 2
 	}
@@ -72,7 +76,7 @@ func runValidate(args []string, d deps) int {
 	}
 
 	for _, is := range issues {
-		_, _ = fmt.Fprintf(d.stdout, "%s: %s\n", is.Severity, is)
+		_, _ = fmt.Fprintf(d.stdout, "%s: %s: %s\n", is.Severity, printable(is.Label), is.Message)
 	}
 
 	if issues.HasErrors() {
@@ -123,14 +127,19 @@ func readLabelLines(out map[string]string, r io.Reader) error {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(nil, maxLabelLine)
 
+	// bufio.ScanLines drops the \r of CRLF line ends.
 	for n := 1; sc.Scan(); n++ {
-		line := strings.TrimRight(sc.Text(), "\r")
+		line := sc.Text()
+		if n == 1 {
+			line = strings.TrimPrefix(line, "\ufeff") // byte order mark, as docker --label-file
+		}
 
-		if trimmed := strings.TrimSpace(line); trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		line = strings.TrimLeftFunc(line, unicode.IsSpace)
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		if err := addLabel(out, strings.TrimLeft(line, " \t")); err != nil {
+		if err := addLabel(out, line); err != nil {
 			return fmt.Errorf("stdin line %d: %w", n, err)
 		}
 	}
@@ -150,7 +159,7 @@ func addLabel(out map[string]string, kv string) error {
 	switch {
 	case !ok:
 		return fmt.Errorf("%q is not label=value", kv)
-	case key == "" || strings.ContainsAny(key, " \t"):
+	case key == "" || strings.ContainsFunc(key, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }):
 		return fmt.Errorf("%q has an invalid label name", kv)
 	}
 
@@ -171,11 +180,13 @@ func hasPrefixed(input map[string]string, prefix string) bool {
 
 func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	row := func(key, value string) { _, _ = fmt.Fprintf(tw, "%s\t%s\n", labels.Name(prefix, key), value) }
+	row := func(key, value string) {
+		_, _ = fmt.Fprintf(tw, "%s\t%s\n", labels.Name(prefix, key), printable(value))
+	}
 
 	row(labels.KeyEnable, strconv.FormatBool(spec.Enable))
 	row(labels.KeyPath, orNone(strings.Join(spec.Paths, ", "), "(none)"))
-	row(labels.KeySchedule, orNone(strings.Join(spec.Policy.Scheduling.Cron, "; "), "(inherit from the host or global policy)"))
+	row(labels.KeySchedule, orNone(strings.Join(spec.Policy.Scheduling.Cron, "; "), "(inherit from the parent policies)"))
 	row(labels.KeySnapshotOnStart, strconv.FormatBool(spec.SnapshotOnStart))
 	row(labels.KeySnapshotOnStop, strconv.FormatBool(spec.SnapshotOnStop))
 	row(labels.KeyDescription, orNone(spec.Description, "(container name)"))
@@ -188,6 +199,16 @@ func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 	row(labels.KeyTags, orNone(strings.Join(tags, ", "), "(none)"))
 
 	_ = tw.Flush()
+}
+
+// printable quotes a value with control characters, so that a newline or a
+// tab in a label value cannot break the table or fake an issue line.
+func printable(s string) string {
+	if strings.ContainsFunc(s, unicode.IsControl) {
+		return strconv.Quote(s)
+	}
+
+	return s
 }
 
 func orNone(s, none string) string {

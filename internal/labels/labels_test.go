@@ -137,6 +137,22 @@ func TestParse(t *testing.T) {
 			want:   Default(),
 		},
 		{
+			// The required path error is added after the loop over the
+			// labels and still lands in label order.
+			name: "the missing path error is ordered too",
+			labels: map[string]string{
+				"kopia.enable": "true",
+				"kopia.tags":   "standalone",
+				"kopia.aaa":    "1",
+			},
+			want: spec(func(s *ContainerSpec) { s.Enable = true }),
+			issues: []string{
+				"warning kopia.aaa: unknown label, ignored",
+				"error kopia.path: required when kopia.enable is true",
+				`warning kopia.tags: tag "standalone" is not key:value, ignored`,
+			},
+		},
+		{
 			name: "issues are ordered by label",
 			labels: map[string]string{
 				"kopia.zzz":              "1",
@@ -232,9 +248,13 @@ func TestParseBooleans(t *testing.T) {
 		{value: "true", want: true},
 		{value: "TRUE", want: true},
 		{value: "True", want: true},
-		{value: " true ", want: true},
 		{value: "false", want: false},
 		{value: "False", want: false},
+		// The Python version did not trim: " true" was false.
+		{value: " true ", issue: `" true " is not a boolean, treated as false; remove the spaces around it`},
+		{value: "\tTRUE", issue: `"\tTRUE" is not a boolean, treated as false; remove the spaces around it`},
+		{value: "false ", issue: `"false " is not a boolean, treated as false; remove the spaces around it`},
+		{value: "  ", issue: "empty value, treated as false; use true or false"},
 		{value: "yes", issue: `"yes" is not a boolean, treated as false; use true or false`},
 		{value: "1", issue: `"1" is not a boolean, treated as false; use true or false`},
 		{value: "on", issue: `"on" is not a boolean, treated as false; use true or false`},
@@ -340,6 +360,7 @@ func TestParseUnknownKeys(t *testing.T) {
 		{"kopia.Retention.Daily", "unknown label, ignored; did you mean kopia.retention.daily?"},
 		{"kopia.compression", "unknown label, ignored; it is a group of labels such as kopia.compression.algorithm"},
 		{"kopia.retention", "unknown label, ignored; it is a group of labels such as kopia.retention.latest"},
+		{"kopia.Compression", "unknown label, ignored; it is a group of labels such as kopia.compression.algorithm"},
 		{"kopia.", "unknown label, ignored"},
 		{"kopia..enable", "unknown label, ignored"},
 	}

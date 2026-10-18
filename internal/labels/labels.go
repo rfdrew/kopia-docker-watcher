@@ -60,7 +60,8 @@ type Tag struct {
 }
 
 // Policy mirrors the sections of a Kopia policy that labels can set. A
-// field left at its zero value is inherited from the host or global policy.
+// field left at its zero value is inherited from the parent policies:
+// those of parent directories, then user@host, host and global.
 type Policy struct {
 	Scheduling Scheduling
 }
@@ -196,7 +197,9 @@ func (p *parser) errorf(format string, args ...any) {
 
 // warn reports a problem the parser works around. The message is what,
 // then how it is worked around, then the hint, each part optional except
-// the first. In strict mode it is an error and nothing is worked around.
+// the first. In strict mode it is an error and the message leaves the
+// workaround out; the spec still gets it, but a spec with errors is not
+// meant to be applied.
 func (p *parser) warn(what, workaround, hint string) {
 	is := Issue{Label: p.label, Severity: Warning, Message: what}
 
@@ -223,18 +226,18 @@ func (p *parser) unknown(rel string) {
 }
 
 // bool parses a boolean the way the Python version did: only "true" in any
-// case is true. Anything but "true" and "false" is false with a warning.
-// Surrounding spaces are ignored.
+// case is true. Anything but "true" and "false" is false with a warning,
+// including " true" with spaces, which the Python version did not trim.
 func (p *parser) bool(v string) bool {
-	s := strings.TrimSpace(v)
-
-	switch {
-	case strings.EqualFold(s, "true"):
+	switch s := strings.TrimSpace(v); {
+	case strings.EqualFold(v, "true"):
 		return true
-	case strings.EqualFold(s, "false"):
+	case strings.EqualFold(v, "false"):
 		return false
 	case s == "":
 		p.warn("empty value", "treated as false", "use true or false")
+	case strings.EqualFold(s, "true") || strings.EqualFold(s, "false"):
+		p.warn(fmt.Sprintf("%q is not a boolean", v), "treated as false", "remove the spaces around it")
 	default:
 		p.warn(fmt.Sprintf("%q is not a boolean", v), "treated as false", "use true or false")
 	}

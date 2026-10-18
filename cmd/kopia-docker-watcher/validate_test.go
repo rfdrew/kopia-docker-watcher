@@ -69,7 +69,7 @@ func TestValidate(t *testing.T) {
 		{
 			name:   "empty schedule",
 			args:   []string{"kopia.enable=true", "kopia.path=/data", "kopia.schedule="},
-			stdout: []string{"kopia.schedule (inherit from the host or global policy)"},
+			stdout: []string{"kopia.schedule (inherit from the parent policies)"},
 		},
 		{
 			name:   "error",
@@ -130,9 +130,49 @@ func TestValidate(t *testing.T) {
 		{name: "space in name", args: []string{"kopia enable=true"}, code: 2, stderr: []string{"invalid label name"}},
 		{name: "stdin twice", args: []string{"-", "-"}, code: 2, stderr: []string{`"-" is given more than once`}},
 		{name: "option after labels", args: []string{"kopia.enable=true", "--strict"}, code: 2, stderr: []string{"options go before the labels"}},
-		{name: "unknown option", args: []string{"--bogus"}, code: 2, stderr: []string{"flag provided but not defined"}},
-		{name: "bad stdin line", stdin: "kopia.enable=true\nkopia.path\n", args: []string{"-"}, code: 2, stderr: []string{"stdin line 2", `"kopia.path" is not label=value`}},
-		{name: "help", args: []string{"--help"}, code: 0, stderr: []string{"Usage: kopia-docker-watcher validate"}},
+		{name: "unknown option", args: []string{"--bogus"}, code: 2, stderr: []string{"flag provided but not defined", "Usage:"}},
+		{
+			// Line numbers count every line, skipped ones included.
+			name:   "bad stdin line",
+			stdin:  "# app\n\nkopia.enable=true\nkopia.path\n",
+			args:   []string{"-"},
+			code:   2,
+			stderr: []string{"stdin line 4:", `"kopia.path" is not label=value`},
+		},
+		{
+			name:   "byte order mark and unicode spaces on stdin",
+			stdin:  "\ufeffkopia.enable=true\n\u00a0kopia.path=/data\n",
+			args:   []string{"-"},
+			stdout: []string{"kopia.enable true", "kopia.path /data"},
+		},
+		{
+			name:   "byte order mark before a comment",
+			stdin:  "\ufeff# app\nkopia.enable=true\nkopia.path=/data\n",
+			args:   []string{"-"},
+			stdout: []string{"kopia.enable true"},
+		},
+		{
+			name:   "long stdin line",
+			stdin:  "kopia.description=" + strings.Repeat("a", 100_000) + "\n",
+			args:   []string{"-"},
+			stdout: []string{"kopia.description " + strings.Repeat("a", 100_000)},
+		},
+		{
+			name:   "stdin line too long",
+			stdin:  "kopia.description=" + strings.Repeat("a", maxLabelLine) + "\n",
+			args:   []string{"-"},
+			code:   2,
+			stderr: []string{"reading stdin", "token too long"},
+		},
+		{
+			// A newline in a value cannot fake an issue line.
+			name:   "control characters are quoted",
+			args:   []string{"kopia.description=x\nerror: kopia.path: fake"},
+			stdout: []string{`kopia.description "x\nerror: kopia.path: fake"`},
+		},
+		{name: "control character in name", args: []string{"kopia.enable\n=true"}, code: 2, stderr: []string{"invalid label name"}},
+		{name: "help", args: []string{"--help"}, code: 0, stdout: []string{"Usage: kopia-docker-watcher validate [--strict] label=value... | -"}},
+		{name: "short help", args: []string{"-h"}, code: 0, stdout: []string{"Usage: kopia-docker-watcher validate [--strict] label=value... | -"}},
 	}
 
 	for _, tt := range tests {
