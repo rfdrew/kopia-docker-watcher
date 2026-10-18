@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,7 +16,6 @@ import (
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/config"
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
-	"github.com/rfdrew/kopia-docker-watcher/internal/kopiaclient"
 	"github.com/rfdrew/kopia-docker-watcher/internal/metrics"
 	"github.com/rfdrew/kopia-docker-watcher/internal/version"
 )
@@ -25,7 +23,7 @@ import (
 const usage = `Usage: kopia-docker-watcher [command]
 
 Commands:
-  run          start the watcher (default)
+  run          start the watcher (default), see "run --help"
   healthcheck  exit 0 if the running watcher answers on LISTEN_ADDR /healthz
   validate     check container labels, see "validate --help"
   version      print the version and exit
@@ -33,10 +31,7 @@ Commands:
 Configuration is read from environment variables, see docs/configuration.md.
 `
 
-const (
-	shutdownTimeout    = 5 * time.Second
-	healthcheckTimeout = 5 * time.Second
-)
+const healthcheckTimeout = 5 * time.Second
 
 // deps are the process's interfaces to the outside world; tests replace them.
 type deps struct {
@@ -47,11 +42,17 @@ type deps struct {
 	listen func(network, address string) (net.Listener, error)
 	// httpClient is used by the healthcheck subcommand.
 	httpClient *http.Client
-	// newDocker connects to the Docker Engine, for validate.
+	// newDocker connects to the Docker Engine, for run and validate.
 	newDocker func() (docker.Engine, io.Closer, error)
 	// kopiaTransport replaces the HTTP transport of the kopia server client
-	// of validate; nil means the default one.
+	// of run and validate; nil means the default one.
 	kopiaTransport http.RoundTripper
+
+	// Timing of run; zero means the default.
+	minKopiaRetry, maxKopiaRetry time.Duration
+	shutdownGrace                time.Duration
+	// newTicker replaces time.NewTicker for the full reconciles of run.
+	newTicker func(time.Duration) (<-chan time.Time, func())
 }
 
 func main() {
@@ -79,7 +80,7 @@ func run(ctx context.Context, args []string, d deps) int {
 
 	switch cmd {
 	case "run":
-		return runWatcher(ctx, d)
+		return runWatcher(ctx, tail(args), d)
 	case "healthcheck":
 		return runHealthcheck(ctx, d)
 	case "validate":
@@ -96,6 +97,15 @@ func run(ctx context.Context, args []string, d deps) int {
 	}
 }
 
+// tail returns the arguments after the command, if any.
+func tail(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+
+	return args[1:]
+}
+
 func newDocker() (docker.Engine, io.Closer, error) {
 	c, err := docker.New(version.UserAgent())
 	if err != nil {
@@ -107,103 +117,6 @@ func newDocker() (docker.Engine, io.Closer, error) {
 
 func newLogger(w io.Writer, level slog.Level) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level}))
-}
-
-func runWatcher(ctx context.Context, d deps) int {
-	cfg, err := config.Load(d.getenv)
-	if err != nil {
-		logConfigError(newLogger(d.stderr, config.DefaultLogLevel), err)
-		return 1
-	}
-
-	log := newLogger(d.stderr, cfg.LogLevel)
-
-	for _, w := range cfg.Warnings {
-		log.Warn(w)
-	}
-
-	log.Info("starting kopia-docker-watcher", "version", version.Version, "config", cfg)
-
-	kopia, err := kopiaclient.New(kopiaclient.Options{
-		URL:                cfg.Kopia.URL,
-		Username:           cfg.Kopia.Username,
-		Password:           cfg.Kopia.Password,
-		CertFingerprint:    cfg.Kopia.CertFingerprint,
-		CAFile:             cfg.Kopia.CAFile,
-		InsecureSkipVerify: cfg.Kopia.InsecureSkipVerify,
-		UserAgent:          version.UserAgent(),
-		Logger:             log,
-	})
-	if err != nil {
-		log.Error("cannot create kopia server client", "error", err.Error())
-		return 1
-	}
-
-	ln, err := d.listen("tcp", cfg.ListenAddr)
-	if err != nil {
-		log.Error("cannot listen", "addr", cfg.ListenAddr, "error", err.Error())
-		return 1
-	}
-
-	srv := metrics.NewServer(ln, log)
-	serveErr := make(chan error, 1)
-
-	log.Info("serving HTTP", "addr", ln.Addr().String())
-
-	go func() { serveErr <- srv.Serve() }()
-
-	checkKopia(ctx, log, kopia)
-
-	code := 0
-
-	select {
-	case <-ctx.Done():
-	case err := <-serveErr:
-		serveErr = nil
-
-		log.Error("HTTP server failed", "error", err.Error())
-
-		code = 1
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
-	defer cancel()
-
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Warn("HTTP server shutdown", "error", err.Error())
-	}
-
-	// Nothing started here outlives runWatcher.
-	if serveErr != nil {
-		if err := <-serveErr; err != nil {
-			log.Error("HTTP server failed", "error", err.Error())
-
-			code = 1
-		}
-	}
-
-	log.Info("stopped")
-
-	return code
-}
-
-// checkKopia logs whether kopia server is reachable. Waiting for it with
-// retries is part of the reconcile loop.
-func checkKopia(ctx context.Context, log *slog.Logger, kopia *kopiaclient.Client) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	st, err := kopia.RepoStatus(ctx)
-
-	switch {
-	case errors.Is(err, context.Canceled):
-	case err != nil:
-		log.Warn("kopia server check failed", "error", err.Error(), "retryable", kopiaclient.IsRetryable(err))
-	case !st.Connected:
-		log.Warn("kopia server has no connected repository yet")
-	default:
-		log.Info("connected to kopia server", "hostname", st.Hostname, "username", st.Username, "storage", st.Storage)
-	}
 }
 
 // runHealthcheck probes /healthz of the watcher running in the same
