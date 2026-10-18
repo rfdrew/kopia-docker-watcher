@@ -185,7 +185,8 @@ func TestRunWatcherStartsAndStops(t *testing.T) {
 		msgs = append(msgs, l["level"].(string)+" "+l["msg"].(string))
 	}
 
-	want := []string{"WARN KOPIA_PASSWORD is ignored", "INFO starting kopia-docker-watcher", "INFO serving HTTP", "INFO stopped"}
+	want := []string{"WARN KOPIA_PASSWORD is ignored", "INFO starting kopia-docker-watcher", "INFO serving HTTP",
+		"INFO HTTP server stopped", "INFO stopped"}
 	if len(msgs) != len(want) {
 		t.Fatalf("log = %q, want %q", msgs, want)
 	}

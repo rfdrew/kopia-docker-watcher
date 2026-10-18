@@ -3,8 +3,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -116,6 +120,158 @@ func TestIntegrationValidate(t *testing.T) {
 	src := kopiaclient.SourceInfo{Host: kopiatest.Hostname, UserName: kopiatest.Username, Path: kopiatest.HelloDir}
 	if _, err := c.GetPolicy(t.Context(), src); !errors.Is(err, kopiaclient.ErrNotFound) {
 		t.Errorf("validate left a policy for %s: err = %v", src, err)
+	}
+}
+
+// TestIntegrationRun runs the watcher against a real kopia server and a
+// real Docker Engine: it registers the path of a running container with
+// the backup labels, pauses the source when the container stops and
+// resumes it when the container starts again.
+func TestIntegrationRun(t *testing.T) {
+	s := kopiatest.Start(t, kopiatest.Options{})
+
+	c, err := kopiaclient.New(kopiaclient.Options{
+		URL:             s.URL,
+		Username:        kopiatest.UIUser,
+		Password:        kopiatest.UIPassword,
+		CertFingerprint: s.CertFingerprint,
+		Timeout:         time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+
+	// The path label names the directory kopiatest creates in the kopia
+	// server container, under HOST_PREFIX.
+	ctr, err := testcontainers.Run(ctx, "busybox:1.37",
+		testcontainers.WithCmd("sleep", "600"),
+		testcontainers.WithLabels(map[string]string{
+			"kopia.enable":   "true",
+			"kopia.path":     "/hello",
+			"kopia.schedule": "30 4 * * *",
+		}),
+	)
+	testcontainers.CleanupContainer(t, ctr)
+
+	if err != nil {
+		t.Fatalf("start busybox: %v", err)
+	}
+
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+
+	td := newTestDeps(env(
+		"KOPIA_SERVER_URL", s.URL,
+		"KOPIA_SERVER_USERNAME", kopiatest.UIUser,
+		"KOPIA_SERVER_PASSWORD", kopiatest.UIPassword,
+		"KOPIA_SERVER_CERT_FINGERPRINT", s.CertFingerprint,
+		"HOST_PREFIX", kopiatest.DataDir,
+		"STATE_FILE", stateFile,
+		"LOG_LEVEL", "debug",
+	))
+	td.newDocker = newDocker
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+
+	done := make(chan int, 1)
+
+	go func() { done <- run(runCtx, []string{"run"}, td.deps) }()
+
+	src := kopiaclient.SourceInfo{Host: kopiatest.Hostname, UserName: kopiatest.Username, Path: kopiatest.HelloDir}
+
+	// scheduling returns the scheduling section of the path's policy, ""
+	// while there is none.
+	scheduling := func() string {
+		pol, err := c.GetPolicy(ctx, src)
+		if errors.Is(err, kopiaclient.ErrNotFound) {
+			return ""
+		}
+
+		if err != nil {
+			t.Fatalf("get policy: %v", err)
+		}
+
+		var p struct {
+			Scheduling json.RawMessage `json:"scheduling"`
+		}
+
+		if err := json.Unmarshal(pol, &p); err != nil {
+			t.Fatalf("policy %s: %v", pol, err)
+		}
+
+		var b bytes.Buffer
+		if err := json.Compact(&b, p.Scheduling); err != nil {
+			t.Fatalf("scheduling %s: %v", p.Scheduling, err)
+		}
+
+		return b.String()
+	}
+
+	waitScheduling := func(what, want string) {
+		t.Helper()
+
+		deadline := time.Now().Add(2 * time.Minute)
+
+		for {
+			got := scheduling()
+			if got == want {
+				return
+			}
+
+			select {
+			case code := <-done:
+				t.Fatalf("watcher exited with %d while waiting for %s; log:\n%s", code, what, td.stderr)
+			case <-time.After(500 * time.Millisecond):
+			}
+
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: scheduling = %s, want %s; log:\n%s", what, got, want, td.stderr)
+			}
+		}
+	}
+
+	const running = `{"cron":["30 4 * * *"]}`
+
+	waitScheduling("registration", running)
+
+	if !slices.Contains(sourcePaths(t, c), src.String()) {
+		t.Errorf("kopia server does not list %s: %q", src, sourcePaths(t, c))
+	}
+
+	stopTimeout := 2 * time.Second
+	if err := ctr.Stop(ctx, &stopTimeout); err != nil {
+		t.Fatalf("stop busybox: %v", err)
+	}
+
+	waitScheduling("pause", `{"manual":true}`)
+
+	if err := ctr.Start(ctx); err != nil {
+		t.Fatalf("start busybox again: %v", err)
+	}
+
+	waitScheduling("resume", running)
+
+	stop()
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Errorf("watcher exit code = %d; log:\n%s", code, td.stderr)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("watcher did not stop; log:\n%s", td.stderr)
+	}
+
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(data), kopiatest.HelloDir) {
+		t.Errorf("state file has no record of %s:\n%s", kopiatest.HelloDir, data)
 	}
 }
 
