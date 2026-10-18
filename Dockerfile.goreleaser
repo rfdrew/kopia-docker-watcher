@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+
+# Release image built by goreleaser (dockers_v2 in .goreleaser.yaml). The
+# build context holds the binaries goreleaser already built, one per
+# platform under $TARGETPLATFORM/. Keep the runtime part in sync with the
+# root Dockerfile, which compiles from source for CI and `make docker`.
+
+FROM gcr.io/distroless/static-debian13:nonroot
+
+ARG TARGETPLATFORM
+
+COPY $TARGETPLATFORM/kopia-docker-watcher /usr/local/bin/kopia-docker-watcher
+
+# Directory of STATE_FILE. distroless has no shell to mkdir it, so the empty
+# home of nonroot from the same base image is copied in its place, owned by
+# nonroot: a named volume mounted here starts with that owner.
+COPY --from=gcr.io/distroless/static-debian13:nonroot --chown=65532:65532 /home/nonroot /var/lib/kopia-docker-watcher
+
+USER 65532:65532
+
+EXPOSE 8080
+
+# distroless has no shell or curl: the binary probes its own /healthz on
+# LISTEN_ADDR.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD ["/usr/local/bin/kopia-docker-watcher", "healthcheck"]
+
+ENTRYPOINT ["/usr/local/bin/kopia-docker-watcher"]
