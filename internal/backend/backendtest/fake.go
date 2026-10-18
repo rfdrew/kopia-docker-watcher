@@ -7,7 +7,8 @@
 // that combines manual with anything else, a path with a trailing slash,
 // upload.maxParallelSnapshots on a path (only when the policy is stored,
 // as kopia server's policy/resolve does not check it), a source of another
-// identity, a path that does not exist on registration, a cron expression
+// identity or with a path that is not absolute, a path that does not exist
+// on registration, a cron expression
 // marked invalid, a policy a check set with SetPolicyCheck refuses. It can also rewrite stored policies the way kopia
 // server does (SetNormalizer). A source without snapshots is forgotten when
 // its policy is deleted, as kopia server forgets it.
@@ -537,11 +538,15 @@ func (f *Fake) source(src backend.Source) *sourceState {
 	return s
 }
 
-// own checks that src is a complete source of kopia server's identity.
-// f.mu is held.
+// own checks that src is a complete source of kopia server's identity
+// with an absolute path. f.mu is held.
 func (f *Fake) own(op Method, src backend.Source) error {
 	if err := src.Validate(); err != nil {
 		return &backend.Error{Op: string(op), Source: src, Err: err}
+	}
+
+	if !path.IsAbs(src.Path) {
+		return &backend.Error{Op: string(op), Source: src, Err: fmt.Errorf("source path %q is not absolute", src.Path)}
 	}
 
 	if src.Host != f.host || src.UserName != f.userName {

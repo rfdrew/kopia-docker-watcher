@@ -20,10 +20,13 @@ import (
 // (kopiatest.DefaultImage unless KOPIA_IMAGE names another), with the
 // reconcile steps of package backend.
 //
-// kopia server snapshots a source registered with a schedule right away:
-// runMissed is on by default, and a source never snapshotted counts as
-// missed. Assertions that need a source without snapshots register it
-// paused.
+// kopia server usually snapshots a source registered with a schedule
+// right away: runMissed is on by default and a source never snapshotted
+// counts as missed, but only when its next scheduled run is more than 30
+// minutes away (checkMissedSnapshot in kopia's
+// snapshot/policy/scheduling_policy.go). Assertions that need a source
+// without snapshots register it paused; a test that needs a snapshot
+// starts one with TriggerSnapshot instead of waiting for kopia server's.
 func TestIntegrationBackend(t *testing.T) {
 	s := kopiatest.Start(t, kopiatest.Options{})
 

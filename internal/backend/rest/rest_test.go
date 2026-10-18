@@ -292,6 +292,16 @@ func TestListSources(t *testing.T) {
 		t.Errorf("requests = %+v, want a filtered and an unfiltered GET sources", r)
 	}
 
+	f.resetRequests()
+
+	if _, err := b.ListSources(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if r := f.requestsTo("GET sources"); len(r) != 1 || r[0].Query.Get("host") != "kopia-2" || r[0].Query.Get("userName") != "other" {
+		t.Errorf("requests = %+v, want one GET sources filtered by other@kopia-2", r)
+	}
+
 	f.set(func(f *fakeKopia) { f.userName = fakeUser })
 
 	// An empty list is no error.
@@ -1092,6 +1102,16 @@ func TestTriggerSnapshot(t *testing.T) {
 		t.Errorf("uploads = %d after a failed task list", f.uploads(info("/data/app")))
 	}
 
+	// kopia server runs every source read-only when its repository is
+	// connected read-only: no trigger, and no retries.
+	ro := f.addSource(info("/data/ro"), nil)
+	ro.status = kopiaclient.SourceStatusRemote
+	f.resetRequests()
+
+	_, err = b.TriggerSnapshot(t.Context(), src("/data/ro"))
+	assertError(t, err, opTriggerSnapshot, src("/data/ro"), nil)
+	assertRoutes(t, f, "GET sources")
+
 	// A source without snapshots has no last start.
 	ticket, err = b.TriggerSnapshot(t.Context(), src("/data/app2"))
 	if err != nil || !ticket.LastSnapshotStart.IsZero() || !slices.Equal(ticket.TasksBefore, []string{"4"}) {
@@ -1401,6 +1421,11 @@ func TestErrorKinds(t *testing.T) {
 		{"write", answer{status: 413, body: tooLarge}, backend.ErrConfig},
 		{"write", answer{status: 400, body: notConn}, backend.ErrUnavailable},
 		{"write", answer{err: errors.New("connection reset")}, backend.ErrUnavailable},
+		{"write", answer{status: 401, body: "nope"}, nil},
+		{"write", answer{status: 403, body: accessDeny}, nil},
+		{"write", answer{status: 404, body: "404 page not found"}, nil},
+		{"write", answer{status: 400, body: unknownCode}, nil},
+		{"write", answer{status: 418, body: "teapot"}, nil},
 
 		// POST /api/v1/sources.
 		{"register", answer{status: 400, body: `{"code":"PATH_NOT_FOUND","error":"path does not exist"}`}, backend.ErrConfig},
@@ -1412,11 +1437,21 @@ func TestErrorKinds(t *testing.T) {
 		{"register", answer{status: 400, body: notConn}, backend.ErrUnavailable},
 		{"register", answer{status: 500, body: roInitial}, nil},
 		{"register", answer{status: 413, body: tooLarge}, backend.ErrConfig},
+		{"register", answer{status: 401, body: "nope"}, nil},
+		{"register", answer{status: 403, body: accessDeny}, nil},
+		{"register", answer{status: 404, body: "404 page not found"}, nil},
+		{"register", answer{status: 400, body: unknownCode}, nil},
+		{"register", answer{status: 418, body: "teapot"}, nil},
 
 		// POST /api/v1/policy/resolve.
 		{"resolve", answer{status: 400, body: `{"code":"MALFORMED_REQUEST","error":"unable to decode request: x"}`}, backend.ErrConfig},
 		{"resolve", answer{status: 500, body: internal}, backend.ErrTemporary},
 		{"resolve", answer{status: 413, body: tooLarge}, backend.ErrConfig},
+		{"resolve", answer{status: 401, body: "nope"}, nil},
+		{"resolve", answer{status: 403, body: accessDeny}, nil},
+		{"resolve", answer{status: 404, body: "404 page not found"}, nil},
+		{"resolve", answer{status: 400, body: unknownCode}, nil},
+		{"resolve", answer{status: 418, body: "teapot"}, nil},
 		{"resolve", answer{status: 200, body: `{"effective":{},"schedulingError":"invalid cron expression"}`}, backend.ErrConfig},
 
 		// DELETE /api/v1/policy.
@@ -1529,6 +1564,23 @@ func TestListSourcesIdentityHint(t *testing.T) {
 	if r := f.requestsTo("GET sources"); len(r) != 1 || r[0].Query.Get("host") != fakeHost || r[0].Query.Get("userName") != fakeUser {
 		t.Errorf("requests = %+v, want one GET sources filtered by root@kopia", r)
 	}
+
+	// The identity check of a plan gives the filter too.
+	b = newBackend(t, f)
+
+	if _, err := b.PlanSource(t.Context(), backend.Desired{Source: src("/data/app")}, backend.Applied{}); err != nil {
+		t.Fatal(err)
+	}
+
+	f.resetRequests()
+
+	if _, err := b.ListSources(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if r := f.requestsTo("GET sources"); len(r) != 1 || r[0].Query.Get("host") != fakeHost || r[0].Query.Get("userName") != fakeUser {
+		t.Errorf("after a plan: requests = %+v, want one GET sources filtered by root@kopia", r)
+	}
 }
 
 // The listing keeps only kopia server's own sources with a path, sorted by
@@ -1578,13 +1630,19 @@ func TestPlanSourceExactMatch(t *testing.T) {
 		t.Errorf("plan = %+v, status %+v", plan, plan.Status)
 	}
 
-	// Another user's source with the same path is not this one.
-	f.inject("GET sources", injection{status: http.StatusOK, body: `{"localHost":"kopia","localUsername":"root","sources":[` +
-		`{"source":{"host":"kopia","userName":"other","path":"/data/app"},"status":"IDLE"}]}`})
+	// Another user's or another host's source with the same path is not
+	// this one.
+	for _, other := range []string{
+		`{"host":"kopia","userName":"other","path":"/data/app"}`,
+		`{"host":"laptop","userName":"root","path":"/data/app"}`,
+	} {
+		f.inject("GET sources", injection{status: http.StatusOK,
+			body: `{"localHost":"kopia","localUsername":"root","sources":[{"source":` + other + `,"status":"IDLE"}]}`})
 
-	plan, err = b.PlanSource(t.Context(), backend.Desired{Source: s}, backend.Applied{})
-	if err != nil || plan.Known || plan.Action != backend.ActionRegister {
-		t.Errorf("plan = %+v, %v", plan, err)
+		plan, err = b.PlanSource(t.Context(), backend.Desired{Source: s}, backend.Applied{})
+		if err != nil || plan.Known || plan.Action != backend.ActionRegister {
+			t.Errorf("%s: plan = %+v, %v", other, plan, err)
+		}
 	}
 }
 
@@ -1760,13 +1818,36 @@ func TestReadRequestKinds(t *testing.T) {
 // trusted, and the next pass writes the watcher's fields again. Another
 // client's change to a field the watcher does not own is kept.
 func TestApplyPlanAnotherWriterInBetween(t *testing.T) {
+	s := src("/data/app")
+	running := backend.Desired{Source: s, Patch: cron("5 * * * *")}
+
 	for name, tc := range map[string]struct {
-		other   string
+		// write is the desired state whose apply the other client
+		// overtakes; the source starts as cron 0 * * * *.
+		write backend.Desired
+		other string
+		// after is the policy after the next pass; the other client's if
+		// the read-back is trusted.
+		after   string
 		trusted bool
 	}{
-		"pause":     {`{"scheduling":{"manual":true}}`, false},
-		"cron":      {`{"scheduling":{"cron":["30 2 * * *"]}}`, false},
-		"retention": {`{"scheduling":{"cron":["5 * * * *"]},"retention":{"keepDaily":3}}`, true},
+		"pause":            {running, `{"scheduling":{"manual":true}}`, `{"scheduling":{"cron":["5 * * * *"]}}`, false},
+		"cron":             {running, `{"scheduling":{"cron":["30 2 * * *"]}}`, `{"scheduling":{"cron":["5 * * * *"]}}`, false},
+		"cron added":       {running, `{"scheduling":{"cron":["5 * * * *","30 2 * * *"]}}`, `{"scheduling":{"cron":["5 * * * *"]}}`, false},
+		"schedule removed": {running, `{"retention":{"keepDaily":3}}`, `{"retention":{"keepDaily":3},"scheduling":{"cron":["5 * * * *"]}}`, false},
+		"second cron changed": {
+			backend.Desired{Source: s, Patch: cron("5 * * * *", "10 * * * *")},
+			`{"scheduling":{"cron":["5 * * * *","20 * * * *"]}}`, `{"scheduling":{"cron":["5 * * * *","10 * * * *"]}}`, false,
+		},
+		// The pause alone tells: neither side has a cron.
+		"unpaused while pausing": {
+			backend.Desired{Source: s, Patch: cron("0 * * * *"), Paused: true},
+			`{"scheduling":{"intervalSeconds":3600}}`, `{"scheduling":{"manual":true}}`, false,
+		},
+		// Lifting a pause without a saved section leaves an empty one.
+		"paused while the schedule goes": {backend.Desired{Source: s}, `{"scheduling":{"manual":true}}`, `{"scheduling":{}}`, false},
+		"retention": {running, `{"scheduling":{"cron":["5 * * * *"]},"retention":{"keepDaily":3}}`,
+			`{"scheduling":{"cron":["5 * * * *"]},"retention":{"keepDaily":3}}`, true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFakeKopia()
@@ -1775,11 +1856,9 @@ func TestApplyPlanAnotherWriterInBetween(t *testing.T) {
 
 			b := newBackendLog(t, f, slog.New(slog.NewTextHandler(&logs, nil)))
 			st := memState{}
-			s := src("/data/app")
 			si := info("/data/app")
-			want := backend.Desired{Source: s, Patch: cron("0 * * * *")}
 
-			mustReconcile(t, b, st, want)
+			mustReconcile(t, b, st, backend.Desired{Source: s, Patch: cron("0 * * * *")})
 
 			var armed atomic.Bool
 
@@ -1796,8 +1875,10 @@ func TestApplyPlanAnotherWriterInBetween(t *testing.T) {
 				}
 			})
 
-			want.Patch = cron("5 * * * *")
-			mustReconcile(t, b, st, want)
+			if r := mustReconcile(t, b, st, tc.write); r.Plan.Action != backend.ActionUpdate {
+				t.Fatalf("Action = %v", r.Plan.Action)
+			}
+
 			f.set(func(f *fakeKopia) { f.hook = nil })
 
 			if got := st[s].StoredHash != ""; got != tc.trusted {
@@ -1808,23 +1889,16 @@ func TestApplyPlanAnotherWriterInBetween(t *testing.T) {
 				t.Errorf("log = %s", logs.String())
 			}
 
-			r := mustReconcile(t, b, st, want)
-
+			want := backend.ActionUpdate
 			if tc.trusted {
-				if r.Plan.Action != backend.ActionNone {
-					t.Errorf("Action = %v", r.Plan.Action)
-				}
-
-				mustPolicy(t, f, si, tc.other)
-
-				return
+				want = backend.ActionNone
 			}
 
-			if r.Plan.Action != backend.ActionUpdate {
-				t.Errorf("Action = %v", r.Plan.Action)
+			if r := mustReconcile(t, b, st, tc.write); r.Plan.Action != want {
+				t.Errorf("next pass: Action = %v, want %v", r.Plan.Action, want)
 			}
 
-			mustPolicy(t, f, si, `{"scheduling":{"cron":["5 * * * *"]}}`)
+			mustPolicy(t, f, si, tc.after)
 		})
 	}
 }
@@ -1863,6 +1937,71 @@ func TestApplyPlanReadBackCanceled(t *testing.T) {
 	mustPolicy(t, f, info("/data/app"), `{"scheduling":{"cron":["0 * * * *"]}}`)
 
 	if l := logs.String(); strings.Contains(l, "level=WARN") || !strings.Contains(l, "level=DEBUG") {
+		t.Errorf("log = %s", l)
+	}
+}
+
+// The caller's deadline passes during the read-back: no warning either.
+func TestApplyPlanReadBackDeadline(t *testing.T) {
+	f := newFakeKopia()
+
+	var logs syncBuffer
+
+	b := newBackendLog(t, f, slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	plan, err := b.PlanSource(t.Context(), backend.Desired{Source: src("/data/app"), Patch: cron("0 * * * *")}, backend.Applied{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	f.set(func(f *fakeKopia) {
+		f.hook = func(r fakeRequest) {
+			if r.Route == "PUT policy" {
+				<-ctx.Done()
+			}
+		}
+	})
+
+	applied, err := b.ApplyPlan(ctx, plan)
+	if err != nil || applied.StoredHash != "" {
+		t.Fatalf("ApplyPlan = %+v, %v", applied, err)
+	}
+
+	if l := logs.String(); strings.Contains(l, "level=WARN") || !strings.Contains(l, "level=DEBUG") {
+		t.Errorf("log = %s", l)
+	}
+}
+
+// The HTTP client's own timeout cuts off the read-back while the caller
+// still waits: kopia server failed to answer, which is a warning.
+func TestApplyPlanReadBackClientTimeout(t *testing.T) {
+	f := newFakeKopia()
+
+	plan, err := newBackend(t, f).PlanSource(t.Context(), backend.Desired{Source: src("/data/app"), Patch: cron("0 * * * *")}, backend.Applied{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := kopiaclient.New(kopiaclient.Options{
+		URL: "http://kopia.test:51515", Transport: blockingTransport{inner: f, route: "GET policy"}, Timeout: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var logs syncBuffer
+
+	b := New(c, slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	applied, err := b.ApplyPlan(t.Context(), plan)
+	if err != nil || applied.StoredHash != "" {
+		t.Fatalf("ApplyPlan = %+v, %v", applied, err)
+	}
+
+	if l := logs.String(); !strings.Contains(l, "level=WARN") || !strings.Contains(l, "could not read back") {
 		t.Errorf("log = %s", l)
 	}
 }

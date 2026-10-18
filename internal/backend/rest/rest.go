@@ -367,7 +367,9 @@ func (b *Backend) DeletePolicy(ctx context.Context, src backend.Source) error {
 // ticket records the start of the source's last snapshot and the IDs of
 // the source's snapshot tasks kopia server lists before the trigger. A
 // source kopia server has not picked up yet is ErrTemporary, as after a
-// policy write whose refresh failed.
+// policy write whose refresh failed. A source kopia server runs read-only
+// (status REMOTE: the repository is connected read-only) is an error of
+// neither kind.
 //
 // It is provisional, like the method in backend.Backend: the snapshot
 // lifecycle may change it.
@@ -375,6 +377,11 @@ func (b *Backend) TriggerSnapshot(ctx context.Context, src backend.Source) (back
 	status, err := b.lookup(ctx, opTriggerSnapshot, src)
 	if err != nil {
 		return backend.SnapshotTicket{}, err
+	}
+
+	if status != nil && status.Status == kopiaclient.SourceStatusRemote {
+		return backend.SnapshotTicket{}, &backend.Error{Op: opTriggerSnapshot, Source: src,
+			Err: errors.New("kopia server does not snapshot the source: its repository is connected read-only")}
 	}
 
 	tasks, err := b.client.ListTasks(ctx)

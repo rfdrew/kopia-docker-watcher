@@ -124,7 +124,8 @@ import (
 // alongside them.
 //
 // Every method that takes a Source requires a complete one
-// (ErrIncompleteSource) of kopia server's own identity (ErrWrongIdentity).
+// (ErrIncompleteSource) with an absolute path (an error of neither kind
+// otherwise), of kopia server's own identity (ErrWrongIdentity).
 type Backend interface {
 	// ServerIdentity returns the user name and host kopia server snapshots
 	// its own sources as (GET /api/v1/sources: localUsername and

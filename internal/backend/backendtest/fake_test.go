@@ -571,6 +571,31 @@ func TestWrongIdentityEverywhere(t *testing.T) {
 	}
 }
 
+// A source path that is not absolute is refused like the REST backend
+// refuses it: kopia server would resolve it against its home directory on
+// registration only.
+func TestRelativePathRefused(t *testing.T) {
+	f := New()
+
+	for _, p := range []string{"data/app", "~/app"} {
+		src := f.Source(p)
+
+		_, err := f.PlanSource(ctx, backend.Desired{Source: src, Patch: cron("0 * * * *")}, backend.Applied{})
+		if err == nil || backend.IsConfig(err) || backend.IsTemporary(err) || !strings.Contains(err.Error(), "not absolute") {
+			t.Errorf("PlanSource(%q): %v", p, err)
+		}
+
+		_, err = f.ApplyPlan(ctx, backend.Plan{Source: src, Action: backend.ActionRegister, Merged: backend.Merged{Policy: json.RawMessage(`{}`)}})
+		if err == nil || !strings.Contains(err.Error(), "not absolute") {
+			t.Errorf("ApplyPlan(%q): %v", p, err)
+		}
+
+		if f.Known(src) {
+			t.Errorf("%q registered", p)
+		}
+	}
+}
+
 // A failure set with FailNextAfter is used up by the next call of the
 // method, also when that call fails for another reason first, and never by
 // an ApplyPlan of ActionNone, which sends nothing.
