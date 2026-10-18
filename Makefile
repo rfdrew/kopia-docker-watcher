@@ -8,8 +8,9 @@ LDFLAGS := -s -w -X $(PKG)/internal/version.Version=$(VERSION)
 
 IMAGE   ?= kopia-docker-watcher:dev
 
-# Integration tests start kopia/kopia in Docker; KOPIA_IMAGE picks the release.
-KOPIA_IMAGE ?= kopia/kopia:0.23.1
+# Integration tests start kopia server in Docker, by default the latest
+# release pinned in internal/kopiatest; KOPIA_IMAGE overrides the image.
+KOPIA_IMAGE ?=
 
 .PHONY: all build test test-integration lint fmt tidy docker clean
 

@@ -35,20 +35,16 @@ jobs:
       - run: go build ./...
       - run: go test -race ./...
 
+  # Only the latest kopia release is supported; its image is pinned in
+  # internal/kopiatest.DefaultImage.
   integration:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # Supported kopia release lines (ROADMAP section 2), latest patch of each.
-        kopia: ["0.22.3", "0.23.1"]
-    name: integration (kopia ${{ matrix.kopia }})
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - run: make test-integration KOPIA_IMAGE=kopia/kopia:${{ matrix.kopia }}
+      - run: make test-integration
 
   image:
     runs-on: ubuntu-latest
