@@ -125,8 +125,8 @@ func TestIntegrationValidate(t *testing.T) {
 
 // TestIntegrationRun runs the watcher against a real kopia server and a
 // real Docker Engine: it registers the path of a running container with
-// the backup labels, pauses the source when the container stops and
-// resumes it when the container starts again.
+// the backup labels, pauses the source when the container stops, and
+// resumes it and takes a snapshot when the container starts again.
 func TestIntegrationRun(t *testing.T) {
 	s := kopiatest.Start(t, kopiatest.Options{})
 
@@ -145,13 +145,16 @@ func TestIntegrationRun(t *testing.T) {
 	defer cancel()
 
 	// The path label names the directory kopiatest creates in the kopia
-	// server container, under HOST_PREFIX.
+	// server container, under HOST_PREFIX. kopia server snapshots the
+	// source as soon as it is registered (runMissed), so the start
+	// snapshot needs no minimum interval.
 	ctr, err := testcontainers.Run(ctx, "busybox:1.37",
 		testcontainers.WithCmd("sleep", "600"),
 		testcontainers.WithLabels(map[string]string{
-			"kopia.enable":   "true",
-			"kopia.path":     "/hello",
-			"kopia.schedule": "30 4 * * *",
+			"kopia.enable":       "true",
+			"kopia.path":         "/hello",
+			"kopia.schedule":     "30 4 * * *",
+			"kopia.min-interval": "0",
 		}),
 	)
 	testcontainers.CleanupContainer(t, ctr)
@@ -248,11 +251,30 @@ func TestIntegrationRun(t *testing.T) {
 
 	waitScheduling("pause", `{"manual":true}`)
 
+	// A start does not queue a snapshot while one runs, so the snapshot
+	// kopia server took at the registration has to end first.
+	waitIdle(t, c, src)
+
+	before := snapshotTasks(t, c, src)
+
 	if err := ctr.Start(ctx); err != nil {
 		t.Fatalf("start busybox again: %v", err)
 	}
 
 	waitScheduling("resume", running)
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for len(snapshotTasks(t, c, src)) <= len(before) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no snapshot after the start: tasks %v; log:\n%s", snapshotTasks(t, c, src), td.stderr)
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if !strings.Contains(td.stderr.String(), `"msg":"snapshot queued"`) {
+		t.Errorf("the watcher did not queue the snapshot; log:\n%s", td.stderr)
+	}
 
 	stop()
 
@@ -273,6 +295,50 @@ func TestIntegrationRun(t *testing.T) {
 	if !strings.Contains(string(data), kopiatest.HelloDir) {
 		t.Errorf("state file has no record of %s:\n%s", kopiatest.HelloDir, data)
 	}
+}
+
+// waitIdle waits until kopia server runs no snapshot of src.
+func waitIdle(t *testing.T, c *kopiaclient.Client, src kopiaclient.SourceInfo) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Minute)
+
+	for {
+		resp, err := c.ListSources(t.Context(), src)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(resp.Sources) == 1 && resp.Sources[0].Status == kopiaclient.SourceStatusIdle {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("%s is not idle: %+v", src, resp.Sources)
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// snapshotTasks returns the IDs of kopia server's snapshot tasks of src.
+func snapshotTasks(t *testing.T, c *kopiaclient.Client, src kopiaclient.SourceInfo) []string {
+	t.Helper()
+
+	tasks, err := c.ListTasks(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out []string
+
+	for _, task := range tasks {
+		if task.Kind == kopiaclient.TaskKindSnapshot && strings.HasPrefix(task.Description, src.String()+" at ") {
+			out = append(out, task.ID)
+		}
+	}
+
+	return out
 }
 
 func waitRepository(t *testing.T, c *kopiaclient.Client) {

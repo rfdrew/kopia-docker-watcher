@@ -28,6 +28,9 @@ type harness struct {
 	logs      *syncBuffer
 	out       *syncBuffer
 	r         *Reconciler
+	// opts are the options r was made with, for another Reconciler on the
+	// same fakes and state.
+	opts Options
 }
 
 type harnessOption func(*Options)
@@ -79,6 +82,7 @@ func newHarness(t *testing.T, opts ...harnessOption) *harness {
 	}
 
 	h.r = r
+	h.opts = o
 
 	return h
 }

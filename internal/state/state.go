@@ -6,9 +6,12 @@
 // container labels. For every source the watcher has reconciled, the store
 // keeps a Record, which holds backend.Applied: the policy patch last
 // applied, the scheduling section a pause replaced, an apply in progress,
-// the fingerprint of the stored policy. A record stays until it is
-// deleted, also when it holds nothing else, so the store lists every
-// source the watcher manages.
+// the fingerprint of the stored policy. It also holds what the snapshot
+// lifecycle needs across restarts: the snapshots the watcher queued and
+// still waits for, when it last queued one, and the mark after which
+// snapshots get a description. A record stays until it is deleted, also
+// when it holds nothing else, so the store lists every source the watcher
+// manages.
 //
 // # Using the store
 //
@@ -38,7 +41,11 @@
 //	      "source": {"host": "kopia", "userName": "root", "path": "/data/app"},
 //	      "patch": {"scheduling": {"cron": ["0 * * * *"]}},
 //	      "savedScheduling": {"cron": ["0 * * * *"], "runMissed": true},
-//	      "storedHash": "sha256:…"
+//	      "storedHash": "sha256:…",
+//	      "snapshotWaits": [{"ticket": {…}, "stop": true, "reason": "stop of app", "description": "app"}],
+//	      "lastTriggered": "2026-10-18T12:00:00Z",
+//	      "annotateAfter": "2026-10-18T11:00:00Z",
+//	      "stopAbsorbedAt": "2026-10-18T12:30:00Z"
 //	    }
 //	  ]
 //	}
@@ -75,11 +82,9 @@
 // goes into a new top-level field of the file. Fields are never renamed or
 // given a new meaning in place; Version is raised, with a migration in
 // load, only for a change an older watcher would misread. Planned
-// additions: pending snapshot waits and the annotation mark per source
-// (a record from before the mark existed has none, which must not be read
-// as "annotate everything"), owners and the cleanup mode per source, and
-// containers the watcher stopped itself. Records of another kopia server
-// identity than the current one must never be cleaned up automatically.
+// additions: owners and the cleanup mode per source, and containers the
+// watcher stopped itself. Records of another kopia server identity than
+// the current one must never be cleaned up automatically.
 package state
 
 import (
@@ -140,9 +145,78 @@ type Record struct {
 	// A field added here must not be named "source", which holds the
 	// entry's source, nor share a JSON name with a field of
 	// backend.Applied: encoding/json would quietly drop one of the two.
+
+	// SnapshotWaits are the snapshots the watcher queued and has not
+	// finished with yet, in the order they were queued: those it still
+	// waits for, and those whose result a pass has yet to act on. After a
+	// restart the watcher waits for the first again and acts on the
+	// others. The reconciler skips a wait it cannot use and leaves it as
+	// it is, so a wait never makes the entry unreadable.
+	SnapshotWaits []SnapshotWait `json:"snapshotWaits,omitempty"`
+
+	// LastTriggered is when the watcher last queued a snapshot of the
+	// source; zero if never. The minimum interval between snapshots counts
+	// from it as well as from the last saved snapshot: a snapshot that
+	// fails saves none.
+	LastTriggered time.Time `json:"lastTriggered,omitzero"`
+
+	// AnnotateAfter is the mark of the source's snapshot descriptions: a
+	// snapshot that started after it and has no description gets the one
+	// of the path's containers, and the mark then moves past it. It is set
+	// to the start of the source's last snapshot when the watcher first
+	// manages the source, so the snapshots taken before stay as they are,
+	// or to the time the watcher looked if kopia server reported none. Nil
+	// means no mark yet, as in a record written before marks existed, and
+	// is never read as "annotate everything".
+	AnnotateAfter *time.Time `json:"annotateAfter,omitempty"`
+
+	// StopAbsorbedAt is when a container stopped while a snapshot of the
+	// source was pending, which then counts as the stop snapshot; zero if
+	// none. If kopia server loses that run, the stop snapshot is taken
+	// once more.
+	StopAbsorbedAt time.Time `json:"stopAbsorbedAt,omitzero"`
 }
 
-// Validate reports whether r can be stored.
+// SnapshotWait is a snapshot the watcher queued and has not finished with.
+//
+// Its fields are closed: an older watcher that rewrites the record drops
+// fields it does not know inside a wait, so new data about a wait goes
+// into a new field of the entry, keyed by the wait's ID.
+type SnapshotWait struct {
+	// ID tells the waits of a source apart.
+	ID string `json:"id"`
+	// Ticket follows the snapshot, as WaitSnapshot last updated it. Its
+	// JSON form is part of STATE_FILE.
+	Ticket backend.SnapshotTicket `json:"ticket"`
+	// Stop marks a snapshot taken because a container stopped.
+	Stop bool `json:"stop,omitempty"`
+	// Reason says for the log why it was taken, e.g. "start of app".
+	Reason string `json:"reason,omitempty"`
+	// Description is what the snapshot is described as once it is saved,
+	// worked out when it was queued: by the time it ends, the containers
+	// may be gone.
+	Description string `json:"description,omitempty"`
+	// Retried marks a snapshot taken once more because the first one was
+	// lost; it is not taken a third time.
+	Retried bool `json:"retried,omitempty"`
+	// Result is how the snapshot ended, once the watcher knows; nil while
+	// it waits. A pass acts on it and then removes the wait.
+	Result *SnapshotResult `json:"result,omitempty"`
+}
+
+// SnapshotResult is how a snapshot the watcher waited for ended.
+type SnapshotResult struct {
+	Outcome backend.SnapshotOutcome `json:"outcome"`
+	TaskID  string                  `json:"taskID,omitempty"`
+	// Error is the error message of a failed snapshot.
+	Error string `json:"error,omitempty"`
+	// SnapshotStart is the start of the snapshot the task saved; zero if
+	// it saved none.
+	SnapshotStart time.Time `json:"snapshotStart,omitzero"`
+}
+
+// Validate reports whether r can be stored. The snapshot waits are not
+// checked: the reconciler skips those it cannot use.
 func (r Record) Validate() error {
 	return r.Applied.Validate()
 }

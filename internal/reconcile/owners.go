@@ -61,13 +61,17 @@ func (pc parsed) patch() backend.PolicyPatch {
 
 // owner is a container that uses a path.
 type owner struct {
-	name  string
-	state docker.State
+	id     string
+	name   string
+	state  docker.State
+	labels map[string]string
 	// valid reports whether its labels can be applied; patch is only set
 	// then.
 	valid  bool
 	patch  backend.PolicyPatch
 	issues labels.Issues
+	// snap is what its labels say about snapshots.
+	snap snapLabels
 }
 
 // owners returns the containers that back up path p, stopped ones
@@ -81,7 +85,8 @@ func (r *Reconciler) owners(p string, containers []docker.Container) []owner {
 			continue
 		}
 
-		o := owner{name: c.Name, state: c.State, valid: pc.valid(), issues: pc.issues}
+		o := owner{id: c.ID, name: c.Name, state: c.State, labels: c.Labels, valid: pc.valid(), issues: pc.issues,
+			snap: r.snapshotLabels(pc)}
 		if o.valid {
 			o.patch = pc.patch()
 		}

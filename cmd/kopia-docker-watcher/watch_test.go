@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -48,7 +49,11 @@ type reply struct {
 //   - PUT /api/v1/policy rejects manual combined with anything else, as
 //     kopia server's validation does, else stores the policy;
 //   - POST /api/v1/policy/resolve returns the updates as the effective
-//     policy and one upcoming time per cron schedule.
+//     policy and one upcoming time per cron schedule;
+//   - GET /api/v1/tasks lists no tasks, GET /api/v1/snapshots no
+//     snapshots;
+//   - POST /api/v1/sources/upload records the path and succeeds for a
+//     known source.
 type runKopia struct {
 	t *testing.T
 
@@ -64,6 +69,8 @@ type runKopia struct {
 	// is canceled; putStarted receives a value as a PUT begins to wait.
 	putGate    chan struct{}
 	putStarted chan struct{}
+	// uploads are the paths of the sources/upload requests.
+	uploads []string
 }
 
 func newRunKopia(t *testing.T) *runKopia {
@@ -188,6 +195,23 @@ func (f *runKopia) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		writeJSONResponse(w, map[string]any{"effective": req.Updates, "upcomingSnapshotTimes": upcoming})
+	case "GET /api/v1/tasks":
+		writeJSONResponse(w, map[string]any{"tasks": []any{}})
+	case "GET /api/v1/snapshots":
+		f.checkSource(r)
+		writeJSONResponse(w, map[string]any{"snapshots": []any{}})
+	case "POST /api/v1/sources/upload":
+		f.checkSource(r)
+
+		p := q.Get("path")
+		if !f.known[p] {
+			writeKopiaError(w, http.StatusNotFound, "NOT_FOUND", "no source matches")
+			return
+		}
+
+		f.uploads = append(f.uploads, p)
+		src := fakeUser + "@" + fakeHost + ":" + p
+		writeJSONResponse(w, map[string]any{"sources": map[string]any{src: map[string]any{"success": true}}})
 	default:
 		f.t.Errorf("unexpected request %s %s", r.Method, r.URL)
 		writeKopiaError(w, http.StatusBadRequest, "MALFORMED_REQUEST", "unexpected")
@@ -794,6 +818,95 @@ func TestRunPausesOnEvent(t *testing.T) {
 
 	if code := wr.wait(t, 10*time.Second); code != 0 {
 		t.Fatalf("exit code = %d; log:\n%s", code, wr.td.stderr)
+	}
+}
+
+// A container start queues a snapshot through sources/upload. The REST
+// backend cannot follow snapshots yet: that is logged once, and the
+// watcher goes on.
+func TestRunSnapshotOnStart(t *testing.T) {
+	k := newRunKopia(t)
+	e := newWatchEngine(appContainer())
+
+	wr := startWatcher(t, k, e, watcherOptions{})
+
+	waitFor(t, "the policy", func() bool { return cronOf(t, k, "/srv/app") != nil })
+
+	start := docker.Event{Kind: docker.KindStarted, Action: "start", ContainerID: "c0ffee", Name: "app",
+		Labels: appContainer().Labels, Time: time.Now()}
+	e.events <- start
+
+	uploads := func() []string {
+		k.mu.Lock()
+		defer k.mu.Unlock()
+
+		return slices.Clone(k.uploads)
+	}
+
+	const notFollowed = "the backend cannot follow snapshots yet; their results are not checked"
+
+	waitFor(t, "the snapshot", func() bool { return len(uploads()) == 1 })
+	wr.waitLog(t, notFollowed)
+
+	// Another start within the minimum interval queues none.
+	e.events <- start
+
+	time.Sleep(3 * time.Second)
+
+	if got := uploads(); !slices.Equal(got, []string{"/srv/app"}) {
+		t.Errorf("uploads = %q", got)
+	}
+
+	wr.cancel()
+
+	if code := wr.wait(t, 10*time.Second); code != 0 {
+		t.Fatalf("exit code = %d; log:\n%s", code, wr.td.stderr)
+	}
+
+	if n := len(logMessages(wr.td.stderr.String(), notFollowed)); n != 1 {
+		t.Errorf("warned %d times", n)
+	}
+
+	// The wait the backend cannot follow is not kept; the trigger time is.
+	data, err := os.ReadFile(wr.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(string(data), "snapshotWaits") || !strings.Contains(string(data), "lastTriggered") {
+		t.Errorf("state file:\n%s", data)
+	}
+}
+
+// SNAPSHOT_ON_WATCHER_START takes a snapshot of the running containers at
+// the start; by default the start takes none.
+func TestRunSnapshotOnWatcherStart(t *testing.T) {
+	for _, tt := range []struct {
+		env  []string
+		want int
+	}{{nil, 0}, {[]string{"SNAPSHOT_ON_WATCHER_START", "true"}, 1}} {
+		t.Run(fmt.Sprint(tt.env), func(t *testing.T) {
+			k := newRunKopia(t)
+			e := newWatchEngine(appContainer())
+
+			wr := startWatcher(t, k, e, watcherOptions{env: tt.env})
+
+			waitFor(t, "the policy", func() bool { return cronOf(t, k, "/srv/app") != nil })
+
+			// The decision waits for the pass after the policy write.
+			time.Sleep(3 * time.Second)
+
+			k.mu.Lock()
+			n := len(k.uploads)
+			k.mu.Unlock()
+
+			if n != tt.want {
+				t.Errorf("%d uploads, want %d; log:\n%s", n, tt.want, wr.td.stderr)
+			}
+
+			wr.cancel()
+			wr.wait(t, 10*time.Second)
+		})
 	}
 }
 

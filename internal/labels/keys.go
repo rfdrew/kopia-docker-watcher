@@ -15,6 +15,7 @@ const (
 	KeySnapshotOnStop  = "snapshot-on-stop"
 	KeyDescription     = "description"
 	KeyTags            = "tags"
+	KeyMinInterval     = "min-interval"
 )
 
 // key is one supported label: its name relative to the prefix and how its
@@ -36,6 +37,7 @@ var keys = []key{
 	{KeySnapshotOnStop, func(p *parser, v string) { p.spec.SnapshotOnStop = p.bool(v) }},
 	{KeyDescription, func(p *parser, v string) { p.spec.Description = strings.TrimSpace(v) }},
 	{KeyTags, (*parser).tags},
+	{KeyMinInterval, (*parser).minInterval},
 }
 
 // plannedKeys are labels of later releases. They are ignored with a "not
@@ -43,8 +45,7 @@ var keys = []key{
 // the schema tests check them together with keys, so that a key added now
 // cannot clash with one of them later.
 var plannedKeys = []string{
-	// Snapshot pacing and cleanup.
-	"min-interval",
+	// Cleanup of abandoned sources.
 	"cleanup-on-remove",
 
 	// Policy of the path.

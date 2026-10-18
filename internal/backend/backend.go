@@ -122,8 +122,9 @@ import (
 // Backend is what the reconciler needs from kopia server. Implementations
 // are safe for concurrent use. The reconciler calls them for different
 // sources at once; for one source it does not overlap PlanSource,
-// ApplyPlan, PreviewSchedule and DeletePolicy, but WaitSnapshot may run
-// alongside them.
+// ApplyPlan, PreviewSchedule, DeletePolicy, TriggerSnapshot,
+// AnnotateSnapshot and ListSnapshots with each other, but WaitSnapshot may
+// run alongside them, also several times for one source.
 //
 // Every method that takes a Source requires a complete one
 // (ErrIncompleteSource) with an absolute path (an error of neither kind
@@ -179,12 +180,11 @@ type Backend interface {
 	// source without snapshots. Deleting a missing policy succeeds.
 	DeletePolicy(ctx context.Context, src Source) error
 
-	// The snapshot methods below are provisional: the snapshot lifecycle
-	// implements them and may still change them, and nothing calls them
-	// before that. It will also add a listing of a source's snapshots and
-	// a way to wait for a run that is already pending without queuing
-	// another one. Until then an implementation may return
-	// ErrNotImplemented.
+	// The snapshot methods below serve the snapshot lifecycle. An
+	// implementation that cannot do one yet returns ErrNotImplemented;
+	// the reconciler then logs it once and goes on without it. A run
+	// that is already pending is not followed: the reconciler counts it
+	// as the snapshot it would have queued.
 
 	// TriggerSnapshot queues a snapshot of src (sources/upload) and returns
 	// the ticket WaitSnapshot follows it with. kopia server returns no task
@@ -196,8 +196,10 @@ type Backend interface {
 	// handler of the source. Whenever it learns something that must survive
 	// a restart of the watcher, such as the task of the snapshot, it calls
 	// save with the updated ticket, so the caller can store it and wait
-	// with that ticket after a restart. It returns ctx's error when ctx is
-	// done.
+	// with that ticket after a restart; it calls save only from the
+	// goroutine that called it, and never after it returns. It returns
+	// ctx's error when ctx is done. The reconciler calls it again with the
+	// last saved ticket after an ErrTemporary error, and after a restart.
 	WaitSnapshot(ctx context.Context, ticket SnapshotTicket, save func(SnapshotTicket)) (SnapshotResult, error)
 
 	// AnnotateSnapshot sets the description of a snapshot of src and adds
@@ -285,7 +287,8 @@ type SnapshotInfo struct {
 }
 
 // SnapshotTicket identifies a snapshot TriggerSnapshot queued. It is plain
-// data, stored in STATE_FILE while the snapshot runs.
+// data, stored in STATE_FILE while the snapshot runs, so its JSON names are
+// part of the state file: fields are only added, never renamed.
 type SnapshotTicket struct {
 	Source Source `json:"source"`
 	// TriggeredAt is when the snapshot was queued.

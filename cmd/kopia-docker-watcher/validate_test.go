@@ -36,6 +36,7 @@ kopia.path               /data/, /logs
 kopia.schedule           0 2 * * *; 30 3 * * 0
 kopia.snapshot-on-start  true
 kopia.snapshot-on-stop   false
+kopia.min-interval       10m0s
 kopia.description        (container name)
 kopia.tags               env:prod, app:web
 
@@ -76,6 +77,18 @@ func TestValidate(t *testing.T) {
 			name:   "empty schedule",
 			args:   []string{"kopia.enable=true", "kopia.path=/data", "kopia.schedule="},
 			stdout: []string{"kopia.schedule (inherit from the parent policies)"},
+		},
+		{
+			name:   "min interval",
+			args:   []string{"kopia.enable=true", "kopia.path=/data", "kopia.min-interval=0"},
+			stdout: []string{"kopia.min-interval 0 (no minimum)"},
+		},
+		{
+			name: "bad min interval",
+			args: []string{"kopia.enable=true", "kopia.path=/data", "kopia.min-interval=1d"},
+			stdout: []string{"kopia.min-interval 10m0s",
+				`warning: kopia.min-interval: invalid duration "1d", the default 10m0s is used; ` +
+					"use a Go duration such as 10m, 1h or 24h (d is not a unit), or 0 for no minimum"},
 		},
 		{
 			name:   "error",
