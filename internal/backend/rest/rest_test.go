@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -258,6 +259,40 @@ func TestListSources(t *testing.T) {
 
 	_, err = b.ListSources(t.Context())
 	assertError(t, err, opListSources, backend.Source{}, backend.ErrUnavailable)
+
+	// Once listed under the new identity, the next listing filters by it
+	// with a single request.
+	f.set(func(f *fakeKopia) { f.host = "kopia-2" })
+
+	if _, err := b.ListSources(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	f.resetRequests()
+
+	if _, err := b.ListSources(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if r := f.requestsTo("GET sources"); len(r) != 1 || r[0].Query.Get("host") != "kopia-2" || r[0].Query.Get("userName") != fakeUser {
+		t.Errorf("requests = %+v, want one GET sources filtered by root@kopia-2", r)
+	}
+
+	// Only the user name changes.
+	f.set(func(f *fakeKopia) { f.userName = "other" })
+	f.addSource(kopiaclient.SourceInfo{Host: "kopia-2", UserName: "other", Path: "/data/d"}, nil)
+	f.resetRequests()
+
+	got, err = b.ListSources(t.Context())
+	if err != nil || len(got) != 1 || got[0].Source != (backend.Source{Host: "kopia-2", UserName: "other", Path: "/data/d"}) {
+		t.Errorf("after a user name change ListSources = %+v, %v", got, err)
+	}
+
+	if r := f.requestsTo("GET sources"); len(r) != 2 || len(r[1].Query) != 0 {
+		t.Errorf("requests = %+v, want a filtered and an unfiltered GET sources", r)
+	}
+
+	f.set(func(f *fakeKopia) { f.userName = fakeUser })
 
 	// An empty list is no error.
 	f.set(func(f *fakeKopia) { f.host = "kopia-3" })
@@ -630,10 +665,17 @@ func (s *syncBuffer) String() string {
 
 // A failed read-back does not fail the apply: the policy is stored.
 func TestApplyPlanReadBackFails(t *testing.T) {
-	for name, inj := range map[string]injection{
-		"500":       {status: http.StatusInternalServerError, body: `{"code":"INTERNAL","error":"boom"}`},
-		"null":      {status: http.StatusOK, body: "null"},
-		"transport": {err: errors.New("connection reset by peer")},
+	const failed, changed = "could not read back", "changed right after"
+
+	for name, tc := range map[string]struct {
+		inj injection
+		log string
+	}{
+		"500":       {injection{status: http.StatusInternalServerError, body: `{"code":"INTERNAL","error":"boom"}`}, failed},
+		"null":      {injection{status: http.StatusOK, body: "null"}, failed},
+		"transport": {injection{err: errors.New("connection reset by peer")}, failed},
+		// A schedule that does not decode is no schedule the watcher wrote.
+		"undecodable": {injection{status: http.StatusOK, body: `{"scheduling":{"manual":"yes"}}`}, changed},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFakeKopia()
@@ -648,7 +690,7 @@ func TestApplyPlanReadBackFails(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			f.inject("GET policy", inj)
+			f.inject("GET policy", tc.inj)
 
 			applied, err := b.ApplyPlan(t.Context(), plan)
 			if err != nil {
@@ -661,7 +703,7 @@ func TestApplyPlanReadBackFails(t *testing.T) {
 
 			mustPolicy(t, f, info("/data/app"), `{"scheduling":{"cron":["0 * * * *"]}}`)
 
-			if !strings.Contains(logs.String(), "could not read back") || !strings.Contains(logs.String(), "root@kopia:/data/app") {
+			if !strings.Contains(logs.String(), tc.log) || !strings.Contains(logs.String(), "root@kopia:/data/app") {
 				t.Errorf("log = %s", logs.String())
 			}
 		})
@@ -1010,6 +1052,7 @@ func TestTriggerSnapshot(t *testing.T) {
 			{ID: "4", Kind: kopiaclient.TaskKindSnapshot, Description: "root@kopia:/data/app2 at 2026-10-17T09:00:00Z"},
 			{ID: "5", Kind: "Maintenance", Description: "Periodic maintenance"},
 			{ID: "6", Kind: kopiaclient.TaskKindSnapshot, Description: "root@kopia:/data/app at 2026-10-18T08:00:00Z", Status: kopiaclient.TaskRunning},
+			{ID: "7", Kind: "Maintenance", Description: "root@kopia:/data/app at 2026-10-18T07:00:00Z"},
 		}
 	})
 
@@ -1256,6 +1299,9 @@ func TestErrorKinds(t *testing.T) {
 		notConn     = `{"code":"NOT_CONNECTED","error":"not connected"}`
 		storage     = `{"code":"STORAGE_CONNECTION","error":"storage"}`
 		notFound    = `{"code":"NOT_FOUND","error":"not found"}`
+		readOnly    = `{"code":"INTERNAL","error":"internal server error: unable to set policy: error flushing writer: error writing pack: storage is read-only"}`
+		roInitial   = `{"code":"INTERNAL","error":"internal server error: unable to set initial policy: error flushing writer: storage is read-only"}`
+		tooLarge    = "error reading request body"
 		accessDeny  = `{"code":"ACCESS_DENIED","error":"access denied"}`
 		unknownCode = `{"code":"SOMETHING_NEW","error":"?"}`
 	)
@@ -1343,6 +1389,7 @@ func TestErrorKinds(t *testing.T) {
 		{"read", answer{status: 400, body: unknownCode}, nil},
 		{"read", answer{status: 200, body: "<html>"}, nil},
 		{"read", answer{status: 418, body: "teapot"}, nil},
+		{"read", answer{status: 413, body: tooLarge}, nil},
 
 		// PUT /api/v1/policy.
 		{"write", answer{status: 500, body: validate}, backend.ErrConfig},
@@ -1350,6 +1397,8 @@ func TestErrorKinds(t *testing.T) {
 		{"write", answer{status: 400, body: malformed}, backend.ErrConfig},
 		{"write", answer{status: 500, body: internal}, backend.ErrTemporary},
 		{"write", answer{status: 500, body: notWritable}, nil},
+		{"write", answer{status: 500, body: readOnly}, nil},
+		{"write", answer{status: 413, body: tooLarge}, backend.ErrConfig},
 		{"write", answer{status: 400, body: notConn}, backend.ErrUnavailable},
 		{"write", answer{err: errors.New("connection reset")}, backend.ErrUnavailable},
 
@@ -1361,16 +1410,21 @@ func TestErrorKinds(t *testing.T) {
 		{"register", answer{status: 400, body: malformed}, backend.ErrConfig},
 		{"register", answer{status: 500, body: "proxy error"}, backend.ErrTemporary},
 		{"register", answer{status: 400, body: notConn}, backend.ErrUnavailable},
+		{"register", answer{status: 500, body: roInitial}, nil},
+		{"register", answer{status: 413, body: tooLarge}, backend.ErrConfig},
 
 		// POST /api/v1/policy/resolve.
 		{"resolve", answer{status: 400, body: `{"code":"MALFORMED_REQUEST","error":"unable to decode request: x"}`}, backend.ErrConfig},
 		{"resolve", answer{status: 500, body: internal}, backend.ErrTemporary},
+		{"resolve", answer{status: 413, body: tooLarge}, backend.ErrConfig},
 		{"resolve", answer{status: 200, body: `{"effective":{},"schedulingError":"invalid cron expression"}`}, backend.ErrConfig},
 
 		// DELETE /api/v1/policy.
 		{"delete", answer{status: 500, body: internal}, backend.ErrTemporary},
 		{"delete", answer{status: 400, body: malformed}, nil},
 		{"delete", answer{status: 400, body: notConn}, backend.ErrUnavailable},
+		{"delete", answer{status: 500, body: readOnly}, nil},
+		{"delete", answer{status: 413, body: tooLarge}, nil},
 
 		// POST /api/v1/sources/upload.
 		{"upload", answer{status: 404, body: `{"code":"NOT_FOUND","error":"no source matching the provided filters"}`}, backend.ErrTemporary},
@@ -1446,5 +1500,369 @@ func TestConcurrentUse(t *testing.T) {
 	got, err := b.ListSources(t.Context())
 	if err != nil || len(got) != 16 {
 		t.Errorf("ListSources = %d sources, %v", len(got), err)
+	}
+}
+
+// ServerIdentity's answer gives the filter of the next listing; an answer
+// without an identity does not replace it.
+func TestListSourcesIdentityHint(t *testing.T) {
+	f := newFakeKopia()
+	b := newBackend(t, f)
+
+	if _, _, err := b.ServerIdentity(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	f.inject("GET sources", injection{status: http.StatusOK, body: `{"localHost":"","localUsername":"","sources":[]}`})
+
+	_, err := b.PlanSource(t.Context(), backend.Desired{Source: src("/data/app")}, backend.Applied{})
+	if !errors.Is(err, backend.ErrWrongIdentity) {
+		t.Errorf("err = %v, want ErrWrongIdentity", err)
+	}
+
+	f.resetRequests()
+
+	if _, err := b.ListSources(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if r := f.requestsTo("GET sources"); len(r) != 1 || r[0].Query.Get("host") != fakeHost || r[0].Query.Get("userName") != fakeUser {
+		t.Errorf("requests = %+v, want one GET sources filtered by root@kopia", r)
+	}
+}
+
+// The listing keeps only kopia server's own sources with a path, sorted by
+// path, whatever order and entries the answer has.
+func TestListSourcesAnswer(t *testing.T) {
+	f := newFakeKopia()
+	b := newBackend(t, f)
+
+	f.inject("GET sources", injection{status: http.StatusOK, body: `{"localHost":"kopia","localUsername":"root","sources":[` +
+		`{"source":{"host":"kopia","userName":"root","path":"/data/b"},"status":"IDLE"},` +
+		`{"source":{"host":"kopia","userName":"other","path":"/data/a"},"status":"IDLE"},` +
+		`{"source":{"host":"kopia","userName":"root","path":""},"status":"IDLE"},` +
+		`{"source":{"host":"kopia","userName":"root","path":"/data/a"},"status":"PENDING"}]}`})
+
+	got, err := b.ListSources(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []backend.SourceStatus{
+		{Source: src("/data/a"), Status: backend.StatusPending},
+		{Source: src("/data/b"), Status: backend.StatusIdle},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ListSources = %+v\nwant %+v", got, want)
+	}
+}
+
+// The status of a source is the answer's entry for exactly that source.
+func TestPlanSourceExactMatch(t *testing.T) {
+	f := newFakeKopia()
+	b := newBackend(t, f)
+	s := src("/data/app")
+
+	f.inject("GET sources", injection{status: http.StatusOK, body: `{"localHost":"kopia","localUsername":"root","sources":[` +
+		`{"source":{"host":"kopia","userName":"other","path":"/data/app"},"status":"UPLOADING"},` +
+		`{"source":{"host":"kopia","userName":"root","path":"/data/app/sub"},"status":"PENDING"},` +
+		`{"source":{"host":"kopia","userName":"root","path":"/data/app"},"status":"IDLE"}]}`})
+
+	plan, err := b.PlanSource(t.Context(), backend.Desired{Source: s}, backend.Applied{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !plan.Known || plan.Status == nil || plan.Status.Source != s || plan.Status.Status != backend.StatusIdle {
+		t.Errorf("plan = %+v, status %+v", plan, plan.Status)
+	}
+
+	// Another user's source with the same path is not this one.
+	f.inject("GET sources", injection{status: http.StatusOK, body: `{"localHost":"kopia","localUsername":"root","sources":[` +
+		`{"source":{"host":"kopia","userName":"other","path":"/data/app"},"status":"IDLE"}]}`})
+
+	plan, err = b.PlanSource(t.Context(), backend.Desired{Source: s}, backend.Applied{})
+	if err != nil || plan.Known || plan.Action != backend.ActionRegister {
+		t.Errorf("plan = %+v, %v", plan, err)
+	}
+}
+
+// Every method that takes a source refuses one of another identity before
+// it sends anything but the identity check.
+func TestWrongIdentityEverywhere(t *testing.T) {
+	for _, other := range []backend.Source{
+		{Host: fakeHost, UserName: "other", Path: "/data/app"},
+		{Host: "laptop", UserName: fakeUser, Path: "/data/app"},
+	} {
+		f := newFakeKopia()
+		b := newBackend(t, f)
+
+		// kopia server knows the other source: a request that got through
+		// would act on it.
+		f.addSource(toInfo(other), nil)
+		f.setPolicy(toInfo(other), `{"scheduling":{"cron":["0 * * * *"]}}`)
+		f.resetRequests()
+
+		calls := map[string]func() error{
+			opPlanSource: func() error {
+				_, err := b.PlanSource(t.Context(), backend.Desired{Source: other}, backend.Applied{})
+				return err
+			},
+			opApplyPlan + " register": func() error {
+				_, err := b.ApplyPlan(t.Context(), backend.Plan{Source: other, Action: backend.ActionRegister, Merged: backend.Merged{Policy: json.RawMessage(`{}`)}})
+				return err
+			},
+			opApplyPlan + " update": func() error {
+				_, err := b.ApplyPlan(t.Context(), backend.Plan{Source: other, Action: backend.ActionUpdate, Merged: backend.Merged{Policy: json.RawMessage(`{}`)}})
+				return err
+			},
+			opPreviewSchedule: func() error {
+				_, err := b.PreviewSchedule(t.Context(), other, json.RawMessage(`{}`), 1)
+				return err
+			},
+			opDeletePolicy: func() error { return b.DeletePolicy(t.Context(), other) },
+			opTriggerSnapshot: func() error {
+				_, err := b.TriggerSnapshot(t.Context(), other)
+				return err
+			},
+		}
+
+		for name, call := range calls {
+			f.resetRequests()
+
+			if err := call(); !errors.Is(err, backend.ErrWrongIdentity) || kindOf(err) != nil {
+				t.Errorf("%s(%s): err = %v, want ErrWrongIdentity of neither kind", name, other, err)
+			}
+
+			assertRoutes(t, f, "GET sources")
+		}
+
+		mustPolicy(t, f, toInfo(other), `{"scheduling":{"cron":["0 * * * *"]}}`)
+
+		if f.uploads(toInfo(other)) != 0 {
+			t.Errorf("%s was snapshotted", other)
+		}
+	}
+}
+
+// A path that is not absolute is refused before anything is sent: the POST
+// of a registration would resolve it against kopia server's home
+// directory, the policy requests would not.
+func TestRelativePathRefused(t *testing.T) {
+	f := newFakeKopia()
+	b := newBackend(t, f)
+
+	for _, p := range []string{"data/app", "~/app", "./app"} {
+		s := src(p)
+
+		calls := map[string]func() error{
+			opPlanSource: func() error {
+				_, err := b.PlanSource(t.Context(), backend.Desired{Source: s, Patch: cron("0 * * * *")}, backend.Applied{})
+				return err
+			},
+			opApplyPlan: func() error {
+				_, err := b.ApplyPlan(t.Context(), backend.Plan{Source: s, Action: backend.ActionRegister, Merged: backend.Merged{Policy: json.RawMessage(`{}`)}})
+				return err
+			},
+			opPreviewSchedule: func() error {
+				_, err := b.PreviewSchedule(t.Context(), s, json.RawMessage(`{}`), 1)
+				return err
+			},
+			opDeletePolicy: func() error { return b.DeletePolicy(t.Context(), s) },
+			opTriggerSnapshot: func() error {
+				_, err := b.TriggerSnapshot(t.Context(), s)
+				return err
+			},
+		}
+
+		for op, call := range calls {
+			err := call()
+			assertError(t, err, op, s, nil)
+
+			if err == nil || !strings.Contains(err.Error(), "not absolute") {
+				t.Errorf("%s(%q): err = %v", op, p, err)
+			}
+		}
+	}
+
+	assertRoutes(t, f)
+}
+
+// Reads map their errors as reads: what is the source's configuration in a
+// write is not in a read.
+func TestReadRequestKinds(t *testing.T) {
+	s := src("/data/app")
+
+	sites := []struct {
+		name, route, op string
+		src             backend.Source
+		call            func(t *testing.T, b *Backend) error
+	}{
+		{"ServerIdentity", "GET sources", opServerIdentity, backend.Source{}, func(t *testing.T, b *Backend) error {
+			_, _, err := b.ServerIdentity(t.Context())
+			return err
+		}},
+		{"ListSources", "GET sources", opListSources, backend.Source{}, func(t *testing.T, b *Backend) error {
+			_, err := b.ListSources(t.Context())
+			return err
+		}},
+		{"lookup", "GET sources", opPlanSource, s, func(t *testing.T, b *Backend) error {
+			_, err := b.PlanSource(t.Context(), backend.Desired{Source: s}, backend.Applied{})
+			return err
+		}},
+		{"GET policy", "GET policy", opPlanSource, s, func(t *testing.T, b *Backend) error {
+			_, err := b.PlanSource(t.Context(), backend.Desired{Source: s}, backend.Applied{})
+			return err
+		}},
+		{"paths/resolve", "POST paths/resolve", opResolvePath, backend.Source{}, func(t *testing.T, b *Backend) error {
+			_, err := b.ResolvePath(t.Context(), "/data/app")
+			return err
+		}},
+		{"tasks", "GET tasks", opTriggerSnapshot, s, func(t *testing.T, b *Backend) error {
+			_, err := b.TriggerSnapshot(t.Context(), s)
+			return err
+		}},
+	}
+
+	answers := []struct {
+		status int
+		body   string
+		want   error
+	}{
+		{400, `{"code":"MALFORMED_REQUEST","error":"malformed request body"}`, nil},
+		{400, `{"code":"PATH_NOT_FOUND","error":"path does not exist"}`, nil},
+		{404, `{"code":"NOT_FOUND","error":"not found"}`, nil},
+		{413, "error reading request body", nil},
+		{500, `{"code":"INTERNAL","error":"internal server error: stat /data/app: permission denied"}`, backend.ErrTemporary},
+		{500, `{"code":"INTERNAL","error":"internal server error: failed to validate policy: x"}`, backend.ErrTemporary},
+	}
+
+	for _, site := range sites {
+		for _, a := range answers {
+			if site.route == "GET policy" && a.status == http.StatusNotFound {
+				continue // no policy, not an error
+			}
+
+			t.Run(fmt.Sprintf("%s %d %s", site.name, a.status, a.body), func(t *testing.T) {
+				f := newFakeKopia()
+				b := newBackend(t, f)
+				f.inject(site.route, injection{status: a.status, body: a.body})
+
+				assertError(t, site.call(t, b), site.op, site.src, a.want)
+			})
+		}
+	}
+}
+
+// Another client writes the policy between the watcher's PUT and its
+// read-back. A changed pause or cron shows it: the read-back is not
+// trusted, and the next pass writes the watcher's fields again. Another
+// client's change to a field the watcher does not own is kept.
+func TestApplyPlanAnotherWriterInBetween(t *testing.T) {
+	for name, tc := range map[string]struct {
+		other   string
+		trusted bool
+	}{
+		"pause":     {`{"scheduling":{"manual":true}}`, false},
+		"cron":      {`{"scheduling":{"cron":["30 2 * * *"]}}`, false},
+		"retention": {`{"scheduling":{"cron":["5 * * * *"]},"retention":{"keepDaily":3}}`, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeKopia()
+
+			var logs syncBuffer
+
+			b := newBackendLog(t, f, slog.New(slog.NewTextHandler(&logs, nil)))
+			st := memState{}
+			s := src("/data/app")
+			si := info("/data/app")
+			want := backend.Desired{Source: s, Patch: cron("0 * * * *")}
+
+			mustReconcile(t, b, st, want)
+
+			var armed atomic.Bool
+
+			f.set(func(f *fakeKopia) {
+				f.hook = func(r fakeRequest) {
+					switch r.Route {
+					case "PUT policy":
+						armed.Store(true)
+					case "GET policy":
+						if armed.CompareAndSwap(true, false) {
+							f.setPolicy(si, tc.other)
+						}
+					}
+				}
+			})
+
+			want.Patch = cron("5 * * * *")
+			mustReconcile(t, b, st, want)
+			f.set(func(f *fakeKopia) { f.hook = nil })
+
+			if got := st[s].StoredHash != ""; got != tc.trusted {
+				t.Errorf("read-back trusted = %v, want %v", got, tc.trusted)
+			}
+
+			if got := strings.Contains(logs.String(), "changed right after"); got == tc.trusted {
+				t.Errorf("log = %s", logs.String())
+			}
+
+			r := mustReconcile(t, b, st, want)
+
+			if tc.trusted {
+				if r.Plan.Action != backend.ActionNone {
+					t.Errorf("Action = %v", r.Plan.Action)
+				}
+
+				mustPolicy(t, f, si, tc.other)
+
+				return
+			}
+
+			if r.Plan.Action != backend.ActionUpdate {
+				t.Errorf("Action = %v", r.Plan.Action)
+			}
+
+			mustPolicy(t, f, si, `{"scheduling":{"cron":["5 * * * *"]}}`)
+		})
+	}
+}
+
+// The caller's context is done right after the PUT: the apply succeeded,
+// and the read-back that could not be made is no warning.
+func TestApplyPlanReadBackCanceled(t *testing.T) {
+	f := newFakeKopia()
+
+	var logs syncBuffer
+
+	b := newBackendLog(t, f, slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	s := src("/data/app")
+
+	plan, err := b.PlanSource(t.Context(), backend.Desired{Source: s, Patch: cron("0 * * * *")}, backend.Applied{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	f.set(func(f *fakeKopia) {
+		f.hook = func(r fakeRequest) {
+			if r.Route == "PUT policy" {
+				cancel()
+			}
+		}
+	})
+
+	applied, err := b.ApplyPlan(ctx, plan)
+	if err != nil || applied.StoredHash != "" {
+		t.Fatalf("ApplyPlan = %+v, %v", applied, err)
+	}
+
+	mustPolicy(t, f, info("/data/app"), `{"scheduling":{"cron":["0 * * * *"]}}`)
+
+	if l := logs.String(); strings.Contains(l, "level=WARN") || !strings.Contains(l, "level=DEBUG") {
+		t.Errorf("log = %s", l)
 	}
 }

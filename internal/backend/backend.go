@@ -91,19 +91,21 @@
 // this:
 //
 //   - ErrConfig: ErrInvalidPolicy (a 500 with "failed to validate policy"
-//     or "invalid policy path") and ErrMalformedRequest from a policy
-//     write, POST /api/v1/sources or policy/resolve; a schedulingError
-//     from policy/resolve; ErrPathNotFound from POST /api/v1/sources, and
-//     an ErrInternal of that call with code INTERNAL whose message lacks
+//     or "invalid policy path"), ErrMalformedRequest and a 413 (the policy
+//     is larger than kopia server reads) from a policy write, POST
+//     /api/v1/sources or policy/resolve; a schedulingError from
+//     policy/resolve; ErrPathNotFound from POST /api/v1/sources, and an
+//     ErrInternal of that call with code INTERNAL whose message lacks
 //     "unable to set initial policy": kopia server could not stat the
 //     path.
 //   - ErrUnavailable (also ErrTemporary): ErrUnavailable (408, 429, 502,
 //     503, 504, STORAGE_CONNECTION), ErrNotConnected, and transport errors
 //     kopiaclient.IsRetryable accepts.
 //   - ErrTemporary: any other ErrInternal, the 200 null of GET
-//     /api/v1/policy included, except one whose message has "repository
-//     is not writable"; ErrNotFound from sources/upload for a source kopia
-//     server has not picked up yet.
+//     /api/v1/policy included, except one of a read-only repository
+//     ("storage is read-only", or "repository is not writable");
+//     ErrNotFound from sources/upload for a source kopia server has not
+//     picked up yet.
 //   - neither: ErrUnauthorized, ErrCSRF, ErrAccessDenied, ErrUIDisabled,
 //     ErrUnexpectedResponse, ErrInvalidArgument, TLS verification errors,
 //     a read-only repository, and the caller's context being done.
@@ -154,7 +156,8 @@ type Backend interface {
 	// returns what to store in the state: plan.Applied, with StoredHash
 	// set to the Fingerprint of the policy as kopia server stored it, read
 	// back after the write, or empty if reading it back failed (the write
-	// still succeeded). ActionNone sends nothing and returns plan.Applied
+	// still succeeded) or showed that another client wrote the policy in
+	// between. ActionNone sends nothing and returns plan.Applied
 	// as it is. ActionRegister and ActionUpdate are described with the
 	// actions. A policy written after the plan was made, say in the web UI,
 	// is overwritten: kopia server has no conditional write.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
@@ -31,9 +32,13 @@ const (
 )
 
 // Texts of kopia server's 500 answers (internal/server/api_error.go,
-// api_sources.go).
+// api_sources.go, repo/blob/readonly).
 const (
-	// msgNotWritable: the repository is connected read-only.
+	// msgReadOnly: a write to a repository connected read-only fails when
+	// kopia server flushes it.
+	msgReadOnly = "storage is read-only"
+	// msgNotWritable: kopia server holds a repository it cannot write to.
+	// Neither of its repository types is one, but the check is there.
 	msgNotWritable = "repository is not writable"
 	// msgInitialPolicy prefixes every failure of POST /api/v1/sources to
 	// store the policy; any other 500 of that call comes from os.Stat of
@@ -97,7 +102,7 @@ func kind(req request, err error) error {
 		return nil
 	case errors.Is(err, kopiaclient.ErrInternal):
 		switch {
-		case strings.Contains(apiErr.Message, msgNotWritable):
+		case strings.Contains(apiErr.Message, msgReadOnly), strings.Contains(apiErr.Message, msgNotWritable):
 			return nil
 		case req == reqCreateSource && apiErr.Code == kopiaclient.CodeInternal && !strings.Contains(apiErr.Message, msgInitialPolicy):
 			// kopia server could not stat the path, e.g. permission denied.
@@ -115,6 +120,10 @@ func kind(req request, err error) error {
 		}
 
 		return nil
+	case apiErr.StatusCode == http.StatusRequestEntityTooLarge && configReq:
+		// kopia server reads at most 100 kB of a request: the policy is
+		// too large for the UI API.
+		return backend.ErrConfig
 	default:
 		return nil
 	}

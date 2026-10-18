@@ -19,6 +19,11 @@ import (
 // TestIntegrationBackend runs the REST backend against a real kopia server
 // (kopiatest.DefaultImage unless KOPIA_IMAGE names another), with the
 // reconcile steps of package backend.
+//
+// kopia server snapshots a source registered with a schedule right away:
+// runMissed is on by default, and a source never snapshotted counts as
+// missed. Assertions that need a source without snapshots register it
+// paused.
 func TestIntegrationBackend(t *testing.T) {
 	s := kopiatest.Start(t, kopiatest.Options{})
 
@@ -39,7 +44,7 @@ func TestIntegrationBackend(t *testing.T) {
 	b := New(c, slog.New(slog.NewTextHandler(t.Output(), nil)))
 	ctx := t.Context()
 
-	s.Exec(t, "mkdir", "-p", "/data/ui", "/data/pause", "/data/python", "/data/reject")
+	s.Exec(t, "mkdir", "-p", "/data/ui", "/data/pause", "/data/python", "/data/reject", "/data/delete")
 
 	user, host, err := b.ServerIdentity(ctx)
 	if err != nil || user != kopiatest.Username || host != kopiatest.Hostname {
@@ -71,13 +76,14 @@ func TestIntegrationBackend(t *testing.T) {
 		}
 
 		// No 404: the POST made kopia server know the source, the PUT
-		// refreshed it.
+		// refreshed it. kopia server may have snapshotted it already, so
+		// the ticket's last snapshot is not checked.
 		ticket, err := b.TriggerSnapshot(ctx, src)
 		if err != nil {
 			t.Fatalf("TriggerSnapshot right after the registration: %v", err)
 		}
 
-		if ticket.Source != src || !ticket.LastSnapshotStart.IsZero() {
+		if ticket.Source != src {
 			t.Errorf("ticket = %+v", ticket)
 		}
 
@@ -297,7 +303,14 @@ func TestIntegrationBackend(t *testing.T) {
 	})
 
 	t.Run("DeletePolicy", func(t *testing.T) {
-		src := source("/data/ui")
+		// Registered paused, so kopia server does not snapshot it.
+		src := source("/data/delete")
+
+		if r := mustReconcile(t, b, memState{}, backend.Desired{Source: src, Patch: cron("0 8 * * *"), Paused: true}); r.Plan.Action != backend.ActionRegister {
+			t.Fatalf("Action = %v", r.Plan.Action)
+		}
+
+		assertScheduling(t, policyOf(t, c, src), `{"manual":true}`)
 
 		if err := b.DeletePolicy(ctx, src); err != nil {
 			t.Fatal(err)

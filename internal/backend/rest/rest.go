@@ -6,7 +6,10 @@
 // source first asks kopia server for it with GET /api/v1/sources and the
 // three fields: the answer tells kopia server's identity, so a source of
 // another identity fails with backend.ErrWrongIdentity before anything is
-// written, and whether kopia server knows the source.
+// written, and whether kopia server knows the source. A source path must
+// be absolute: POST /api/v1/sources resolves any other path against kopia
+// server's home directory, the policy requests do not, so the two would
+// name different sources.
 //
 // Policies are read and written as raw JSON and merged by backend.Merge
 // through backend.NewPlan, so fields the watcher does not own are written
@@ -26,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -98,12 +102,12 @@ func (b *Backend) ServerIdentity(ctx context.Context) (userName, host string, er
 }
 
 // ResolvePath implements backend.Backend with paths/resolve.
-func (b *Backend) ResolvePath(ctx context.Context, path string) (backend.Source, error) {
-	if path == "" {
+func (b *Backend) ResolvePath(ctx context.Context, p string) (backend.Source, error) {
+	if p == "" {
 		return backend.Source{}, &backend.Error{Op: opResolvePath, Err: errors.New("empty path")}
 	}
 
-	si, err := b.client.ResolvePath(ctx, path)
+	si, err := b.client.ResolvePath(ctx, p)
 	if err != nil {
 		return backend.Source{}, fail(ctx, opResolvePath, backend.Source{}, reqRead, err)
 	}
@@ -189,7 +193,7 @@ func (b *Backend) PlanSource(ctx context.Context, want backend.Desired, last bac
 // that does not exist on kopia server, then PUT /api/v1/policy with the
 // same policy, since the POST does not refresh kopia server; an update is
 // the PUT alone. The policy is read back with GET /api/v1/policy for
-// StoredHash. ActionNone sends nothing.
+// StoredHash; see storedHash. ActionNone sends nothing.
 func (b *Backend) ApplyPlan(ctx context.Context, plan backend.Plan) (backend.Applied, error) {
 	src := plan.Source
 
@@ -222,26 +226,62 @@ func (b *Backend) ApplyPlan(ctx context.Context, plan backend.Plan) (backend.App
 	}
 
 	applied := plan.Applied.Clone()
-	applied.StoredHash = b.storedHash(ctx, src)
+	applied.StoredHash = b.storedHash(ctx, src, plan.Policy)
 
 	return applied, nil
 }
 
-// storedHash reads the policy of src back after a write and returns its
-// fingerprint. If that fails it returns "": the write succeeded, and the
-// next plan writes the policy again if it looks changed.
-func (b *Backend) storedHash(ctx context.Context, src backend.Source) string {
+// storedHash reads the policy of src back after writing it and returns its
+// fingerprint, which tells the next plan what kopia server made of the
+// write. It returns "" if the read-back fails, or if its pause or cron
+// differ from the written policy's: kopia server stores those as written,
+// so another client wrote the policy after the watcher, and the next plan
+// compares the policy instead of taking the difference for kopia server's
+// own. The write itself succeeded either way.
+//
+// Another client's change to a field kopia server may rewrite, such as a
+// policy-json field, is not told apart from kopia server's own rewrite.
+func (b *Backend) storedHash(ctx context.Context, src backend.Source, written json.RawMessage) string {
 	stored, err := b.client.GetPolicy(ctx, toInfo(src))
 	if err == nil {
+		if !sameSchedule(written, stored) {
+			b.log.WarnContext(ctx, "the policy changed right after the watcher wrote it", "source", src.String())
+
+			return ""
+		}
+
 		var hash string
 		if hash, err = backend.Fingerprint(stored); err == nil {
 			return hash
 		}
 	}
 
-	b.log.WarnContext(ctx, "could not read back the policy written to kopia server", "source", src.String(), "error", err)
+	if ctx.Err() != nil {
+		// The caller stopped waiting, e.g. at shutdown.
+		b.log.DebugContext(ctx, "policy not read back after the write", "source", src.String(), "error", err)
+	} else {
+		b.log.WarnContext(ctx, "could not read back the policy written to kopia server", "source", src.String(), "error", err)
+	}
 
 	return ""
+}
+
+// sameSchedule reports whether two policies have the same pause and cron.
+func sameSchedule(a, b json.RawMessage) bool {
+	type schedule struct {
+		Scheduling struct {
+			Manual bool     `json:"manual"`
+			Cron   []string `json:"cron"`
+		} `json:"scheduling"`
+	}
+
+	var x, y schedule
+
+	if json.Unmarshal(a, &x) != nil || json.Unmarshal(b, &y) != nil {
+		return false
+	}
+
+	return x.Scheduling.Manual == y.Scheduling.Manual && slices.Equal(x.Scheduling.Cron, y.Scheduling.Cron)
 }
 
 // PreviewSchedule implements backend.Backend with policy/resolve: policy
@@ -375,10 +415,15 @@ func (b *Backend) AnnotateSnapshot(_ context.Context, src backend.Source, _ time
 }
 
 // lookup checks that src is a complete source of kopia server's identity
-// and returns its status; nil if kopia server does not know it.
+// with an absolute path, and returns its status; nil if kopia server does
+// not know it.
 func (b *Backend) lookup(ctx context.Context, op string, src backend.Source) (*backend.SourceStatus, error) {
 	if err := src.Validate(); err != nil {
 		return nil, &backend.Error{Op: op, Source: src, Err: err}
+	}
+
+	if !path.IsAbs(src.Path) {
+		return nil, &backend.Error{Op: op, Source: src, Err: fmt.Errorf("source path %q is not absolute", src.Path)}
 	}
 
 	resp, err := b.client.ListSources(ctx, toInfo(src))
