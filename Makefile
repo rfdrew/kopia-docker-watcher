@@ -6,8 +6,9 @@ PKG     := github.com/rfdrew/kopia-docker-watcher
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X $(PKG)/internal/version.Version=$(VERSION)
 
-# Integration tests start kopia/kopia in Docker; KOPIA_IMAGE picks the release.
-KOPIA_IMAGE ?= kopia/kopia:0.23.1
+# Integration tests start kopia server in Docker, by default the latest
+# release pinned in internal/kopiatest; KOPIA_IMAGE overrides the image.
+KOPIA_IMAGE ?=
 
 .PHONY: all build test test-integration lint fmt tidy clean
 

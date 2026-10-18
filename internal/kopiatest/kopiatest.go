@@ -4,8 +4,8 @@
 //
 // The server uses a filesystem repository inside the container, Basic auth
 // and CSRF checks as in production, and a TLS certificate generated on first
-// start and kept for restarts. The image is KOPIA_IMAGE, default
-// DefaultImage; CI runs the tests against every supported release line.
+// start and kept for restarts. The image is DefaultImage unless KOPIA_IMAGE
+// names another one, e.g. to try a new kopia release before switching to it.
 package kopiatest
 
 import (
@@ -26,7 +26,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// DefaultImage is used when KOPIA_IMAGE is not set.
+// DefaultImage is the latest kopia release, the only version the watcher
+// supports. It moves to each new release.
 const DefaultImage = "kopia/kopia:0.23.1"
 
 // Credentials and identity of the test server.
