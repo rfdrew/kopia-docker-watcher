@@ -87,13 +87,19 @@ dockers_v2:
       org.opencontainers.image.version: "{{ .Version }}"
       org.opencontainers.image.revision: "{{ .FullCommit }}"
       org.opencontainers.image.created: "{{ .CommitDate }}"
-    # The same keys on the index and on each platform manifest, so GHCR
-    # links the package to the repository and shows the license.
+    # The same keys on each platform manifest and on the index, so GHCR
+    # links the package to the repository and shows the license. Snapshot
+    # images are single-platform, where buildx rejects index annotations;
+    # the empty values drop them there.
     annotations:
-      "index,manifest:org.opencontainers.image.source": https://github.com/rfdrew/kopia-docker-watcher
-      "index,manifest:org.opencontainers.image.licenses": Apache-2.0
-      "index,manifest:org.opencontainers.image.version": "{{ .Version }}"
-      "index,manifest:org.opencontainers.image.revision": "{{ .FullCommit }}"
+      "manifest:org.opencontainers.image.source": https://github.com/rfdrew/kopia-docker-watcher
+      "manifest:org.opencontainers.image.licenses": Apache-2.0
+      "manifest:org.opencontainers.image.version": "{{ .Version }}"
+      "manifest:org.opencontainers.image.revision": "{{ .FullCommit }}"
+      "index:org.opencontainers.image.source": "{{ if not .IsSnapshot }}https://github.com/rfdrew/kopia-docker-watcher{{ end }}"
+      "index:org.opencontainers.image.licenses": "{{ if not .IsSnapshot }}Apache-2.0{{ end }}"
+      "index:org.opencontainers.image.version": "{{ if not .IsSnapshot }}{{ .Version }}{{ end }}"
+      "index:org.opencontainers.image.revision": "{{ if not .IsSnapshot }}{{ .FullCommit }}{{ end }}"
     # Snapshot images are loaded into the local Docker daemon, which
     # cannot store attestations.
     sbom: "{{ not .IsSnapshot }}"
