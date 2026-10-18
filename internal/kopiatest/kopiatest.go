@@ -54,7 +54,7 @@ const (
 
 // Options select the server variant.
 type Options struct {
-	// DisableUI starts kopia server with --ui=false and plain HTTP.
+	// DisableUI starts kopia server with --no-ui and plain HTTP.
 	DisableUI bool
 }
 
@@ -82,7 +82,9 @@ func Image() string {
 
 // The entrypoint creates the repository and the test data once, then runs
 // kopia server in a loop, so Restart can stop the process through the
-// control API without changing the container's published port.
+// control API without changing the container's published port. A server
+// that keeps failing to start ends the container, so the wait for it fails
+// at once instead of timing out.
 const script = `set -e
 mkdir -p ` + HelloDir + `
 echo hello > ` + HelloDir + `/hello.txt
@@ -90,19 +92,26 @@ if [ ! -f /app/config/repository.config ]; then
   kopia repository create filesystem --path=/repository \
     --override-hostname=` + Hostname + ` --override-username=` + Username + `
 fi
+failures=0
 while true; do
   if [ "$KDW_DISABLE_UI" = "1" ]; then
-    kopia server start --address=0.0.0.0:51515 --insecure --ui=false \
-      --server-username=` + UIUser + ` --server-password="$KDW_UI_PASSWORD" \
-      --server-control-password="$KDW_CONTROL_PASSWORD" || true
+    mode="--insecure --no-ui"
   else
-    tls="--tls-cert-file=/app/config/server.crt --tls-key-file=/app/config/server.key"
+    mode="--tls-cert-file=/app/config/server.crt --tls-key-file=/app/config/server.key"
     if [ ! -f /app/config/server.crt ]; then
-      tls="$tls --tls-generate-cert --tls-generate-rsa-key-size=2048"
+      mode="$mode --tls-generate-cert --tls-generate-rsa-key-size=2048"
     fi
-    kopia server start --address=0.0.0.0:51515 $tls \
+  fi
+  if kopia server start --address=0.0.0.0:51515 $mode \
       --server-username=` + UIUser + ` --server-password="$KDW_UI_PASSWORD" \
-      --server-control-password="$KDW_CONTROL_PASSWORD" || true
+      --server-control-password="$KDW_CONTROL_PASSWORD"; then
+    failures=0
+  else
+    failures=$((failures + 1))
+    if [ "$failures" -ge 3 ]; then
+      echo "kopia server failed to start $failures times in a row" >&2
+      exit 1
+    fi
   fi
   sleep 0.2
 done
