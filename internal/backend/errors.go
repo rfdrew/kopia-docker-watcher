@@ -11,8 +11,9 @@ import (
 // of neither kind is not about the source and will not go away by itself:
 // wrong credentials, CSRF, TLS verification, access denied, a kopia server
 // without the UI API, a read-only repository, an answer that does not
-// decode, a canceled context. The reconciler reports it and tries again at
-// the next full reconcile.
+// decode. The reconciler reports it and tries again at the next full
+// reconcile. An error because the caller's context is done is of neither
+// kind too.
 var (
 	// ErrTemporary: the call may succeed later without any change. Retry
 	// the source with a growing delay.
@@ -36,6 +37,9 @@ var (
 
 // Errors a Backend reports in Error.Err, with Kind nil.
 var (
+	// ErrIncompleteSource: the source lacks its host, user name or path.
+	ErrIncompleteSource = errors.New("incomplete source")
+
 	// ErrWrongIdentity: the source is not kopia server's own. Its user
 	// name or host differs from ServerIdentity, which changes when kopia
 	// server connects to the repository under another name. The

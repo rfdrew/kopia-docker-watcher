@@ -21,13 +21,24 @@ type Desired struct {
 	Owners []string
 }
 
+// Clone returns a deep copy of d.
+func (d Desired) Clone() Desired {
+	out := d
+	out.Patch = d.Patch.Clone()
+	out.Owners = slices.Clone(d.Owners)
+
+	return out
+}
+
 // Applied is what the watcher has to remember about a source between
 // reconciles, because the policy alone does not tell. internal/state
 // stores it per source, and its JSON form is part of STATE_FILE: fields
 // are only ever added, with omitempty or omitzero, and never renamed.
 type Applied struct {
-	// Patch is the patch last applied to the source. Fields it owns that a
-	// new patch does not are removed from the policy.
+	// Patch is the patch last applied to the source and confirmed. Fields
+	// it owns that a new patch does not are removed from the policy. It is
+	// what the reconciler falls back to when new labels are rejected or
+	// owners disagree.
 	Patch PolicyPatch `json:"patch,omitzero"`
 
 	// SavedScheduling is the scheduling section the pause replaced, put
@@ -40,12 +51,13 @@ type Applied struct {
 
 	// Pending marks an apply that was started but not confirmed: the
 	// reconciler stores Plan.Intent, which sets it, before ApplyPlan, and
-	// the Applied ApplyPlan returns clears it. It holds the patch of that
-	// apply. While it is set kopia server may or may not have the policy,
-	// so the next plan writes the policy even if it looks unchanged (a
-	// POST that registered a source needs the PUT after it), and fields of
-	// Pending that the new patch does not own are removed like those of
-	// Patch.
+	// the Applied ApplyPlan returns clears it. It owns the fields of every
+	// unconfirmed apply since the last confirmed one, so it may mix
+	// several label sets. While it is set kopia server may or may not have
+	// the policy, so the next plan writes the policy even if it looks
+	// unchanged (a POST that registered a source needs the PUT after it),
+	// and fields of Pending that the new patch does not own are removed
+	// like those of Patch.
 	Pending *PolicyPatch `json:"pending,omitempty"`
 
 	// StoredHash is the Fingerprint of the policy as kopia server stored
@@ -54,8 +66,26 @@ type Applied struct {
 	// and fills in defaults when it stores a policy, so what it returns
 	// can differ from what the watcher wrote. When the policy still has
 	// this fingerprint and the desired state is the one last applied, the
-	// difference is kopia server's own and nothing is written.
+	// difference is kopia server's own and nothing is written. Fingerprints
+	// are salted per process, so after a restart (perhaps with a new
+	// watcher or kopia server) the policy is written once more. A kopia
+	// server upgraded while the watcher runs is noticed only at the next
+	// change of the policy, the labels or the pause.
 	StoredHash string `json:"storedHash,omitempty"`
+}
+
+// Clone returns a deep copy of a.
+func (a Applied) Clone() Applied {
+	out := a
+	out.Patch = a.Patch.Clone()
+	out.SavedScheduling = slices.Clone(a.SavedScheduling)
+
+	if a.Pending != nil {
+		p := a.Pending.Clone()
+		out.Pending = &p
+	}
+
+	return out
 }
 
 // IsZero reports whether a holds nothing.
@@ -168,6 +198,23 @@ type Plan struct {
 	Merged
 }
 
+// Clone returns a deep copy of p.
+func (p Plan) Clone() Plan {
+	out := p
+	out.Current = slices.Clone(p.Current)
+	out.Policy = slices.Clone(p.Policy)
+	out.Unpaused = slices.Clone(p.Unpaused)
+	out.Intent = p.Intent.Clone()
+	out.Applied = p.Applied.Clone()
+
+	if p.Status != nil {
+		st := p.Status.Clone()
+		out.Status = &st
+	}
+
+	return out
+}
+
 // NewPlan plans a source from what kopia server has: whether it knows the
 // source (with its status, nil if not known) and the policy defined for
 // the path (nil if none). Every Backend plans with it, so they all decide
@@ -180,12 +227,19 @@ func NewPlan(want Desired, last Applied, known bool, status *SourceStatus, curre
 
 	m, err := Merge(current, want, last)
 	if err != nil {
+		// Only an invalid desired patch is ErrConfig; Merge returns it as
+		// PolicyPatch's own error.
 		var be *Error
-		if errors.As(err, &be) {
+		if errors.As(err, &be) && be.Kind != nil {
 			return Plan{}, &Error{Op: "PlanSource", Source: want.Source, Kind: be.Kind, Err: be.Err}
 		}
 
 		return Plan{}, &Error{Op: "PlanSource", Source: want.Source, Err: err}
+	}
+
+	if status != nil {
+		st := status.Clone()
+		status = &st
 	}
 
 	p := Plan{

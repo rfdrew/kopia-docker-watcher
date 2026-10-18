@@ -3,17 +3,25 @@
 //
 // Fake behaves like a small kopia server. It knows sources and the policies
 // defined for their paths, plans with backend.NewPlan as every Backend
-// does, and rejects what kopia server rejects: a scheduling section that
-// combines manual with anything else, a path with a trailing slash, a
-// source of another identity, a path that does not exist on registration,
-// a cron expression marked invalid. It can also rewrite stored policies the
-// way kopia server does (SetNormalizer).
+// does, and rejects some of what kopia server rejects: a scheduling section
+// that combines manual with anything else, a path with a trailing slash,
+// upload.maxParallelSnapshots on a path (only when the policy is stored,
+// as kopia server's policy/resolve does not check it), a source of another
+// identity, a path that does not exist on registration, a cron expression
+// marked invalid, a policy a check set with SetPolicyCheck refuses. It can also rewrite stored policies the way kopia
+// server does (SetNormalizer). A source without snapshots is forgotten when
+// its policy is deleted, as kopia server forgets it.
 //
-// Every call is recorded. Any call can fail before it takes effect
-// (FailNext) or after (FailNextAfter, as when kopia server stored a policy
-// but the answer was lost), and a registration can stop after the POST
-// (FailRegisterPut). A hook sees every call and may change the fake, for
+// Every call is recorded, as a deep copy. Any call can fail before it takes
+// effect (FailNext) or after (FailNextAfter, as when kopia server stored a
+// policy but the answer was lost), for any source or for one, and a
+// registration can stop after the POST (FailRegisterPut). A failed call
+// returns zero values. A hook sees every call and may change the fake, for
 // example to simulate an edit in the web UI between two calls.
+//
+// A context that is done fails the call before it takes effect, like a
+// request that is never sent, with an error of neither kind that wraps
+// ctx.Err().
 package backendtest
 
 import (
@@ -76,6 +84,24 @@ type Call struct {
 	AddPins     []string               // AnnotateSnapshot
 }
 
+func (c Call) clone() Call {
+	c.Desired = c.Desired.Clone()
+	c.Last = c.Last.Clone()
+	c.Plan = c.Plan.Clone()
+	c.Policy = slices.Clone(c.Policy)
+	c.Ticket.TasksBefore = slices.Clone(c.Ticket.TasksBefore)
+	c.AddPins = slices.Clone(c.AddPins)
+
+	return c
+}
+
+// failKey selects the calls a failure is for: one method, and one source
+// or, with the zero Source, any.
+type failKey struct {
+	method Method
+	source backend.Source
+}
+
 // Fake is an in-memory backend.Backend. It is safe for concurrent use.
 // Create it with New.
 type Fake struct {
@@ -84,6 +110,7 @@ type Fake struct {
 	userName, host, home string
 	now                  func() time.Time
 	normalize            func(json.RawMessage) json.RawMessage
+	check                func(json.RawMessage) error
 
 	sources  map[backend.Source]*sourceState
 	missing  map[string]bool // paths that do not exist on kopia server
@@ -91,9 +118,9 @@ type Fake struct {
 	upcoming []time.Time
 
 	calls       []Call
-	failBefore  map[Method][]error
-	failAfter   map[Method][]error
-	failRegPut  []error
+	failBefore  map[failKey][]error
+	failAfter   map[failKey][]error
+	failRegPut  map[backend.Source][]error
 	hook        func(Call) error
 	results     map[backend.Source][]backend.SnapshotResult
 	nextTaskID  int
@@ -128,8 +155,9 @@ func New() *Fake {
 		sources:     map[backend.Source]*sourceState{},
 		missing:     map[string]bool{},
 		badCrons:    map[string]bool{},
-		failBefore:  map[Method][]error{},
-		failAfter:   map[Method][]error{},
+		failBefore:  map[failKey][]error{},
+		failAfter:   map[failKey][]error{},
+		failRegPut:  map[backend.Source][]error{},
 		results:     map[backend.Source][]backend.SnapshotResult{},
 		annotations: map[backend.Source][]Annotation{},
 	}
@@ -154,7 +182,8 @@ func (f *Fake) SetIdentity(userName, host string) {
 	f.userName, f.host = userName, host
 }
 
-// SetClock replaces the clock used for tickets.
+// SetClock replaces the clock used for tickets. now runs with the fake
+// locked and must not call it.
 func (f *Fake) SetClock(now func() time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -164,7 +193,8 @@ func (f *Fake) SetClock(now func() time.Time) {
 
 // SetNormalizer makes the fake store every written policy as fn returns
 // it, the way kopia server drops unknown fields and fills in defaults. Nil
-// stores policies as written.
+// stores policies as written. fn runs with the fake locked and must not
+// call it.
 func (f *Fake) SetNormalizer(fn func(json.RawMessage) json.RawMessage) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -172,8 +202,22 @@ func (f *Fake) SetNormalizer(fn func(json.RawMessage) json.RawMessage) {
 	f.normalize = fn
 }
 
-// AddSource makes kopia server know src without a policy, as after a
-// snapshot taken with the kopia CLI.
+// SetPolicyCheck installs fn, which checks a policy the way kopia server
+// decodes and validates it, for the fields the test cares about. A policy
+// fn rejects makes ApplyPlan and PreviewSchedule fail with ErrConfig, like
+// MALFORMED_REQUEST or "failed to validate policy". Nil removes the check.
+// fn runs with the fake locked and must not call it.
+func (f *Fake) SetPolicyCheck(fn func(policy json.RawMessage) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.check = fn
+}
+
+// AddSource makes kopia server know src without a policy and without
+// snapshots, as between a snapshot taken with the kopia CLI and its
+// deletion; AddSnapshot adds snapshots. DeletePolicy forgets a source
+// without snapshots.
 func (f *Fake) AddSource(src backend.Source) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -233,13 +277,21 @@ func (f *Fake) Loaded(src backend.Source) bool {
 }
 
 // SetStatus sets what ListSources and PlanSource report for src, which
-// becomes known. The Source field of status is ignored.
+// becomes known. The Source field of status is ignored. A nil LastSnapshot
+// keeps the last snapshot the fake has.
 func (f *Fake) SetStatus(src backend.Source, status backend.SourceStatus) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	s := f.source(src)
+	status = status.Clone()
 	status.Source = src
-	f.source(src).status = status
+
+	if status.LastSnapshot == nil {
+		status.LastSnapshot = s.status.LastSnapshot
+	}
+
+	s.status = status
 }
 
 // AddSnapshot adds a snapshot of src, which becomes known; it becomes the
@@ -248,10 +300,10 @@ func (f *Fake) AddSnapshot(src backend.Source, snap backend.SnapshotInfo) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.addSnapshot(f.source(src), snap)
+	addSnapshot(f.source(src), snap)
 }
 
-func (f *Fake) addSnapshot(s *sourceState, snap backend.SnapshotInfo) {
+func addSnapshot(s *sourceState, snap backend.SnapshotInfo) {
 	s.snapshots = append(s.snapshots, snap)
 
 	if last := s.status.LastSnapshot; last == nil || !snap.StartTime.Before(last.StartTime) {
@@ -321,38 +373,60 @@ func (f *Fake) Annotations(src backend.Source) []Annotation {
 	return slices.Clone(f.annotations[src])
 }
 
-// FailNext makes the next call of m return err without any effect.
-// Several failures queue up in order.
+// FailNext makes the next call of m fail with err without any effect.
+// Failures queue up in order.
 func (f *Fake) FailNext(m Method, err error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.failBefore[m] = append(f.failBefore[m], err)
+	f.FailNextFor(backend.Source{}, m, err)
 }
 
-// FailNextAfter makes the next call of m take effect and then return err,
-// as when kopia server stored a policy but the answer was lost.
-func (f *Fake) FailNextAfter(m Method, err error) {
+// FailNextFor is FailNext for the next call of m about src only.
+func (f *Fake) FailNextFor(src backend.Source, m Method, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.failAfter[m] = append(f.failAfter[m], err)
+	k := failKey{m, src}
+	f.failBefore[k] = append(f.failBefore[k], err)
+}
+
+// FailNextAfter makes the next call of m take effect and then fail with
+// err, as when kopia server stored a policy but the answer was lost. The
+// failure is used up by that call even if it fails for another reason
+// first. ApplyPlan of ActionNone sends nothing and cannot fail; it does
+// not use up failures.
+func (f *Fake) FailNextAfter(m Method, err error) {
+	f.FailNextAfterFor(backend.Source{}, m, err)
+}
+
+// FailNextAfterFor is FailNextAfter for the next call of m about src only.
+func (f *Fake) FailNextAfterFor(src backend.Source, m Method, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	k := failKey{m, src}
+	f.failAfter[k] = append(f.failAfter[k], err)
 }
 
 // FailRegisterPut makes the next registration stop after its POST: the
 // source is known with the policy, but kopia server's scheduler does not
-// have it, and ApplyPlan returns err.
+// have it, and ApplyPlan fails with err. A registration that fails before
+// the POST uses it up too.
 func (f *Fake) FailRegisterPut(err error) {
+	f.FailRegisterPutFor(backend.Source{}, err)
+}
+
+// FailRegisterPutFor is FailRegisterPut for the next registration of src
+// only.
+func (f *Fake) FailRegisterPutFor(src backend.Source, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.failRegPut = append(f.failRegPut, err)
+	f.failRegPut[src] = append(f.failRegPut[src], err)
 }
 
-// SetHook installs fn, called with every call after it is recorded and
-// before it takes effect; a non-nil error is returned instead. fn runs
-// without the fake locked, so it may call the fake's setters. Nil removes
-// the hook.
+// SetHook installs fn, called with every call right after it is recorded,
+// before any failure set with FailNext applies; a non-nil error fails the
+// call without effect. fn runs without the fake locked, so it may call the
+// fake's setters. Nil removes the hook.
 func (f *Fake) SetHook(fn func(Call) error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -362,10 +436,7 @@ func (f *Fake) SetHook(fn func(Call) error) {
 
 // Calls returns the recorded calls in order.
 func (f *Fake) Calls() []Call {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	return slices.Clone(f.calls)
+	return f.filter(func(Call) bool { return true })
 }
 
 // CallsTo returns the recorded calls of m in order.
@@ -386,7 +457,7 @@ func (f *Fake) filter(keep func(Call) bool) []Call {
 
 	for _, c := range f.calls {
 		if keep(c) {
-			out = append(out, c)
+			out = append(out, c.clone())
 		}
 	}
 
@@ -401,49 +472,58 @@ func (f *Fake) ResetCalls() {
 	f.calls = nil
 }
 
-// enter records c and returns the error the call fails with before taking
-// effect, if any. It must be called without f.mu held.
-func (f *Fake) enter(ctx context.Context, c Call) error {
+// record adds c to the recorded calls.
+func (f *Fake) record(c Call) {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 
-	f.calls = append(f.calls, c)
+	f.calls = append(f.calls, c.clone())
+}
 
-	var err error
+// enter records c and decides how the call fails: err fails it before it
+// takes effect; after, if not nil, fails it once it took effect. It must be
+// called without f.mu held.
+func (f *Fake) enter(ctx context.Context, c Call) (after, err error) {
+	f.record(c)
 
-	if q := f.failBefore[c.Method]; len(q) > 0 {
-		f.failBefore[c.Method], err = q[1:], q[0]
-	}
-
+	f.mu.Lock()
 	hook := f.hook
-
 	f.mu.Unlock()
 
-	if err != nil {
-		return err
+	if hook != nil {
+		if err := hook(c.clone()); err != nil {
+			return nil, err
+		}
+	}
+
+	f.mu.Lock()
+	before := pop(f.failBefore, c)
+	after = pop(f.failAfter, c)
+	f.mu.Unlock()
+
+	if before != nil {
+		return nil, before
 	}
 
 	if err := ctx.Err(); err != nil {
-		return &backend.Error{Op: string(c.Method), Source: c.Source, Err: err}
+		return nil, &backend.Error{Op: string(c.Method), Source: c.Source, Err: err}
 	}
 
-	if hook != nil {
-		return hook(c)
+	return after, nil
+}
+
+// pop takes the first failure queued for c's method and source, or else
+// for its method and any source.
+func pop(queues map[failKey][]error, c Call) error {
+	for _, k := range []failKey{{c.Method, c.Source}, {c.Method, backend.Source{}}} {
+		if q := queues[k]; len(q) > 0 {
+			queues[k] = q[1:]
+
+			return q[0]
+		}
 	}
 
 	return nil
-}
-
-// leave returns the error the call fails with after taking effect, if any.
-// f.mu is held.
-func (f *Fake) leave(m Method) error {
-	q := f.failAfter[m]
-	if len(q) == 0 {
-		return nil
-	}
-
-	f.failAfter[m] = q[1:]
-
-	return q[0]
 }
 
 // source returns the state of src, adding it. f.mu is held.
@@ -478,21 +558,28 @@ func configErr(op Method, src backend.Source, format string, args ...any) error 
 
 // ServerIdentity implements backend.Backend.
 func (f *Fake) ServerIdentity(ctx context.Context) (string, string, error) {
-	if err := f.enter(ctx, Call{Method: ServerIdentity}); err != nil {
+	after, err := f.enter(ctx, Call{Method: ServerIdentity})
+	if err != nil {
 		return "", "", err
 	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	return f.userName, f.host, f.leave(ServerIdentity)
+	if after != nil {
+		return "", "", after
+	}
+
+	return f.userName, f.host, nil
 }
 
-// ResolvePath implements backend.Backend like paths/resolve: a relative
-// path is resolved against DefaultHome, then the path is cleaned.
-// Existence is not checked.
+// ResolvePath implements backend.Backend like paths/resolve: a leading ~
+// is replaced by DefaultHome, a relative path is resolved against it, then
+// the path is cleaned. Existence is not checked. An empty path is an
+// error, as the REST backend rejects it before sending.
 func (f *Fake) ResolvePath(ctx context.Context, p string) (backend.Source, error) {
-	if err := f.enter(ctx, Call{Method: ResolvePath, Path: p}); err != nil {
+	after, err := f.enter(ctx, Call{Method: ResolvePath, Path: p})
+	if err != nil {
 		return backend.Source{}, err
 	}
 
@@ -503,49 +590,52 @@ func (f *Fake) ResolvePath(ctx context.Context, p string) (backend.Source, error
 		return backend.Source{}, &backend.Error{Op: string(ResolvePath), Err: errors.New("empty path")}
 	}
 
-	if !path.IsAbs(p) {
+	if after != nil {
+		return backend.Source{}, after
+	}
+
+	switch {
+	case strings.HasPrefix(p, "~"):
+		p = f.home + p[1:]
+	case !path.IsAbs(p):
 		p = path.Join(f.home, p)
 	}
 
-	return backend.Source{Host: f.host, UserName: f.userName, Path: path.Clean(p)}, f.leave(ResolvePath)
+	return backend.Source{Host: f.host, UserName: f.userName, Path: path.Clean(p)}, nil
 }
 
 // ListSources implements backend.Backend: the known sources of the fake's
 // identity, sorted by path.
 func (f *Fake) ListSources(ctx context.Context) ([]backend.SourceStatus, error) {
-	if err := f.enter(ctx, Call{Method: ListSources}); err != nil {
+	after, err := f.enter(ctx, Call{Method: ListSources})
+	if err != nil {
 		return nil, err
 	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if after != nil {
+		return nil, after
+	}
+
 	var out []backend.SourceStatus
 
 	for _, src := range slices.SortedFunc(maps.Keys(f.sources), backend.Source.Compare) {
 		if src.Host == f.host && src.UserName == f.userName {
-			out = append(out, f.status(src))
+			out = append(out, f.sources[src].status.Clone())
 		}
 	}
 
-	return out, f.leave(ListSources)
-}
-
-// status returns a copy of the status of a known source. f.mu is held.
-func (f *Fake) status(src backend.Source) backend.SourceStatus {
-	st := f.sources[src].status
-	if st.LastSnapshot != nil {
-		last := *st.LastSnapshot
-		st.LastSnapshot = &last
-	}
-
-	return st
+	return out, nil
 }
 
 // PlanSource implements backend.Backend with backend.NewPlan.
 func (f *Fake) PlanSource(ctx context.Context, want backend.Desired, last backend.Applied) (backend.Plan, error) {
 	src := want.Source
-	if err := f.enter(ctx, Call{Method: PlanSource, Source: src, Desired: want, Last: last}); err != nil {
+
+	after, err := f.enter(ctx, Call{Method: PlanSource, Source: src, Desired: want, Last: last})
+	if err != nil {
 		return backend.Plan{}, err
 	}
 
@@ -563,9 +653,8 @@ func (f *Fake) PlanSource(ctx context.Context, want backend.Desired, last backen
 
 	s, known := f.sources[src]
 	if known {
-		st := f.status(src)
-		status = &st
-		current = slices.Clone(s.policy)
+		status = &s.status
+		current = s.policy
 	}
 
 	plan, err := backend.NewPlan(want, last, known, status, current)
@@ -573,23 +662,39 @@ func (f *Fake) PlanSource(ctx context.Context, want backend.Desired, last backen
 		return backend.Plan{}, err
 	}
 
-	return plan, f.leave(PlanSource)
+	if after != nil {
+		return backend.Plan{}, after
+	}
+
+	return plan, nil
 }
 
 // ApplyPlan implements backend.Backend. Like kopia server it validates
 // the policy, and a registration fails for a path that does not exist.
 // The returned Applied carries the fingerprint of the policy as stored.
+// ActionNone is recorded but sends nothing: no hook or failure applies to
+// it.
 func (f *Fake) ApplyPlan(ctx context.Context, plan backend.Plan) (backend.Applied, error) {
 	src := plan.Source
-	if err := f.enter(ctx, Call{Method: ApplyPlan, Source: src, Plan: plan}); err != nil {
+	c := Call{Method: ApplyPlan, Source: src, Plan: plan}
+
+	if plan.Action == backend.ActionNone {
+		f.record(c)
+
+		return plan.Applied.Clone(), nil
+	}
+
+	after, err := f.enter(ctx, c)
+	if err != nil {
 		return backend.Applied{}, err
 	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if plan.Action == backend.ActionNone {
-		return plan.Applied, f.leave(ApplyPlan)
+	var regPut error
+	if plan.Action == backend.ActionRegister {
+		regPut = f.popRegisterPut(src)
 	}
 
 	if err := f.own(ApplyPlan, src); err != nil {
@@ -615,10 +720,8 @@ func (f *Fake) ApplyPlan(ctx context.Context, plan backend.Plan) (backend.Applie
 		s.policy = stored
 		s.loaded = false
 
-		if q := f.failRegPut; len(q) > 0 {
-			f.failRegPut = q[1:]
-
-			return backend.Applied{}, q[0]
+		if regPut != nil {
+			return backend.Applied{}, regPut
 		}
 
 		s.loaded = true
@@ -630,16 +733,33 @@ func (f *Fake) ApplyPlan(ctx context.Context, plan backend.Plan) (backend.Applie
 		return backend.Applied{}, &backend.Error{Op: string(ApplyPlan), Source: src, Err: fmt.Errorf("unknown action %v", plan.Action)}
 	}
 
-	applied := plan.Applied
+	if after != nil {
+		return backend.Applied{}, after
+	}
 
 	hash, err := backend.Fingerprint(stored)
 	if err != nil {
 		return backend.Applied{}, &backend.Error{Op: string(ApplyPlan), Source: src, Err: err}
 	}
 
+	applied := plan.Applied.Clone()
 	applied.StoredHash = hash
 
-	return applied, f.leave(ApplyPlan)
+	return applied, nil
+}
+
+// popRegisterPut takes the first FailRegisterPut failure for src, or else
+// for any source. f.mu is held.
+func (f *Fake) popRegisterPut(src backend.Source) error {
+	for _, k := range []backend.Source{src, {}} {
+		if q := f.failRegPut[k]; len(q) > 0 {
+			f.failRegPut[k] = q[1:]
+
+			return q[0]
+		}
+	}
+
+	return nil
 }
 
 // scheduling decodes the scheduling section of a policy.
@@ -671,7 +791,43 @@ func (f *Fake) validatePolicy(op Method, src backend.Source, policy json.RawMess
 		return configErr(op, src, "failed to validate policy: manual cannot be combined with other scheduling policies")
 	}
 
-	return f.checkCrons(op, src, sched["cron"])
+	if err := f.checkCrons(op, src, sched["cron"]); err != nil {
+		return err
+	}
+
+	// kopia server validates the whole policy on a write, but
+	// policy/resolve only checks the schedule; this rule is one that
+	// PreviewSchedule lets through.
+	var upload struct {
+		Upload struct {
+			MaxParallelSnapshots json.RawMessage `json:"maxParallelSnapshots"`
+		} `json:"upload"`
+	}
+
+	if json.Unmarshal(policy, &upload) == nil && !isNull(upload.Upload.MaxParallelSnapshots) {
+		return configErr(op, src, "failed to validate policy: max parallel snapshots cannot be specified for paths")
+	}
+
+	return f.runCheck(op, src, policy)
+}
+
+func isNull(raw json.RawMessage) bool {
+	s := strings.TrimSpace(string(raw))
+
+	return s == "" || s == "null"
+}
+
+// runCheck applies the check set with SetPolicyCheck. f.mu is held.
+func (f *Fake) runCheck(op Method, src backend.Source, policy json.RawMessage) error {
+	if f.check == nil {
+		return nil
+	}
+
+	if err := f.check(slices.Clone(policy)); err != nil {
+		return configErr(op, src, "policy rejected: %w", err)
+	}
+
+	return nil
 }
 
 // checkCrons reports a cron expression marked with RejectCron. f.mu is held.
@@ -697,10 +853,12 @@ func (f *Fake) checkCrons(op Method, src backend.Source, raw json.RawMessage) er
 // PreviewSchedule implements backend.Backend from the policy it is given,
 // as kopia server does: no times for a paused one, otherwise the first n
 // of SetUpcoming's times. The scheduling section is the policy's own; the
-// fake has no parent policies. A cron marked with RejectCron is an
-// ErrConfig error.
+// fake has no parent policies. A cron marked with RejectCron, manual
+// combined with other scheduling fields, or a policy the check set with
+// SetPolicyCheck refuses, is an ErrConfig error.
 func (f *Fake) PreviewSchedule(ctx context.Context, src backend.Source, policy json.RawMessage, n int) (backend.SchedulePreview, error) {
-	if err := f.enter(ctx, Call{Method: PreviewSchedule, Source: src, Policy: slices.Clone(policy), N: n}); err != nil {
+	after, err := f.enter(ctx, Call{Method: PreviewSchedule, Source: src, Policy: policy, N: n})
+	if err != nil {
 		return backend.SchedulePreview{}, err
 	}
 
@@ -720,6 +878,18 @@ func (f *Fake) PreviewSchedule(ctx context.Context, src backend.Source, policy j
 		return backend.SchedulePreview{}, err
 	}
 
+	if m, ok := sched["manual"]; ok && string(m) == "true" && len(sched) > 1 {
+		return backend.SchedulePreview{}, configErr(PreviewSchedule, src, "invalid scheduling policy: manual cannot be combined with other scheduling policies")
+	}
+
+	if err := f.runCheck(PreviewSchedule, src, policy); err != nil {
+		return backend.SchedulePreview{}, err
+	}
+
+	if after != nil {
+		return backend.SchedulePreview{}, after
+	}
+
 	if sched == nil {
 		sched = map[string]json.RawMessage{}
 	}
@@ -735,13 +905,15 @@ func (f *Fake) PreviewSchedule(ctx context.Context, src backend.Source, policy j
 		preview.Times = slices.Clone(f.upcoming[:min(max(n, 0), len(f.upcoming))])
 	}
 
-	return preview, f.leave(PreviewSchedule)
+	return preview, nil
 }
 
-// DeletePolicy implements backend.Backend: the policy goes, the source
-// stays known.
+// DeletePolicy implements backend.Backend. The policy goes; a source
+// without snapshots is forgotten, as kopia server's refresh drops it, and
+// one with snapshots stays known.
 func (f *Fake) DeletePolicy(ctx context.Context, src backend.Source) error {
-	if err := f.enter(ctx, Call{Method: DeletePolicy, Source: src}); err != nil {
+	after, err := f.enter(ctx, Call{Method: DeletePolicy, Source: src})
+	if err != nil {
 		return err
 	}
 
@@ -753,17 +925,22 @@ func (f *Fake) DeletePolicy(ctx context.Context, src backend.Source) error {
 	}
 
 	if s, ok := f.sources[src]; ok {
-		s.policy = nil
-		s.loaded = true
+		if len(s.snapshots) == 0 {
+			delete(f.sources, src)
+		} else {
+			s.policy = nil
+			s.loaded = true
+		}
 	}
 
-	return f.leave(DeletePolicy)
+	return after
 }
 
 // TriggerSnapshot implements backend.Backend. An unknown source is an
 // ErrTemporary error, like the 404 of sources/upload.
 func (f *Fake) TriggerSnapshot(ctx context.Context, src backend.Source) (backend.SnapshotTicket, error) {
-	if err := f.enter(ctx, Call{Method: TriggerSnapshot, Source: src}); err != nil {
+	after, err := f.enter(ctx, Call{Method: TriggerSnapshot, Source: src})
+	if err != nil {
 		return backend.SnapshotTicket{}, err
 	}
 
@@ -780,29 +957,59 @@ func (f *Fake) TriggerSnapshot(ctx context.Context, src backend.Source) (backend
 			Err: errors.New("kopia server does not know the source yet")}
 	}
 
+	if after != nil {
+		return backend.SnapshotTicket{}, after
+	}
+
 	t := backend.SnapshotTicket{Source: src, TriggeredAt: f.now()}
 	if s.status.LastSnapshot != nil {
 		t.LastSnapshotStart = s.status.LastSnapshot.StartTime
 	}
 
-	return t, f.leave(TriggerSnapshot)
+	return t, nil
 }
 
 // WaitSnapshot implements backend.Backend. It returns the next result
 // queued for the ticket's source, saving its snapshot if it has one, or
 // else saves a complete snapshot started when the ticket was triggered and
-// reports success. A result with a task ID is passed to save first.
+// reports success. A result with a task ID is passed to save first. The
+// snapshot of a source kopia server does not know is SnapshotUnknown.
 func (f *Fake) WaitSnapshot(ctx context.Context, t backend.SnapshotTicket, save func(backend.SnapshotTicket)) (backend.SnapshotResult, error) {
-	if err := f.enter(ctx, Call{Method: WaitSnapshot, Source: t.Source, Ticket: t}); err != nil {
+	after, err := f.enter(ctx, Call{Method: WaitSnapshot, Source: t.Source, Ticket: t})
+	if err != nil {
 		return backend.SnapshotResult{}, err
 	}
 
+	r, err := f.finishSnapshot(t)
+	if err != nil {
+		return backend.SnapshotResult{}, err
+	}
+
+	if r.TaskID != "" && save != nil {
+		t.TaskID = r.TaskID
+		t.TaskDescription = t.Source.String() + " at " + t.TriggeredAt.Format(time.RFC3339)
+		save(t)
+	}
+
+	if after != nil {
+		return backend.SnapshotResult{}, after
+	}
+
+	return r, nil
+}
+
+// finishSnapshot works out how the snapshot of t ends.
+func (f *Fake) finishSnapshot(t backend.SnapshotTicket) (backend.SnapshotResult, error) {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	if err := f.own(WaitSnapshot, t.Source); err != nil {
-		f.mu.Unlock()
-
 		return backend.SnapshotResult{}, err
+	}
+
+	s, ok := f.sources[t.Source]
+	if !ok {
+		return backend.SnapshotResult{Outcome: backend.SnapshotUnknown}, nil
 	}
 
 	var r backend.SnapshotResult
@@ -819,28 +1026,22 @@ func (f *Fake) WaitSnapshot(ctx context.Context, t backend.SnapshotTicket, save 
 	}
 
 	if r.Snapshot != nil {
-		f.addSnapshot(f.source(t.Source), *r.Snapshot)
+		snap := *r.Snapshot
+		r.Snapshot = &snap
+		addSnapshot(s, snap)
 	}
 
-	err := f.leave(WaitSnapshot)
-
-	f.mu.Unlock()
-
-	if r.TaskID != "" && save != nil {
-		t.TaskID = r.TaskID
-		t.TaskDescription = t.Source.String() + " at " + t.TriggeredAt.Format(time.RFC3339)
-		save(t)
-	}
-
-	return r, err
+	return r, nil
 }
 
 // AnnotateSnapshot implements backend.Backend: it finds the snapshot like
 // a real backend (the start time, not a checkpoint, the one that ended
 // first), sets its description and records the annotation.
 func (f *Fake) AnnotateSnapshot(ctx context.Context, src backend.Source, startTime time.Time, description string, addPins []string) error {
-	c := Call{Method: AnnotateSnapshot, Source: src, StartTime: startTime, Description: description, AddPins: slices.Clone(addPins)}
-	if err := f.enter(ctx, c); err != nil {
+	c := Call{Method: AnnotateSnapshot, Source: src, StartTime: startTime, Description: description, AddPins: addPins}
+
+	after, err := f.enter(ctx, c)
+	if err != nil {
 		return err
 	}
 
@@ -875,5 +1076,5 @@ func (f *Fake) AnnotateSnapshot(ctx context.Context, src backend.Source, startTi
 	s.snapshots[found].Description = description
 	f.annotations[src] = append(f.annotations[src], Annotation{StartTime: startTime, Description: description, AddPins: slices.Clone(addPins)})
 
-	return f.leave(AnnotateSnapshot)
+	return after
 }

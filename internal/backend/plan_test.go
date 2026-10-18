@@ -3,6 +3,7 @@ package backend
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -43,7 +44,8 @@ func TestNewPlanActions(t *testing.T) {
 				t.Errorf("Action = %v, want %v", p.Action, tt.action)
 			}
 
-			if p.Source != testSource || p.Known != tt.known || p.Status != st {
+			if p.Source != testSource || p.Known != tt.known || (p.Status == nil) != (st == nil) ||
+				(st != nil && (p.Status == st || *p.Status != *st)) {
 				t.Errorf("plan = %+v", p)
 			}
 
@@ -85,6 +87,17 @@ func TestNewPlanErrors(t *testing.T) {
 	_, err = NewPlan(Desired{Source: testSource}, Applied{}, true, nil, json.RawMessage(`"x"`))
 	if !errors.As(err, &be) || IsConfig(err) || IsTemporary(err) {
 		t.Errorf("current policy not an object: %v", err)
+	}
+
+	// A broken stored state is not the labels' fault.
+	_, err = NewPlan(Desired{Source: testSource}, Applied{Patch: PolicyPatch{Raw: json.RawMessage(`[1]`)}}, true, nil, nil)
+	if !errors.As(err, &be) || IsConfig(err) || !strings.Contains(err.Error(), "last applied patch") {
+		t.Errorf("invalid last patch: %v", err)
+	}
+
+	_, err = NewPlan(Desired{Source: Source{Host: "kopia", Path: "/data"}}, Applied{}, true, nil, nil)
+	if !errors.Is(err, ErrIncompleteSource) {
+		t.Errorf("incomplete source: %v", err)
 	}
 }
 

@@ -95,6 +95,15 @@ func TestObjectGetRemove(t *testing.T) {
 
 	got, _ = encode(obj)
 	assertJSON(t, "after removing a.d", got, `{"s":"x"}`)
+
+	// An empty object that held nothing to remove stays.
+	obj, _ = parseObject(json.RawMessage(`{"a":{"e":{}}}`))
+	if err := obj.remove([]string{"a", "e", "x"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ = encode(obj)
+	assertJSON(t, "after removing a missing a.e.x", got, `{"a":{"e":{}}}`)
 }
 
 func TestLeaves(t *testing.T) {

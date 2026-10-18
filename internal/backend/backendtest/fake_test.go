@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -70,6 +71,9 @@ func TestIdentityAndPaths(t *testing.T) {
 		"backups":        "/root/backups",
 		"/":              "/",
 		"../outside/dir": "/outside/dir",
+		"~":              "/root",
+		"~/backups/":     "/root/backups",
+		"~data":          "/rootdata",
 	} {
 		src, err := f.ResolvePath(ctx, in)
 		if err != nil {
@@ -178,12 +182,25 @@ func TestRegisterAndUpdate(t *testing.T) {
 
 	mustPolicy(t, f, src, `{"scheduling":{"cron":["5 * * * *"]},"retention":{"keepDaily":7}}`)
 
+	// Without snapshots kopia server forgets the source with its policy.
+	if err := f.DeletePolicy(ctx, src); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := f.Policy(src); ok || f.Known(src) {
+		t.Errorf("after DeletePolicy: policy %v, known %v", ok, f.Known(src))
+	}
+
+	// With snapshots the source stays.
+	f.SetPolicy(src, `{}`)
+	f.AddSnapshot(src, backend.SnapshotInfo{StartTime: time.Unix(1, 0)})
+
 	if err := f.DeletePolicy(ctx, src); err != nil {
 		t.Fatal(err)
 	}
 
 	if _, ok := f.Policy(src); ok || !f.Known(src) {
-		t.Errorf("after DeletePolicy: policy %v, known %v", ok, f.Known(src))
+		t.Errorf("after DeletePolicy with snapshots: policy %v, known %v", ok, f.Known(src))
 	}
 }
 
@@ -207,6 +224,8 @@ func TestKopiaValidation(t *testing.T) {
 			Merged: backend.Merged{Policy: json.RawMessage(`{"scheduling":{"cron":["0 25 * * *"]}}`)}}},
 		{"malformed", backend.Plan{Source: src, Action: backend.ActionUpdate,
 			Merged: backend.Merged{Policy: json.RawMessage(`{"scheduling":5}`)}}},
+		{"max parallel snapshots on a path", backend.Plan{Source: src, Action: backend.ActionUpdate,
+			Merged: backend.Merged{Policy: json.RawMessage(`{"upload":{"maxParallelSnapshots":2}}`)}}},
 	}
 
 	for _, tt := range tests {
@@ -254,6 +273,15 @@ func TestPreviewSchedule(t *testing.T) {
 
 	if p, err := f.PreviewSchedule(ctx, src, json.RawMessage(`{"scheduling":{"manual":true}}`), 5); err != nil || len(p.Times) != 0 {
 		t.Errorf("paused preview = %+v, %v", p, err)
+	}
+
+	if _, err := f.PreviewSchedule(ctx, src, json.RawMessage(`{"scheduling":{"manual":true,"cron":[]}}`), 1); !backend.IsConfig(err) {
+		t.Errorf("manual with cron: %v", err)
+	}
+
+	// policy/resolve checks only the schedule.
+	if _, err := f.PreviewSchedule(ctx, src, json.RawMessage(`{"upload":{"maxParallelSnapshots":2}}`), 1); err != nil {
+		t.Errorf("max parallel snapshots: %v", err)
 	}
 
 	if _, err := f.PreviewSchedule(ctx, src, json.RawMessage(`{"scheduling":{"cron":["bad"]}}`), 1); !backend.IsConfig(err) {
@@ -313,8 +341,17 @@ func TestFailures(t *testing.T) {
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
 
-	if _, err := f.ListSources(canceled); !errors.Is(err, context.Canceled) {
+	_, err = f.ListSources(canceled)
+	if !errors.Is(err, context.Canceled) || backend.IsTemporary(err) || backend.IsConfig(err) {
 		t.Errorf("canceled context: %v", err)
+	}
+
+	expired, cancel := context.WithDeadline(ctx, time.Unix(1, 0))
+	defer cancel()
+
+	_, err = f.ListSources(expired)
+	if !errors.Is(err, context.DeadlineExceeded) || backend.IsTemporary(err) || backend.IsConfig(err) {
+		t.Errorf("expired context: %v", err)
 	}
 }
 
@@ -487,5 +524,311 @@ func TestConcurrentUse(t *testing.T) {
 
 	if got, _ := f.ListSources(ctx); len(got) != 8 {
 		t.Errorf("%d sources", len(got))
+	}
+}
+
+// Every method that takes a source rejects one of another identity.
+func TestWrongIdentityEverywhere(t *testing.T) {
+	f := New()
+	src := f.Source("/data/app")
+	f.AddSnapshot(src, backend.SnapshotInfo{StartTime: time.Unix(1, 0)})
+
+	plan, err := f.PlanSource(ctx, backend.Desired{Source: src, Patch: cron("0 * * * *")}, backend.Applied{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.SetIdentity("admin", "nas")
+
+	check := func(name string, err error) {
+		t.Helper()
+
+		if !errors.Is(err, backend.ErrWrongIdentity) || backend.IsConfig(err) || backend.IsTemporary(err) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+
+	_, err = f.ApplyPlan(ctx, plan)
+	check("ApplyPlan", err)
+
+	if p, _ := f.Policy(src); p != nil {
+		t.Errorf("ApplyPlan stored %s", p)
+	}
+
+	_, err = f.PreviewSchedule(ctx, src, plan.Unpaused, 1)
+	check("PreviewSchedule", err)
+	check("DeletePolicy", f.DeletePolicy(ctx, src))
+
+	_, err = f.TriggerSnapshot(ctx, src)
+	check("TriggerSnapshot", err)
+
+	_, err = f.WaitSnapshot(ctx, backend.SnapshotTicket{Source: src}, nil)
+	check("WaitSnapshot", err)
+	check("AnnotateSnapshot", f.AnnotateSnapshot(ctx, src, time.Unix(1, 0), "x", nil))
+
+	if got, err := f.ListSources(ctx); err != nil || len(got) != 0 {
+		t.Errorf("ListSources of the new identity = %v, %v", got, err)
+	}
+}
+
+// A failure set with FailNextAfter is used up by the next call of the
+// method, also when that call fails for another reason first, and never by
+// an ApplyPlan of ActionNone, which sends nothing.
+func TestFailNextAfterUse(t *testing.T) {
+	f := New()
+	boom := errors.New("boom")
+	f.SetPathMissing("/missing")
+
+	f.FailNextAfter(ApplyPlan, boom)
+
+	none := backend.Plan{Source: f.Source("/x"), Action: backend.ActionNone}
+	if _, err := f.ApplyPlan(ctx, none); err != nil {
+		t.Errorf("ActionNone: %v", err)
+	}
+
+	missing, err := f.PlanSource(ctx, backend.Desired{Source: f.Source("/missing")}, backend.Applied{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := f.ApplyPlan(ctx, missing); !backend.IsConfig(err) {
+		t.Errorf("missing path: %v", err)
+	}
+
+	good, err := f.PlanSource(ctx, backend.Desired{Source: f.Source("/good")}, backend.Applied{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if applied, err := f.ApplyPlan(ctx, good); err != nil || applied.StoredHash == "" {
+		t.Errorf("the failure leaked to the next call: %+v, %v", applied, err)
+	}
+
+	f.FailNextAfter(ListSources, boom)
+
+	if got, err := f.ListSources(ctx); !errors.Is(err, boom) || got != nil {
+		t.Errorf("ListSources = %v, %v; want no result and boom", got, err)
+	}
+
+	if _, err := f.ListSources(ctx); err != nil {
+		t.Errorf("second ListSources: %v", err)
+	}
+
+	if len(f.CallsTo(ApplyPlan)) != 3 {
+		t.Errorf("ApplyPlan calls = %d, want the ActionNone one recorded too", len(f.CallsTo(ApplyPlan)))
+	}
+}
+
+// Failures can be aimed at one source while others go on.
+func TestFailuresForOneSource(t *testing.T) {
+	f := New()
+	a, b := f.Source("/a"), f.Source("/b")
+	boom := errors.New("boom")
+
+	f.FailNextFor(a, PlanSource, boom)
+	f.FailNextAfterFor(a, ApplyPlan, boom)
+	f.FailRegisterPutFor(a, boom)
+
+	if _, err := f.PlanSource(ctx, backend.Desired{Source: b}, backend.Applied{}); err != nil {
+		t.Errorf("b: %v", err)
+	}
+
+	if _, err := f.PlanSource(ctx, backend.Desired{Source: a}, backend.Applied{}); !errors.Is(err, boom) {
+		t.Errorf("a: %v", err)
+	}
+
+	planB, _ := f.PlanSource(ctx, backend.Desired{Source: b}, backend.Applied{})
+	if _, err := f.ApplyPlan(ctx, planB); err != nil || !f.Loaded(b) {
+		t.Errorf("b apply: %v, loaded %v", err, f.Loaded(b))
+	}
+
+	planA, _ := f.PlanSource(ctx, backend.Desired{Source: a}, backend.Applied{})
+	if _, err := f.ApplyPlan(ctx, planA); !errors.Is(err, boom) || !f.Known(a) || f.Loaded(a) {
+		t.Errorf("a apply: %v, known %v, loaded %v", err, f.Known(a), f.Loaded(a))
+	}
+}
+
+// The hook sees every call, also one that a queued failure or a done
+// context fails.
+func TestHookSeesEveryCall(t *testing.T) {
+	f := New()
+
+	var seen []Method
+
+	f.SetHook(func(c Call) error {
+		seen = append(seen, c.Method)
+
+		return nil
+	})
+
+	f.FailNext(ListSources, errors.New("boom"))
+
+	_, _ = f.ListSources(ctx)
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	_, _ = f.ListSources(canceled)
+
+	if len(seen) != 2 || len(f.Calls()) != 2 {
+		t.Errorf("hook saw %v of %d calls", seen, len(f.Calls()))
+	}
+}
+
+// The fake and its records share no memory with the caller.
+func TestNoSharedMemory(t *testing.T) {
+	f := New()
+	src := f.Source("/data/app")
+	f.SetPolicy(src, `{"x":1}`)
+	f.AddSnapshot(src, backend.SnapshotInfo{StartTime: time.Unix(1, 0)})
+
+	p, _ := f.Policy(src)
+	p[2] = 'y'
+	mustPolicy(t, f, src, `{"x":1}`)
+
+	owners := []string{"app"}
+	raw := json.RawMessage(`{"retention":{"keepDaily":7}}`)
+
+	plan, err := f.PlanSource(ctx, backend.Desired{Source: src, Owners: owners, Patch: backend.PolicyPatch{Raw: raw}}, backend.Applied{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plan.Status.LastSnapshot.Description = "changed by the caller"
+	owners[0] = "other"
+	copy(raw, `{"retention":{"keepDaily":9}}`)
+
+	if got, _ := f.ListSources(ctx); got[0].LastSnapshot.Description != "" {
+		t.Errorf("LastSnapshot shared with a plan: %+v", got[0].LastSnapshot)
+	}
+
+	c := f.CallsTo(PlanSource)[0]
+	if c.Desired.Owners[0] != "app" || !strings.Contains(string(c.Desired.Patch.Raw), "7") {
+		t.Errorf("recorded call shares memory: %+v", c.Desired)
+	}
+
+	c.Desired.Owners[0] = "changed"
+
+	if f.CallsTo(PlanSource)[0].Desired.Owners[0] != "app" {
+		t.Error("Calls returns shared memory")
+	}
+}
+
+func TestSetStatusKeepsLastSnapshot(t *testing.T) {
+	f := New()
+	src := f.Source("/data/app")
+	start := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	f.AddSnapshot(src, backend.SnapshotInfo{StartTime: start})
+
+	f.SetStatus(src, backend.SourceStatus{Status: backend.StatusUploading, CurrentTask: "3"})
+
+	got, _ := f.ListSources(ctx)
+	if got[0].Status != backend.StatusUploading || got[0].LastSnapshot == nil || !got[0].LastSnapshot.StartTime.Equal(start) {
+		t.Errorf("status = %+v", got[0])
+	}
+
+	other := &backend.SnapshotInfo{StartTime: start.Add(time.Hour)}
+	f.SetStatus(src, backend.SourceStatus{LastSnapshot: other})
+	other.Description = "changed by the caller"
+
+	if got, _ := f.ListSources(ctx); got[0].LastSnapshot.Description != "" || !got[0].LastSnapshot.StartTime.Equal(start.Add(time.Hour)) {
+		t.Errorf("status = %+v", got[0].LastSnapshot)
+	}
+}
+
+// The preview of a paused source's Unpaused policy comes from the policy
+// passed in, not from the stored pause.
+func TestPreviewOfPausedSource(t *testing.T) {
+	f := New()
+	src := f.Source("/data/app")
+	t1 := time.Date(2026, 10, 18, 13, 0, 0, 0, time.UTC)
+	f.SetUpcoming(t1)
+	f.SetPolicy(src, `{"scheduling":{"manual":true}}`)
+
+	p, err := f.PreviewSchedule(ctx, src, json.RawMessage(`{"scheduling":{"cron":["0 * * * *"]}}`), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(p.Times) != 1 {
+		t.Errorf("Times = %v", p.Times)
+	}
+
+	assertJSON(t, "Scheduling", p.Scheduling, `{"cron":["0 * * * *"]}`)
+}
+
+// SetPolicyCheck stands for kopia server's decoding and validation of the
+// whole policy.
+func TestPolicyCheck(t *testing.T) {
+	f := New()
+	src := f.Source("/data/app")
+
+	f.SetPolicyCheck(func(p json.RawMessage) error {
+		var v struct {
+			Retention struct {
+				KeepDaily *int `json:"keepDaily"`
+			} `json:"retention"`
+		}
+
+		return json.Unmarshal(p, &v)
+	})
+
+	bad := json.RawMessage(`{"retention":{"keepDaily":"seven"}}`)
+
+	if _, err := f.PreviewSchedule(ctx, src, bad, 1); !backend.IsConfig(err) {
+		t.Errorf("PreviewSchedule: %v", err)
+	}
+
+	plan := backend.Plan{Source: src, Action: backend.ActionRegister, Merged: backend.Merged{Policy: bad}}
+	if _, err := f.ApplyPlan(ctx, plan); !backend.IsConfig(err) || f.Known(src) {
+		t.Errorf("ApplyPlan: %v, known %v", err, f.Known(src))
+	}
+
+	f.SetPolicyCheck(nil)
+
+	if _, err := f.ApplyPlan(ctx, plan); err != nil {
+		t.Errorf("without the check: %v", err)
+	}
+}
+
+// kopia server validates the policy of a registration too, before it
+// knows the source.
+func TestRegisterValidates(t *testing.T) {
+	f := New()
+	src := f.Source("/data/app")
+	f.RejectCron("0 25 * * *")
+
+	for _, policy := range []string{`{"scheduling":{"cron":["0 25 * * *"]}}`, `{"scheduling":{"manual":true,"cron":[]}}`} {
+		_, err := f.ApplyPlan(ctx, backend.Plan{Source: src, Action: backend.ActionRegister, Merged: backend.Merged{Policy: json.RawMessage(policy)}})
+		if !backend.IsConfig(err) || f.Known(src) {
+			t.Errorf("%s: %v, known %v", policy, err, f.Known(src))
+		}
+	}
+}
+
+func TestAnnotateEndedFirst(t *testing.T) {
+	f := New()
+	src := f.Source("/data/app")
+	start := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+
+	f.AddSnapshot(src, backend.SnapshotInfo{StartTime: start, EndTime: start.Add(2 * time.Minute)})
+	f.AddSnapshot(src, backend.SnapshotInfo{StartTime: start, EndTime: start.Add(time.Minute)})
+
+	if err := f.AnnotateSnapshot(ctx, src, start, "app", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if snaps := f.Snapshots(src); snaps[1].Description != "app" || snaps[0].Description != "" {
+		t.Errorf("snapshots = %+v", snaps)
+	}
+}
+
+func TestWaitUnknownSource(t *testing.T) {
+	f := New()
+	src := f.Source("/none")
+
+	r, err := f.WaitSnapshot(ctx, backend.SnapshotTicket{Source: src}, nil)
+	if err != nil || r.Outcome != backend.SnapshotUnknown || f.Known(src) {
+		t.Errorf("WaitSnapshot = %+v, %v, known %v", r, err, f.Known(src))
 	}
 }

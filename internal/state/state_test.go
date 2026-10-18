@@ -816,8 +816,13 @@ func TestJSONKeys(t *testing.T) {
 		B int
 	}
 
+	type ptrInner struct {
+		P int `json:"p"`
+	}
+
 	type outer struct {
 		inner
+		*ptrInner
 		C       int `json:"c"`
 		D       int `json:"-"`
 		E       inner
@@ -828,7 +833,7 @@ func TestJSONKeys(t *testing.T) {
 	_ = outer{}.private
 
 	got := jsonKeys(reflect.TypeFor[outer]())
-	want := map[string]bool{"a": true, "B": true, "c": true, "E": true, "named": true}
+	want := map[string]bool{"a": true, "B": true, "p": true, "c": true, "E": true, "named": true}
 
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("jsonKeys = %v, want %v", got, want)
@@ -1066,4 +1071,233 @@ func TestFlushAndClose(t *testing.T) {
 	}
 
 	assertApplied(t, open(t, path, Options{}), srcA, applied("0 * * * *", ""))
+}
+
+// A key that differs from a known one only in case is the known field to
+// encoding/json; it is not kept as an unknown field next to it.
+func TestCaseVariantKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	content := `{"version":1,"sources":[{"source":{"host":"kopia","userName":"root","path":"/data/a"},` +
+		`"savedscheduling":{"cron":["1 * * * *"],"runMissed":true},"Patch":{"scheduling":{"cron":["1 * * * *"]}}}]}`
+
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := open(t, path, Options{})
+	assertApplied(t, s, srcA, applied("1 * * * *", `{"cron":["1 * * * *"],"runMissed":true}`))
+
+	if err := setApplied(s, srcA, applied("5 * * * *", "")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := readFile(t, path)
+	if strings.Contains(got, "savedscheduling") || strings.Contains(got, `"Patch"`) || strings.Contains(got, "1 * * * *") {
+		t.Errorf("stale case-variant keys kept:\n%s", got)
+	}
+
+	assertApplied(t, reopen(t, s), srcA, applied("5 * * * *", ""))
+}
+
+// null means the same as a missing field.
+func TestNullFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	content := `{"version":1,"sources":[{"source":{"host":"kopia","userName":"root","path":"/data/a"},` +
+		`"patch":{"scheduling":{"cron":["1 * * * *"]},"raw":null},"savedScheduling":null,"pending":null,"storedHash":null}]}`
+
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := open(t, path, Options{})
+	assertApplied(t, s, srcA, applied("1 * * * *", ""))
+
+	if got := readFile(t, path); strings.Contains(got, "null") {
+		t.Errorf("nulls written back:\n%s", got)
+	}
+}
+
+// Temporary files of a corrupt-file copy have the same name pattern as
+// those of the state file, so a crash during the copy leaves nothing that
+// the next Open does not remove.
+func TestCorruptCopyTempNames(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var patterns []string
+
+	createTemp = func(dir, pattern string) (*os.File, error) {
+		patterns = append(patterns, pattern)
+
+		return os.CreateTemp(dir, pattern)
+	}
+
+	t.Cleanup(func() { createTemp = os.CreateTemp })
+
+	open(t, path, Options{})
+
+	if len(patterns) != 2 {
+		t.Fatalf("patterns = %v, want the copy and the first write", patterns)
+	}
+
+	for _, p := range patterns {
+		if p != "state.json"+tmpSuffix+"*" {
+			t.Errorf("temporary file pattern %q", p)
+		}
+	}
+}
+
+// A Delete while the file is behind writes it, like an unchanged Update.
+func TestDeleteWritesWhenBehind(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can write to a read-only directory")
+	}
+
+	dir := filepath.Join(t.TempDir(), "state")
+	path := filepath.Join(dir, "state.json")
+	s := open(t, path, Options{})
+
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o750) })
+
+	if err := setApplied(s, srcA, applied("0 * * * *", "")); err == nil {
+		t.Fatal("Update: no error")
+	}
+
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Delete(srcB); err != nil || s.Err() != nil {
+		t.Errorf("Delete = %v, Err = %v", err, s.Err())
+	}
+
+	if !strings.Contains(readFile(t, path), "/data/a") {
+		t.Errorf("file not written: %s", readFile(t, path))
+	}
+
+	// A Delete that could not be written, retried: the record leaves the
+	// file too.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Delete(srcA); !errors.Is(err, ErrNotPersisted) {
+		t.Fatalf("Delete = %v, want ErrNotPersisted", err)
+	}
+
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Delete(srcA); err != nil || s.Err() != nil {
+		t.Errorf("retried Delete = %v, Err = %v", err, s.Err())
+	}
+
+	if strings.Contains(readFile(t, path), "/data/a") {
+		t.Errorf("deleted record still in the file: %s", readFile(t, path))
+	}
+}
+
+// A write that fails after the temporary file exists removes it.
+func TestTempRemovedOnFailedRename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	s := open(t, path, Options{})
+
+	// The state file is replaced by a non-empty directory: the rename fails.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(path, "x"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := setApplied(s, srcA, applied("0 * * * *", "")); !errors.Is(err, ErrNotPersisted) {
+		t.Fatalf("Update = %v, want ErrNotPersisted", err)
+	}
+
+	for _, n := range dirNames(t, dir) {
+		if strings.Contains(n, tmpSuffix) {
+			t.Errorf("temporary file left: %s", n)
+		}
+	}
+}
+
+// Flush after Close writes nothing: the lock is no longer held.
+func TestFlushAfterClose(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can write to a read-only directory")
+	}
+
+	dir := filepath.Join(t.TempDir(), "state")
+	path := filepath.Join(dir, "state.json")
+	s := open(t, path, Options{})
+
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o750) })
+
+	if err := setApplied(s, srcA, applied("0 * * * *", "")); err == nil {
+		t.Fatal("Update: no error")
+	}
+
+	if err := s.Close(); err == nil {
+		t.Fatal("Close: no error")
+	}
+
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	before := readFile(t, path)
+
+	if err := s.Flush(); err != nil {
+		t.Errorf("Flush after Close = %v", err)
+	}
+
+	if got := readFile(t, path); got != before {
+		t.Errorf("Flush after Close wrote the file:\n%s", got)
+	}
+
+	// The lock was released all the same.
+	open(t, path, Options{})
+}
+
+// No field of Record shares a JSON name with a field of backend.Applied or
+// with "source"; encoding/json would silently drop one of them.
+func TestRecordKeysDoNotCollide(t *testing.T) {
+	applied := jsonKeys(reflect.TypeFor[backend.Applied]())
+	own := map[string]bool{"source": true}
+
+	for f := range reflect.TypeFor[Record]().Fields() {
+		if f.Anonymous {
+			continue
+		}
+
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if name == "" {
+			name = f.Name
+		}
+
+		if applied[name] || own[name] {
+			t.Errorf("Record field %s uses the JSON name %q twice", f.Name, name)
+		}
+
+		own[name] = true
+	}
+
+	if len(knownEntryKeys) != len(applied)+len(own) {
+		t.Errorf("knownEntryKeys = %v, want the keys of Applied, Record and source", knownEntryKeys)
+	}
 }

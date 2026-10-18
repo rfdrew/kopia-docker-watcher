@@ -137,8 +137,9 @@ type Record struct {
 	// fields are stored at the top level of the source's entry.
 	backend.Applied
 
-	// A field added here must not be named "source": that key holds the
-	// entry's source.
+	// A field added here must not be named "source", which holds the
+	// entry's source, nor share a JSON name with a field of
+	// backend.Applied: encoding/json would quietly drop one of the two.
 }
 
 // Validate reports whether r can be stored.
@@ -521,7 +522,7 @@ func (s *Store) keepCorrupt(data []byte, msg string, problems []string) error {
 
 	copyPath, err := s.corruptCopyPath()
 	if err == nil {
-		err = writeAtomic(copyPath, data)
+		err = writeAtomic(copyPath, filepath.Base(s.path), data)
 	}
 
 	if err != nil {
@@ -562,8 +563,8 @@ var knownEntryKeys = func() map[string]bool {
 }()
 
 // jsonKeys returns the JSON names of the fields of struct type t, with the
-// fields of embedded structs without a name promoted, as encoding/json
-// does.
+// fields of embedded structs and struct pointers without a name promoted,
+// as encoding/json does.
 func jsonKeys(t reflect.Type) map[string]bool {
 	out := map[string]bool{}
 
@@ -575,10 +576,16 @@ func jsonKeys(t reflect.Type) map[string]bool {
 
 		name, _, _ := strings.Cut(tag, ",")
 
-		if f.Anonymous && name == "" && f.Type.Kind() == reflect.Struct {
-			maps.Copy(out, jsonKeys(f.Type))
+		if t := f.Type; f.Anonymous && name == "" {
+			if t.Kind() == reflect.Pointer {
+				t = t.Elem()
+			}
 
-			continue
+			if t.Kind() == reflect.Struct {
+				maps.Copy(out, jsonKeys(t))
+
+				continue
+			}
 		}
 
 		if !f.IsExported() {
@@ -684,6 +691,14 @@ func decodeEntry(raw json.RawMessage) (backend.Source, entry, error) {
 		return src, entry{}, fmt.Errorf("%s: %w", src, err)
 	}
 
+	// A null value means the same as a missing one.
+	r.SavedScheduling = nilIfNull(r.SavedScheduling)
+	r.Patch.Raw = nilIfNull(r.Patch.Raw)
+
+	if r.Pending != nil {
+		r.Pending.Raw = nilIfNull(r.Pending.Raw)
+	}
+
 	if err := r.Validate(); err != nil {
 		return src, entry{}, fmt.Errorf("%s: %w", src, err)
 	}
@@ -696,22 +711,46 @@ func decodeEntry(raw json.RawMessage) (backend.Source, entry, error) {
 	e := entry{record: enc}
 
 	for k, v := range fields {
-		if !knownEntryKeys[k] {
-			if e.extra == nil {
-				e.extra = map[string]json.RawMessage{}
-			}
-
-			e.extra[k] = v
+		if isKnownEntryKey(k) {
+			continue
 		}
+
+		if e.extra == nil {
+			e.extra = map[string]json.RawMessage{}
+		}
+
+		e.extra[k] = v
 	}
 
 	return src, e, nil
 }
 
+// isKnownEntryKey reports whether encoding/json decodes key into a field of
+// an entry: it matches field names regardless of case, so a key such as
+// "Patch" is the patch and must not be kept next to it as an unknown one.
+func isKnownEntryKey(key string) bool {
+	for k := range knownEntryKeys {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// nilIfNull returns nil for a JSON null.
+func nilIfNull(raw json.RawMessage) json.RawMessage {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+
+	return raw
+}
+
 // writeLocked writes all records to the file atomically and keeps track of
 // failures. s.mu is held.
 func (s *Store) writeLocked() error {
-	err := writeAtomic(s.path, s.encodeLocked())
+	err := writeAtomic(s.path, filepath.Base(s.path), s.encodeLocked())
 
 	switch {
 	case err != nil && s.writeErr == nil:
@@ -818,14 +857,19 @@ func mustDecode(raw json.RawMessage) Record {
 	return r
 }
 
+// createTemp is os.CreateTemp; tests replace it to see the names.
+var createTemp = os.CreateTemp
+
 // writeAtomic replaces path with data: a temporary file in the same
 // directory is written, synced and renamed over path, then the directory
 // is synced so that the rename survives a power loss. The temporary file
-// is removed if anything fails.
-func writeAtomic(path string, data []byte) (err error) {
+// is named after tmpBase, the base name of STATE_FILE, so that
+// removeLeftovers finds it after a crash, and it is removed if anything
+// fails.
+func writeAtomic(path, tmpBase string, data []byte) (err error) {
 	dir := filepath.Dir(path)
 
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+tmpSuffix+"*")
+	tmp, err := createTemp(dir, tmpBase+tmpSuffix+"*")
 	if err != nil {
 		return fmt.Errorf("create temporary file: %w", err)
 	}

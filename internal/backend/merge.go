@@ -2,6 +2,7 @@ package backend
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -31,8 +32,8 @@ type Merged struct {
 	// Intent is what to store before ApplyPlan. It keeps what a failed or
 	// half-done apply must not lose: the scheduling section a pause is
 	// about to replace, the saved section of a source not yet unpaused,
-	// the fields of the patches that may now be in the policy, and
-	// Pending, which makes the next plan write again.
+	// the last confirmed patch, and Pending with the fields that may now
+	// be in the policy, which also makes the next plan write again.
 	Intent Applied
 
 	// Applied is what to store once Policy is stored. ApplyPlan returns it
@@ -72,23 +73,25 @@ var pausedScheduling = json.RawMessage(`{"manual":true}`)
 // path of a running container is lifted, and a source the watcher did not
 // pause is paused when its containers stop.
 //
-// An invalid want.Patch is an ErrConfig error. A current policy or a last
-// state that is not a JSON object is an error of neither kind.
+// An invalid want.Patch is an ErrConfig error. A current policy that is not
+// a JSON object, or an invalid last state, is an error of neither kind.
 func Merge(current json.RawMessage, want Desired, last Applied) (Merged, error) {
 	newFields, err := want.Patch.Fields()
 	if err != nil {
 		return Merged{}, err
 	}
 
+	// An invalid stored state is not the labels' fault: the error is of
+	// neither kind.
 	oldFields, err := last.Patch.Fields()
 	if err != nil {
-		return Merged{}, fmt.Errorf("last applied patch: %w", err)
+		return Merged{}, fmt.Errorf("last applied patch: %v", err) //nolint:errorlint // not ErrConfig
 	}
 
 	if last.Pending != nil {
 		pending, err := last.Pending.Fields()
 		if err != nil {
-			return Merged{}, fmt.Errorf("pending patch: %w", err)
+			return Merged{}, fmt.Errorf("pending patch: %v", err) //nolint:errorlint // not ErrConfig
 		}
 
 		oldFields = append(oldFields, pending...)
@@ -120,7 +123,9 @@ func Merge(current json.RawMessage, want Desired, last Applied) (Merged, error) 
 
 	for _, f := range newFields {
 		if err := policy.set(f.Path, f.Value); err != nil {
-			return Merged{}, fmt.Errorf("current policy: %w", err)
+			// The labels ask for a field inside one the policy holds as
+			// something other than an object.
+			return Merged{}, configError(err)
 		}
 	}
 
@@ -132,7 +137,7 @@ func Merge(current json.RawMessage, want Desired, last Applied) (Merged, error) 
 	m := Merged{
 		Policy:   unpaused,
 		Unpaused: unpaused,
-		Applied:  Applied{Patch: want.Patch.clone()},
+		Applied:  Applied{Patch: want.Patch.Clone()},
 	}
 
 	if want.Paused {
@@ -162,8 +167,13 @@ func Merge(current json.RawMessage, want Desired, last Applied) (Merged, error) 
 	if !same && last.Pending == nil && last.StoredHash != "" && currentHash == last.StoredHash &&
 		want.Paused == last.paused() && want.Patch.Equal(last.Patch) {
 		// The policy is as kopia server stored the watcher's last write,
-		// and the watcher wants what it wrote then.
+		// and the watcher wants what it wrote then. Nothing is written, so
+		// Policy is the current one.
 		same = true
+
+		if m.Policy, err = encode(policy0(current)); err != nil {
+			return Merged{}, err
+		}
 	}
 
 	m.Changed = !same || last.Pending != nil
@@ -179,22 +189,23 @@ func Merge(current json.RawMessage, want Desired, last Applied) (Merged, error) 
 	return m, nil
 }
 
-// intent is the state to store before applying: the old patch with an
-// earlier unconfirmed one folded in, the new patch as pending, and the
-// saved section of whichever pause may be in force.
+// intent is the state to store before applying: the last confirmed patch,
+// the new patch as pending with an earlier unconfirmed one folded in, and
+// the saved section of whichever pause may be in force.
 func intent(want Desired, last, applied Applied) (Applied, error) {
-	in := Applied{Patch: last.Patch.clone()}
+	in := Applied{Patch: last.Patch.Clone()}
+
+	pending := want.Patch.Clone()
 
 	if last.Pending != nil {
-		u, err := union(last.Patch, *last.Pending)
+		u, err := union(*last.Pending, want.Patch)
 		if err != nil {
-			return Applied{}, fmt.Errorf("pending patch: %w", err)
+			return Applied{}, fmt.Errorf("pending patch: %v", err) //nolint:errorlint // not ErrConfig
 		}
 
-		in.Patch = u
+		pending = u
 	}
 
-	pending := want.Patch.clone()
 	in.Pending = &pending
 
 	in.SavedScheduling = slices.Clone(applied.SavedScheduling)
@@ -203,6 +214,15 @@ func intent(want Desired, last, applied Applied) (Applied, error) {
 	}
 
 	return in, nil
+}
+
+// policy0 decodes the current policy for output; a missing one is empty.
+func policy0(current json.RawMessage) any {
+	if isNull(current) {
+		return map[string]any{}
+	}
+
+	return compact(current)
 }
 
 // unpause replaces the scheduling section of a paused policy by saved, or
@@ -249,6 +269,10 @@ func isPaused(section json.RawMessage) bool {
 // when they mean the same to Kopia, in the sense of Merged.Changed: key
 // order, whitespace, null values and empty objects do not matter. A
 // missing policy has the fingerprint of an empty one.
+//
+// The hash is salted with a random value per process, so a fingerprint
+// from an earlier run of the watcher never matches: Applied.StoredHash is
+// trusted only by the process that computed it.
 func Fingerprint(policy json.RawMessage) (string, error) {
 	c, err := canonical(policy)
 	if err != nil {
@@ -260,10 +284,19 @@ func Fingerprint(policy json.RawMessage) (string, error) {
 		return "", err
 	}
 
-	sum := sha256.Sum256(enc)
+	h := sha256.New()
+	h.Write(fingerprintSalt[:])
+	h.Write(enc)
 
-	return "sha256:" + hex.EncodeToString(sum[:]), nil
+	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
 }
+
+// fingerprintSalt makes fingerprints differ between runs.
+var fingerprintSalt = func() (salt [16]byte) {
+	_, _ = rand.Read(salt[:])
+
+	return salt
+}()
 
 // Change is one field that differs between two policies.
 type Change struct {

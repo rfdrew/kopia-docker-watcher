@@ -243,6 +243,40 @@ func TestMerge(t *testing.T) {
 			changed: true,
 		},
 		{
+			name:    "fields of an unconfirmed first registration are removed",
+			current: `{"scheduling":{"cron":["0 * * * *"]}}`,
+			want:    Desired{},
+			last:    Applied{Pending: ptr(cronPatch("0 * * * *"))},
+			policy:  `{}`,
+			changed: true,
+		},
+		{
+			name:    "an empty object the watcher does not own stays",
+			current: `{"actions":{"beforeSnapshotRoot":{}},"scheduling":{"cron":["0 * * * *"]}}`,
+			want:    Desired{Patch: cronPatch("5 * * * *")},
+			last: Applied{Patch: PolicyPatch{
+				Scheduling: SchedulingPatch{Cron: []string{"0 * * * *"}},
+				Raw:        json.RawMessage(`{"actions":{"beforeSnapshotRoot":{"script":"x.sh"}}}`),
+			}},
+			policy:  `{"actions":{"beforeSnapshotRoot":{}},"scheduling":{"cron":["5 * * * *"]}}`,
+			changed: true,
+		},
+		{
+			name:     "pause of a null scheduling section",
+			current:  `{"scheduling":null}`,
+			want:     Desired{Paused: true},
+			policy:   `{"scheduling":{"manual":true}}`,
+			unpaused: `{"scheduling":null}`,
+			saved:    `{}`,
+			changed:  true,
+		},
+		{
+			name:    "manual false is not a pause",
+			current: `{"scheduling":{"manual":false,"intervalSeconds":3600}}`,
+			want:    Desired{},
+			policy:  `{"scheduling":{"manual":false,"intervalSeconds":3600}}`,
+		},
+		{
 			name:    "an unconfirmed apply is written again even if the policy looks right",
 			current: `{"scheduling":{"cron":["0 * * * *"]}}`,
 			want:    Desired{Patch: cronPatch("0 * * * *")},
@@ -392,9 +426,26 @@ func TestMergeErrors(t *testing.T) {
 			want:    Desired{Patch: cronPatch("0 * * * *")},
 		},
 		{
-			name:    "current section is not an object",
+			name:    "the labels set a field inside a value",
 			current: `{"scheduling":"daily"}`,
 			want:    Desired{Patch: cronPatch("0 * * * *")},
+			config:  true,
+		},
+		{
+			name:    "raw sets a field inside an array",
+			current: `{"files":{"ignore":["*.tmp"]}}`,
+			want:    Desired{Patch: PolicyPatch{Raw: json.RawMessage(`{"files":{"ignore":{"pattern":"*.log"}}}`)}},
+			config:  true,
+		},
+		{
+			name: "last applied patch is invalid",
+			want: Desired{},
+			last: Applied{Patch: PolicyPatch{Raw: json.RawMessage(`[1]`)}},
+		},
+		{
+			name: "pending patch is invalid",
+			want: Desired{},
+			last: Applied{Pending: &PolicyPatch{Raw: json.RawMessage(`[1]`)}},
 		},
 		{
 			name:    "saved section is not an object",
@@ -526,6 +577,13 @@ func TestMergeKopiaNormalization(t *testing.T) {
 		t.Errorf("Changed after kopia's own normalization: %s -> %s", stored, m.Policy)
 	}
 
+	// Nothing is written, so the plan shows the policy as it is.
+	assertJSON(t, "Policy", m.Policy, stored)
+
+	if d, _ := Diff(json.RawMessage(stored), m.Policy); len(d) != 0 {
+		t.Errorf("Diff = %v", d)
+	}
+
 	if m.Applied.StoredHash != last.StoredHash {
 		t.Errorf("StoredHash = %q, want %q", m.Applied.StoredHash, last.StoredHash)
 	}
@@ -606,7 +664,8 @@ func TestMergeIntent(t *testing.T) {
 		t.Errorf("Applied.SavedScheduling = %s", m.Applied.SavedScheduling)
 	}
 
-	// An earlier unconfirmed patch is folded into the intent's patch.
+	// The intent keeps the last confirmed patch; an earlier unconfirmed
+	// one is folded into Pending.
 	m, err = Merge(json.RawMessage(`{}`),
 		Desired{Source: testSource, Patch: cronPatch("10 * * * *")},
 		Applied{Patch: cronPatch("0 * * * *"), Pending: &PolicyPatch{Raw: json.RawMessage(`{"retention":{"keepDaily":7}}`)}})
@@ -614,13 +673,21 @@ func TestMergeIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := m.Intent.Patch.Fields()
+	if !m.Intent.Patch.Equal(cronPatch("0 * * * *")) {
+		t.Errorf("Intent.Patch = %+v", m.Intent.Patch)
+	}
+
+	got, err := m.Intent.Pending.Fields()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if names := fieldNames(got); !reflect.DeepEqual(names, []string{"retention.keepDaily", "scheduling.cron"}) {
-		t.Errorf("Intent.Patch fields = %v", names)
+		t.Errorf("Intent.Pending fields = %v", names)
+	}
+
+	if err := m.Intent.Validate(); err != nil {
+		t.Errorf("Intent.Validate: %v", err)
 	}
 }
 
@@ -673,4 +740,32 @@ func TestMergeAfterFailedApply(t *testing.T) {
 
 		assertJSON(t, name+": resumed", resumed.Policy, string(before))
 	}
+}
+
+// The intent keeps the old patch, so a field the new labels drop is still
+// removed after an apply that never reached kopia server.
+func TestMergeIntentKeepsOldPatch(t *testing.T) {
+	old := PolicyPatch{Scheduling: SchedulingPatch{Cron: []string{"0 * * * *"}}, Raw: json.RawMessage(`{"retention":{"keepDaily":7}}`)}
+	current := json.RawMessage(`{"scheduling":{"cron":["0 * * * *"]},"retention":{"keepDaily":7}}`)
+	want := Desired{Source: testSource, Patch: cronPatch("0 * * * *")}
+
+	m, err := Merge(current, want, Applied{Patch: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !m.Intent.Patch.Equal(old) {
+		t.Errorf("Intent.Patch = %+v, want the old patch", m.Intent.Patch)
+	}
+
+	if err := m.Intent.Validate(); err != nil {
+		t.Errorf("Intent.Validate: %v", err)
+	}
+
+	again, err := Merge(current, want, m.Intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertJSON(t, "Policy", again.Policy, `{"scheduling":{"cron":["0 * * * *"]}}`)
 }

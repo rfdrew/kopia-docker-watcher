@@ -38,7 +38,8 @@
 //
 // # Reconciling a source
 //
-// The reconciler handles one source at a time. Plan first, then apply:
+// One handler per source reconciles it; handlers of different sources run
+// at the same time. Plan first, then apply:
 //
 //	rec, _ := store.Get(src)
 //	plan, err := b.PlanSource(ctx, want, rec.Applied)
@@ -48,46 +49,64 @@
 // rec.Applied.Patch, or plan.Action is ActionRegister, the reconciler
 // calls PreviewSchedule with plan.Unpaused (also while the source stays
 // paused, since the new cron goes into the saved section). On an ErrConfig
-// error it reports the labels and falls back to the last applied patch
-// with Replan, or does not register a new source.
+// error it reports the labels and falls back to the last confirmed patch,
+// rec.Applied.Patch, with Replan; a new source is not registered. The same
+// fallback serves owners whose labels disagree. When PlanSource itself
+// returns ErrConfig (the labels set a field inside one the policy holds as
+// a value), the reconciler plans again with rec.Applied.Patch.
 //
-// With --dry-run the reconciler prints the plan, for example
+// With --dry-run the reconciler prints the plan, for example its Action and
 // Diff(plan.Current, plan.Policy), and stops: nothing is written to kopia
 // server or to the state. Otherwise, when plan.Action is not ActionNone,
-// it stores plan.Intent before calling ApplyPlan, and skips the apply if
-// that store fails. Intent holds the saved scheduling section of a pause
-// and marks the apply as pending, so a call that fails after kopia server
-// stored the policy (a timeout, a canceled context) loses nothing: the
-// next plan writes the policy again. After ApplyPlan succeeds the
-// reconciler stores the Applied it returns; if only writing the state file
-// fails then, the store keeps the record in memory and nothing has to be
-// applied again. With ActionNone it stores plan.Applied when it differs
-// from rec.Applied (new labels of a paused source, a new fingerprint).
+// it stores plan.Intent before calling ApplyPlan. Intent holds the saved
+// scheduling section of a pause and marks the apply as pending, so a call
+// that fails after kopia server stored the policy (a timeout, a canceled
+// context) loses nothing: the next plan writes the policy again. If the
+// store refuses the intent, the apply is skipped; if it only fails to
+// write the file (state.ErrNotPersisted), the intent is kept in memory and
+// the apply goes ahead. After ApplyPlan succeeds the reconciler stores the
+// Applied it returns; if only writing the file fails then, nothing has to
+// be applied again. kopia server checks more when it stores a policy than
+// PreviewSchedule does, so ApplyPlan can still fail with ErrConfig; then
+// the reconciler falls back as above, with Replan(plan, want with
+// rec.Applied.Patch, plan.Intent), and applies that. With ActionNone it
+// stores plan.Applied when it differs from rec.Applied (new labels of a
+// paused source, a new fingerprint).
 //
 // # Errors
 //
 // Every error a Backend returns is an *Error. errors.Is with ErrTemporary,
 // ErrUnavailable and ErrConfig tells what to do; see their documentation.
-// A source that is not kopia server's own is ErrWrongIdentity.
+// A complete source that is not kopia server's own is ErrWrongIdentity,
+// an incomplete one ErrIncompleteSource.
 //
-// Implementations map kopia server's answers to the kinds like this:
+// When the caller's context is done (ctx.Err() is not nil after the call),
+// the error is of neither kind and wraps ctx.Err(), whatever the request
+// failed with: the caller stopped waiting, kopia server did not fail.
+// Implementations check ctx.Err() for this, not errors.Is(err,
+// context.DeadlineExceeded): the HTTP client's own timeout matches that
+// too, and it is ErrUnavailable.
 //
-//   - ErrConfig: a policy write or policy/resolve rejected as invalid (500
-//     with "failed to validate policy" or "invalid policy path",
-//     kopiaclient.ErrInvalidPolicy) or as malformed (400
-//     MALFORMED_REQUEST); a schedulingError from policy/resolve;
-//     PATH_NOT_FOUND from POST /api/v1/sources, and any other 500 of that
-//     call except a failed policy write ("unable to set initial policy"):
-//     kopia server could not stat the path.
-//   - ErrUnavailable (also ErrTemporary): transport errors and timeouts,
-//     502, 503, 504, NOT_CONNECTED, STORAGE_CONNECTION.
-//   - ErrTemporary: any other 5xx, except "repository is not writable";
-//     200 null from GET /api/v1/policy; 404 from sources/upload for a
-//     source kopia server has not picked up yet.
-//   - neither: wrong credentials, CSRF, access denied, TLS verification,
-//     a server without the UI API, a read-only repository, an answer that
-//     does not decode, an argument rejected before sending, a canceled
-//     context.
+// The REST backend maps internal/kopiaclient's errors to the kinds like
+// this:
+//
+//   - ErrConfig: ErrInvalidPolicy (a 500 with "failed to validate policy"
+//     or "invalid policy path") and ErrMalformedRequest from a policy
+//     write, POST /api/v1/sources or policy/resolve; a schedulingError
+//     from policy/resolve; ErrPathNotFound from POST /api/v1/sources, and
+//     an ErrInternal of that call with code INTERNAL whose message lacks
+//     "unable to set initial policy": kopia server could not stat the
+//     path.
+//   - ErrUnavailable (also ErrTemporary): ErrUnavailable (408, 429, 502,
+//     503, 504, STORAGE_CONNECTION), ErrNotConnected, and transport errors
+//     kopiaclient.IsRetryable accepts.
+//   - ErrTemporary: any other ErrInternal, the 200 null of GET
+//     /api/v1/policy included, except one whose message has "repository
+//     is not writable"; ErrNotFound from sources/upload for a source kopia
+//     server has not picked up yet.
+//   - neither: ErrUnauthorized, ErrCSRF, ErrAccessDenied, ErrUIDisabled,
+//     ErrUnexpectedResponse, ErrInvalidArgument, TLS verification errors,
+//     a read-only repository, and the caller's context being done.
 package backend
 
 import (
@@ -97,11 +116,13 @@ import (
 )
 
 // Backend is what the reconciler needs from kopia server. Implementations
-// are safe for concurrent use; the reconciler calls them for different
-// sources at once, one call at a time per source.
+// are safe for concurrent use. The reconciler calls them for different
+// sources at once; for one source it does not overlap PlanSource,
+// ApplyPlan, PreviewSchedule and DeletePolicy, but WaitSnapshot may run
+// alongside them.
 //
-// Every method that takes a Source requires a complete one of kopia
-// server's own identity and fails with ErrWrongIdentity otherwise.
+// Every method that takes a Source requires a complete one
+// (ErrIncompleteSource) of kopia server's own identity (ErrWrongIdentity).
 type Backend interface {
 	// ServerIdentity returns the user name and host kopia server snapshots
 	// its own sources as (GET /api/v1/sources: localUsername and
@@ -115,7 +136,7 @@ type Backend interface {
 	// not checked. The source carries kopia server's identity. An absolute
 	// path is only cleaned, so the reconciler can build sources from
 	// ServerIdentity and path.Clean; ResolvePath is for checking label
-	// paths.
+	// paths. An empty path is an error of neither kind.
 	ResolvePath(ctx context.Context, path string) (Source, error)
 
 	// ListSources returns the sources kopia server knows under its own
@@ -222,6 +243,18 @@ type SourceStatus struct {
 	// CurrentTask is the ID of the running upload task, only while
 	// uploading.
 	CurrentTask string
+}
+
+// Clone returns a deep copy of s.
+func (s SourceStatus) Clone() SourceStatus {
+	out := s
+
+	if s.LastSnapshot != nil {
+		last := *s.LastSnapshot
+		out.LastSnapshot = &last
+	}
+
+	return out
 }
 
 // SnapshotInfo describes a snapshot manifest. It carries no ID: an edit of

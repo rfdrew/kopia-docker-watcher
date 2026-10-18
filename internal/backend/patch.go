@@ -158,7 +158,8 @@ func configError(err error) error {
 	return &Error{Op: "PolicyPatch", Kind: ErrConfig, Err: err}
 }
 
-func (p PolicyPatch) clone() PolicyPatch {
+// Clone returns a deep copy of p.
+func (p PolicyPatch) Clone() PolicyPatch {
 	return PolicyPatch{
 		Scheduling: SchedulingPatch{Cron: slices.Clone(p.Scheduling.Cron)},
 		Raw:        slices.Clone(p.Raw),

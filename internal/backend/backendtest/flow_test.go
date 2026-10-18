@@ -60,6 +60,22 @@ func reconcile(ctx context.Context, b backend.Backend, st memState, want backend
 	st[want.Source] = plan.Intent
 
 	applied, err := b.ApplyPlan(ctx, plan)
+	if backend.IsConfig(err) && plan.Action == backend.ActionUpdate && rejected == nil {
+		// kopia server refused what the schedule check let through: fall
+		// back to the last confirmed patch.
+		rejected = err
+		fallback := want
+		fallback.Patch = last.Patch
+
+		if plan, err = backend.Replan(plan, fallback, plan.Intent); err != nil {
+			return result{}, err
+		}
+
+		st[want.Source] = plan.Intent
+
+		applied, err = b.ApplyPlan(ctx, plan)
+	}
+
 	if err != nil {
 		return result{Plan: plan, Rejected: rejected}, err
 	}
@@ -375,4 +391,133 @@ func TestFlowMissingPath(t *testing.T) {
 	if f.Known(src) {
 		t.Error("registered a missing path")
 	}
+}
+
+// A label removed while the apply fails before kopia server stores
+// anything: the next pass still removes the field.
+func TestFlowRemovedLabelApplyNotStored(t *testing.T) {
+	f := New()
+	st := memState{}
+	src := f.Source("/data/app")
+	full := backend.PolicyPatch{Scheduling: backend.SchedulingPatch{Cron: []string{"0 * * * *"}}, Raw: json.RawMessage(`{"retention":{"keepDaily":7}}`)}
+
+	mustReconcile(t, f, st, backend.Desired{Source: src, Patch: full})
+
+	want := backend.Desired{Source: src, Patch: cron("0 * * * *")}
+	f.FailNext(ApplyPlan, &backend.Error{Op: "ApplyPlan", Kind: backend.ErrTemporary, Err: errors.New("500")})
+
+	if _, err := reconcile(ctx, f, st, want); !backend.IsTemporary(err) {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	mustReconcile(t, f, st, want)
+	mustPolicy(t, f, src, `{"scheduling":{"cron":["0 * * * *"]}}`)
+}
+
+// The answer of a registration is lost, then the schedule label is
+// emptied: the cron of the lost registration is removed.
+func TestFlowRegisterAnswerLostThenLabelRemoved(t *testing.T) {
+	f := New()
+	st := memState{}
+	src := f.Source("/data/app")
+
+	f.FailNextAfter(ApplyPlan, &backend.Error{Op: "ApplyPlan", Kind: backend.ErrUnavailable, Err: errors.New("timeout")})
+
+	if _, err := reconcile(ctx, f, st, backend.Desired{Source: src, Patch: cron("0 * * * *")}); err == nil {
+		t.Fatal("no error")
+	}
+
+	mustReconcile(t, f, st, backend.Desired{Source: src})
+	mustPolicy(t, f, src, `{}`)
+	assertSettled(t, f, st, backend.Desired{Source: src})
+}
+
+// kopia server's identity changes: the old sources fail with
+// ErrWrongIdentity, and sources rebuilt from the new identity work.
+func TestFlowIdentityChange(t *testing.T) {
+	f := New()
+	st := memState{}
+	want := backend.Desired{Source: f.Source("/data/app"), Patch: cron("0 * * * *")}
+
+	mustReconcile(t, f, st, want)
+	f.SetIdentity("root", "kopia-2")
+
+	if _, err := reconcile(ctx, f, st, want); !errors.Is(err, backend.ErrWrongIdentity) {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	user, host, err := f.ServerIdentity(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want.Source = backend.Source{Host: host, UserName: user, Path: "/data/app"}
+	if r := mustReconcile(t, f, st, want); r.Plan.Action != backend.ActionRegister {
+		t.Errorf("Action = %v", r.Plan.Action)
+	}
+}
+
+// After two unconfirmed applies the state's Patch holds the fields of both;
+// a rejected label falls back to the patch last asked for, not to that mix,
+// so a field an earlier label removed does not come back.
+func TestFlowFallbackAfterUnconfirmedApplies(t *testing.T) {
+	f := New()
+	st := memState{}
+	src := f.Source("/data/app")
+	f.RejectCron("0 25 * * *")
+
+	a := backend.PolicyPatch{Scheduling: backend.SchedulingPatch{Cron: []string{"0 * * * *"}}, Raw: json.RawMessage(`{"retention":{"keepDaily":7}}`)}
+	mustReconcile(t, f, st, backend.Desired{Source: src, Patch: a})
+
+	f.FailNextAfter(ApplyPlan, &backend.Error{Op: "ApplyPlan", Kind: backend.ErrUnavailable, Err: errors.New("timeout")})
+
+	if _, err := reconcile(ctx, f, st, backend.Desired{Source: src, Patch: cron("5 * * * *")}); err == nil {
+		t.Fatal("no error")
+	}
+
+	f.FailNext(ApplyPlan, &backend.Error{Op: "ApplyPlan", Kind: backend.ErrTemporary, Err: errors.New("500")})
+
+	if _, err := reconcile(ctx, f, st, backend.Desired{Source: src, Patch: cron("10 * * * *")}); err == nil {
+		t.Fatal("no error")
+	}
+
+	r := mustReconcile(t, f, st, backend.Desired{Source: src, Patch: cron("0 25 * * *")})
+	if !backend.IsConfig(r.Rejected) {
+		t.Fatalf("rejected = %v", r.Rejected)
+	}
+
+	// Back to a, the last confirmed patch: the fields of the unconfirmed
+	// ones are gone, a's are back.
+	mustPolicy(t, f, src, `{"scheduling":{"cron":["0 * * * *"]},"retention":{"keepDaily":7}}`)
+	assertSettled(t, f, st, backend.Desired{Source: src, Patch: a})
+}
+
+// kopia server rejects on PUT what policy/resolve does not check (such as
+// upload.maxParallelSnapshots on a path): the reconciler falls back to the
+// last confirmed patch instead of getting stuck, and the source can still
+// be paused.
+func TestFlowApplyRejected(t *testing.T) {
+	f := New()
+	st := memState{}
+	src := f.Source("/data/app")
+	want := backend.Desired{Source: src, Patch: cron("0 * * * *")}
+
+	mustReconcile(t, f, st, want)
+
+	want.Patch.Raw = json.RawMessage(`{"upload":{"maxParallelSnapshots":2}}`)
+
+	r := mustReconcile(t, f, st, want)
+	if !backend.IsConfig(r.Rejected) {
+		t.Fatalf("rejected = %v", r.Rejected)
+	}
+
+	mustPolicy(t, f, src, `{"scheduling":{"cron":["0 * * * *"]}}`)
+
+	if st[src].Pending != nil {
+		t.Errorf("pending after the fallback: %+v", st[src].Pending)
+	}
+
+	want.Paused = true
+	mustReconcile(t, f, st, want)
+	mustPolicy(t, f, src, `{"scheduling":{"manual":true}}`)
 }

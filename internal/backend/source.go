@@ -2,7 +2,6 @@ package backend
 
 import (
 	"cmp"
-	"errors"
 	"fmt"
 )
 
@@ -28,13 +27,11 @@ func (s Source) String() string {
 // Validate reports a source with an empty field.
 func (s Source) Validate() error {
 	if s.Host == "" || s.UserName == "" || s.Path == "" {
-		return fmt.Errorf("%w: source %q needs host, user name and path", errIncompleteSource, s.String())
+		return fmt.Errorf("%w: %q needs host, user name and path", ErrIncompleteSource, s.String())
 	}
 
 	return nil
 }
-
-var errIncompleteSource = errors.New("incomplete source")
 
 // Compare orders sources by host, user name and path.
 func (s Source) Compare(t Source) int {
