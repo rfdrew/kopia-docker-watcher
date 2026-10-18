@@ -1,10 +1,15 @@
 GO            ?= go
 GOLANGCI_LINT ?= golangci-lint
+GORELEASER    ?= goreleaser
 
 BINARY  := kopia-docker-watcher
 PKG     := github.com/rfdrew/kopia-docker-watcher
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -s -w -X $(PKG)/internal/version.Version=$(VERSION)
+COMMIT  ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+# Commit time in UTC, the format goreleaser uses.
+DATE    ?= $(shell TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd 2>/dev/null || echo unknown)
+LDFLAGS := -s -w -X $(PKG)/internal/version.Version=$(VERSION) \
+	-X $(PKG)/internal/version.Commit=$(COMMIT) -X $(PKG)/internal/version.Date=$(DATE)
 
 IMAGE   ?= kopia-docker-watcher:dev
 
@@ -12,7 +17,11 @@ IMAGE   ?= kopia-docker-watcher:dev
 # release pinned in internal/kopiatest; KOPIA_IMAGE overrides the image.
 KOPIA_IMAGE ?=
 
-.PHONY: all build test test-integration lint fmt tidy docker clean
+# Extra flags for `make snapshot`, e.g. SNAPSHOT_FLAGS=--skip=docker
+# without a Docker daemon.
+SNAPSHOT_FLAGS ?=
+
+.PHONY: all build test test-integration lint fmt tidy docker release-check snapshot clean
 
 all: lint test build
 
@@ -37,5 +46,14 @@ tidy:
 docker:
 	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE) .
 
+# Validates .goreleaser.yaml.
+release-check:
+	$(GORELEASER) check
+
+# Local release dry run into dist/: binaries, archives, checksums and
+# per-platform images tagged <version>-amd64/-arm64. Nothing is published.
+snapshot:
+	$(GORELEASER) release --snapshot --clean $(SNAPSHOT_FLAGS)
+
 clean:
-	rm -rf bin
+	rm -rf bin dist

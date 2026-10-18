@@ -1,0 +1,105 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# Release configuration: binaries, archives, checksums and the multi-arch
+# image in GHCR. Run by .github/workflows/release.yml on a v* tag; check it
+# locally with `make release-check` and `make snapshot`.
+version: 2
+
+project_name: kopia-docker-watcher
+
+builds:
+  - id: kopia-docker-watcher
+    main: ./cmd/kopia-docker-watcher
+    binary: kopia-docker-watcher
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    # Version keeps the "v" prefix, as `make build` does with git describe.
+    ldflags:
+      - -s -w
+      - -X github.com/rfdrew/kopia-docker-watcher/internal/version.Version=v{{ .Version }}
+      - -X github.com/rfdrew/kopia-docker-watcher/internal/version.Commit={{ .FullCommit }}
+      - -X github.com/rfdrew/kopia-docker-watcher/internal/version.Date={{ .CommitDate }}
+    # The commit time instead of the build time makes the binaries
+    # reproducible.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: kopia-docker-watcher
+    ids:
+      - kopia-docker-watcher
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # Commit time on every entry, like the binaries, for reproducible
+    # archives.
+    builds_info:
+      mtime: "{{ .CommitDate }}"
+    files:
+      - src: LICENSE
+        info:
+          mtime: "{{ .CommitDate }}"
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  # No "+": the version is also an image tag.
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+changelog:
+  sort: asc
+
+release:
+  # A tag like v0.1.0-rc.1 becomes a GitHub pre-release.
+  prerelease: auto
+
+dockers_v2:
+  - id: kopia-docker-watcher
+    ids:
+      - kopia-docker-watcher
+    # Copies the binaries built above instead of compiling them again;
+    # the root Dockerfile stays the self-contained build used by CI and
+    # `make docker`.
+    dockerfile: Dockerfile.goreleaser
+    images:
+      - ghcr.io/rfdrew/kopia-docker-watcher
+    # major.minor and latest move only on final releases, so a
+    # pre-release never replaces what users pull by default.
+    tags:
+      - "{{ .Version }}"
+      - "{{ if not .Prerelease }}{{ .Major }}.{{ .Minor }}{{ end }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.title: "{{ .ProjectName }}"
+      org.opencontainers.image.source: https://github.com/rfdrew/kopia-docker-watcher
+      org.opencontainers.image.licenses: Apache-2.0
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.created: "{{ .CommitDate }}"
+    # The same keys on each platform manifest and on the index, so GHCR
+    # links the package to the repository and shows the license. Snapshot
+    # images are single-platform, where buildx rejects index annotations;
+    # the empty values drop them there.
+    annotations:
+      "manifest:org.opencontainers.image.source": https://github.com/rfdrew/kopia-docker-watcher
+      "manifest:org.opencontainers.image.licenses": Apache-2.0
+      "manifest:org.opencontainers.image.version": "{{ .Version }}"
+      "manifest:org.opencontainers.image.revision": "{{ .FullCommit }}"
+      "index:org.opencontainers.image.source": "{{ if not .IsSnapshot }}https://github.com/rfdrew/kopia-docker-watcher{{ end }}"
+      "index:org.opencontainers.image.licenses": "{{ if not .IsSnapshot }}Apache-2.0{{ end }}"
+      "index:org.opencontainers.image.version": "{{ if not .IsSnapshot }}{{ .Version }}{{ end }}"
+      "index:org.opencontainers.image.revision": "{{ if not .IsSnapshot }}{{ .FullCommit }}{{ end }}"
+    # Snapshot images are loaded into the local Docker daemon, which
+    # cannot store attestations.
+    sbom: "{{ not .IsSnapshot }}"

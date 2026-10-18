@@ -91,3 +91,41 @@ jobs:
           test "${ok:-}" = 1
           docker stop kdw
           test "$(docker inspect -f '{{.State.ExitCode}}' kdw)" = 0
+
+  # Dry run of the release: validates .goreleaser.yaml, cross-builds the
+  # archives and builds the image from Dockerfile.goreleaser, so a broken
+  # release config shows up before a tag is pushed. Nothing is published.
+  release-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: docker/setup-buildx-action@v4
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: v2.18.3
+          args: check
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: v2.18.3
+          args: release --snapshot --clean
+      - name: Smoke test
+        run: |
+          set -eux
+          version=$(jq -r .version dist/metadata.json)
+          image=ghcr.io/rfdrew/kopia-docker-watcher:${version}-amd64
+          test "$(docker run --rm "$image" version)" = "v${version}"
+          test "$(docker image inspect -f '{{.Config.User}}' "$image")" = "65532:65532"
+          docker image inspect -f '{{json .Config.Healthcheck}}' "$image" | grep -q healthcheck
+          test "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.licenses"}}' "$image")" = Apache-2.0
+          ctr=$(docker create "$image")
+          docker export "$ctr" | tar --numeric-owner -tvf - | grep -E '^d.* 65532/65532 .* var/lib/kopia-docker-watcher/?$'
+          docker rm "$ctr"
+          # The arm64 image exists too; it is not run without emulation.
+          docker image inspect -f '{{.Architecture}}' "ghcr.io/rfdrew/kopia-docker-watcher:${version}-arm64" | grep -qx arm64
