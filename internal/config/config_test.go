@@ -283,6 +283,30 @@ func TestParseCertFingerprint(t *testing.T) {
 	}
 }
 
+func TestParseLabelPrefix(t *testing.T) {
+	valid := map[string]string{
+		"":                  DefaultLabelPrefix,
+		"  ":                DefaultLabelPrefix,
+		" backup ":          "backup",
+		"k":                 "k",
+		"com.example.kopia": "com.example.kopia",
+		"my-app_2":          "my-app_2",
+	}
+
+	for in, want := range valid {
+		got, err := ParseLabelPrefix(in)
+		if err != nil || got != want {
+			t.Errorf("ParseLabelPrefix(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+
+	for _, in := range []string{"kopia.", ".kopia", "ko pia", "-kopia", "kopia/x"} {
+		if _, err := ParseLabelPrefix(in); err == nil || !strings.Contains(err.Error(), "invalid label prefix") {
+			t.Errorf("ParseLabelPrefix(%q): error = %v", in, err)
+		}
+	}
+}
+
 func TestParseLogLevel(t *testing.T) {
 	tests := map[string]slog.Level{
 		"debug":    slog.LevelDebug,

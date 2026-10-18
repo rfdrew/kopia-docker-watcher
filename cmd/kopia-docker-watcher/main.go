@@ -26,6 +26,7 @@ const usage = `Usage: kopia-docker-watcher [command]
 Commands:
   run          start the watcher (default)
   healthcheck  exit 0 if the running watcher answers on LISTEN_ADDR /healthz
+  validate     check container labels, see "validate --help"
   version      print the version and exit
 
 Configuration is read from environment variables, see docs/configuration.md.
@@ -39,6 +40,7 @@ const (
 // deps are the process's interfaces to the outside world; tests replace them.
 type deps struct {
 	getenv func(string) string
+	stdin  io.Reader
 	stdout io.Writer
 	stderr io.Writer
 	listen func(network, address string) (net.Listener, error)
@@ -50,6 +52,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := run(ctx, os.Args[1:], deps{
 		getenv: os.Getenv,
+		stdin:  os.Stdin,
 		stdout: os.Stdout,
 		stderr: os.Stderr,
 		listen: net.Listen,
@@ -72,6 +75,8 @@ func run(ctx context.Context, args []string, d deps) int {
 		return runWatcher(ctx, d)
 	case "healthcheck":
 		return runHealthcheck(ctx, d)
+	case "validate":
+		return runValidate(args[1:], d)
 	case "version", "--version", "-version":
 		_, _ = fmt.Fprintln(d.stdout, version.Version)
 		return 0

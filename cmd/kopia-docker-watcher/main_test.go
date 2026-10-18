@@ -106,6 +106,7 @@ func newTestDeps(getenv func(string) string) *testDeps {
 	td := &testDeps{stdout: &syncBuffer{}, stderr: &syncBuffer{}, ln: newMemListener()}
 	td.deps = deps{
 		getenv: getenv,
+		stdin:  strings.NewReader(""),
 		stdout: td.stdout,
 		stderr: td.stderr,
 		listen: func(_, addr string) (net.Listener, error) {

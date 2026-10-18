@@ -184,11 +184,12 @@ func Load(getenv func(string) string) (*Config, error) {
 	}
 
 	if v := l.get(EnvLabelPrefix); v != "" {
-		if !labelPrefixRE.MatchString(v) {
-			l.errorf("%s: invalid label prefix %q: use letters, digits, '.', '-' and '_', starting and ending with a letter or digit", EnvLabelPrefix, v)
+		p, err := ParseLabelPrefix(v)
+		if err != nil {
+			l.errorf("%s: %v", EnvLabelPrefix, err)
 		}
 
-		cfg.LabelPrefix = v
+		cfg.LabelPrefix = p
 	}
 
 	// The joined error unwraps to one error per problem.
@@ -303,6 +304,21 @@ func ParseLogLevel(s string) (slog.Level, error) {
 	default:
 		return DefaultLogLevel, fmt.Errorf("unknown log level %q, use debug, info, warning or error", s)
 	}
+}
+
+// ParseLabelPrefix checks a LABEL_PREFIX value. Empty means
+// DefaultLabelPrefix.
+func ParseLabelPrefix(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return DefaultLabelPrefix, nil
+	}
+
+	if !labelPrefixRE.MatchString(s) {
+		return s, fmt.Errorf("invalid label prefix %q: use letters, digits, '.', '-' and '_', starting and ending with a letter or digit", s)
+	}
+
+	return s, nil
 }
 
 // LogValue implements slog.LogValuer. Secrets are never logged: only whether
