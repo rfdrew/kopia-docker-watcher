@@ -93,7 +93,9 @@
 //   - ErrConfig: ErrInvalidPolicy (a 500 with "failed to validate policy"
 //     or "invalid policy path"), ErrMalformedRequest and a 413 (the policy
 //     is larger than kopia server reads) from a policy write, POST
-//     /api/v1/sources or policy/resolve; a schedulingError from
+//     /api/v1/sources or policy/resolve, except from the PUT after the
+//     POST of a registration, where they are ErrTemporary (the POST
+//     stored the policy); a schedulingError from
 //     policy/resolve; ErrPathNotFound from POST /api/v1/sources, and an
 //     ErrInternal of that call with code INTERNAL whose message lacks
 //     "unable to set initial policy": kopia server could not stat the

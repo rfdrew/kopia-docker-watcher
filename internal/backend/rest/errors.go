@@ -21,6 +21,12 @@ const (
 	reqRead request = iota
 	// reqWritePolicy: PUT /api/v1/policy.
 	reqWritePolicy
+	// reqRegisterPut: the PUT /api/v1/policy that follows the POST of a
+	// registration. It writes the policy the POST has just stored, so an
+	// error that would be ErrConfig is ErrTemporary: an ErrConfig error of
+	// a registration means that kopia server stored nothing
+	// (backend.ActionRegister), and the next plan writes the policy again.
+	reqRegisterPut
 	// reqDeletePolicy: DELETE /api/v1/policy.
 	reqDeletePolicy
 	// reqCreateSource: POST /api/v1/sources.
@@ -65,6 +71,13 @@ func fail(ctx context.Context, op string, src backend.Source, req request, err e
 // kind maps an error of internal/kopiaclient to backend.ErrConfig,
 // backend.ErrUnavailable, backend.ErrTemporary or nil.
 func kind(req request, err error) error {
+	if req == reqRegisterPut {
+		if k := kind(reqWritePolicy, err); !errors.Is(k, backend.ErrConfig) {
+			return k
+		}
+
+		return backend.ErrTemporary
+	}
 	var apiErr *kopiaclient.Error
 	if !errors.As(err, &apiErr) {
 		// Not an answer of kopia server: a transport error is retried

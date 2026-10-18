@@ -191,7 +191,8 @@ func (b *Backend) PlanSource(ctx context.Context, want backend.Desired, last bac
 // ApplyPlan implements backend.Backend. A registration is POST
 // /api/v1/sources with the policy, which fails with ErrConfig for a path
 // that does not exist on kopia server, then PUT /api/v1/policy with the
-// same policy, since the POST does not refresh kopia server; an update is
+// same policy, since the POST does not refresh kopia server; that PUT
+// never fails with ErrConfig, as the POST stored the policy. An update is
 // the PUT alone. The policy is read back with GET /api/v1/policy for
 // StoredHash; see storedHash. ActionNone sends nothing.
 func (b *Backend) ApplyPlan(ctx context.Context, plan backend.Plan) (backend.Applied, error) {
@@ -221,8 +222,13 @@ func (b *Backend) ApplyPlan(ctx context.Context, plan backend.Plan) (backend.App
 		}
 	}
 
+	put := reqWritePolicy
+	if plan.Action == backend.ActionRegister {
+		put = reqRegisterPut
+	}
+
 	if err := b.client.SetPolicy(ctx, toInfo(src), plan.Policy); err != nil {
-		return backend.Applied{}, fail(ctx, opApplyPlan, src, reqWritePolicy, err)
+		return backend.Applied{}, fail(ctx, opApplyPlan, src, put, err)
 	}
 
 	applied := plan.Applied.Clone()

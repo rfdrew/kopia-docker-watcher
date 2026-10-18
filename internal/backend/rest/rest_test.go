@@ -802,6 +802,30 @@ func TestApplyPlanRegisterFailures(t *testing.T) {
 		}
 	})
 
+	// An ErrConfig error of a registration means that kopia server stored
+	// nothing. The PUT after the POST writes what the POST stored, so its
+	// rejection is temporary, and the next pass writes the policy again.
+	t.Run("PUT rejected after the POST", func(t *testing.T) {
+		f := newFakeKopia()
+		b := newBackend(t, f)
+		st := memState{}
+		want := backend.Desired{Source: src("/data/app"), Patch: cron("0 * * * *")}
+
+		f.inject("PUT policy", injection{status: http.StatusInternalServerError,
+			body: `{"code":"INTERNAL","error":"internal server error: unable to set policy: failed to validate policy: x"}`})
+
+		_, err := reconcile(t.Context(), b, st, want)
+		assertError(t, err, opApplyPlan, src("/data/app"), backend.ErrTemporary)
+
+		if !errors.Is(err, kopiaclient.ErrInvalidPolicy) || !f.known(info("/data/app")) || st[src("/data/app")].Pending == nil {
+			t.Fatalf("err = %v, known %v, state %+v", err, f.known(info("/data/app")), st[src("/data/app")])
+		}
+
+		if r := mustReconcile(t, b, st, want); r.Plan.Action != backend.ActionUpdate || !f.loaded(info("/data/app")) {
+			t.Errorf("Action = %v, loaded %v", r.Plan.Action, f.loaded(info("/data/app")))
+		}
+	})
+
 	t.Run("repository write fails in the POST", func(t *testing.T) {
 		f := newFakeKopia()
 		b := newBackend(t, f)
@@ -1366,6 +1390,17 @@ func TestErrorKinds(t *testing.T) {
 
 			return err
 		}},
+		// The PUT that follows the POST of a registration.
+		"register-put": {"PUT policy", func(t *testing.T, b *Backend, _ *fakeKopia) error {
+			plan, err := b.PlanSource(t.Context(), backend.Desired{Source: s, Patch: cron("0 * * * *")}, backend.Applied{})
+			if err != nil || plan.Action != backend.ActionRegister {
+				t.Fatalf("plan = %v, %v", plan.Action, err)
+			}
+
+			_, err = b.ApplyPlan(t.Context(), plan)
+
+			return err
+		}},
 		"resolve": {"POST policy/resolve", func(t *testing.T, b *Backend, _ *fakeKopia) error {
 			_, err := b.PreviewSchedule(t.Context(), s, json.RawMessage(`{}`), 1)
 			return err
@@ -1442,6 +1477,18 @@ func TestErrorKinds(t *testing.T) {
 		{"register", answer{status: 404, body: "404 page not found"}, nil},
 		{"register", answer{status: 400, body: unknownCode}, nil},
 		{"register", answer{status: 418, body: "teapot"}, nil},
+
+		// The PUT after the POST of a registration: the POST stored the
+		// policy, so nothing is ErrConfig.
+		{"register-put", answer{status: 500, body: validate}, backend.ErrTemporary},
+		{"register-put", answer{status: 500, body: policyPath}, backend.ErrTemporary},
+		{"register-put", answer{status: 400, body: malformed}, backend.ErrTemporary},
+		{"register-put", answer{status: 413, body: tooLarge}, backend.ErrTemporary},
+		{"register-put", answer{status: 500, body: internal}, backend.ErrTemporary},
+		{"register-put", answer{status: 400, body: notConn}, backend.ErrUnavailable},
+		{"register-put", answer{err: errors.New("connection reset")}, backend.ErrUnavailable},
+		{"register-put", answer{status: 500, body: readOnly}, nil},
+		{"register-put", answer{status: 403, body: accessDeny}, nil},
 
 		// POST /api/v1/policy/resolve.
 		{"resolve", answer{status: 400, body: `{"code":"MALFORMED_REQUEST","error":"unable to decode request: x"}`}, backend.ErrConfig},
