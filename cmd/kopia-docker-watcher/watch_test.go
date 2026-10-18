@@ -891,16 +891,24 @@ func TestRunSnapshotOnWatcherStart(t *testing.T) {
 
 			wr := startWatcher(t, k, e, watcherOptions{env: tt.env})
 
-			waitFor(t, "the policy", func() bool { return cronOf(t, k, "/srv/app") != nil })
+			uploads := func() int {
+				k.mu.Lock()
+				defer k.mu.Unlock()
 
-			// The decision waits for the pass after the policy write.
+				return len(k.uploads)
+			}
+
+			// The decision waits for a pass EventDelay after the policy
+			// write.
+			wr.waitLog(t, "source registered")
+
+			if tt.want > 0 {
+				waitFor(t, "the snapshot", func() bool { return uploads() == tt.want })
+			}
+
 			time.Sleep(3 * time.Second)
 
-			k.mu.Lock()
-			n := len(k.uploads)
-			k.mu.Unlock()
-
-			if n != tt.want {
+			if n := uploads(); n != tt.want {
 				t.Errorf("%d uploads, want %d; log:\n%s", n, tt.want, wr.td.stderr)
 			}
 

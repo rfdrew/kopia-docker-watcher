@@ -20,19 +20,30 @@ const (
 	// watcherStartAction is the Action of the start events that the first
 	// full reconcile makes up for SNAPSHOT_ON_WATCHER_START.
 	watcherStartAction = "watcher start"
-	// unseenStartAction is the Action of the start events a pass makes up
-	// for a container that started without an event the watcher saw.
+	// unseenStartAction and unseenStopAction are the Actions of the events
+	// a pass makes up for a container that started or stopped without an
+	// event the watcher saw.
 	unseenStartAction = "start without an event"
+	unseenStopAction  = "stop without an event"
 
 	// oneOffLabel marks the one-off containers of docker compose run. They
 	// copy the labels of their service but come and go with a task, so
 	// their starts and stops take no snapshots.
 	oneOffLabel = "com.docker.compose.oneoff"
 
-	// maxAnnotations bounds the snapshots one pass describes, so that a
+	// maxAnnotations bounds the descriptions one pass tries, so that a
 	// long backlog does not hold the path's handler; the rest waits for
 	// the next full reconcile.
 	maxAnnotations = 20
+
+	// clockSkew is how much earlier than the watcher's trigger a snapshot
+	// may start by kopia server's clock and still count as that trigger's.
+	clockSkew = time.Minute
+
+	// maxWaitAge is how long a snapshot wait is kept at most. A wait that
+	// cannot be followed or acted on for so long is dropped, so that it
+	// does not hold back the descriptions of the source for good.
+	maxWaitAge = 7 * 24 * time.Hour
 )
 
 // snapRequest is a snapshot a pass is asked to take of its source.
@@ -140,11 +151,19 @@ func (ps *pass) snapshots() error {
 	rec, _ := ps.store.Get(ps.src)
 	mark := ps.mark(rec, status)
 
-	var finished []state.SnapshotWait
+	var (
+		finished []state.SnapshotWait
+		expired  = map[string]bool{}
+	)
 
 	for _, w := range rec.SnapshotWaits {
 		switch {
-		case !ps.usable(w):
+		case !ps.usable(w, true):
+		case ps.started.Sub(w.Ticket.TriggeredAt) > maxWaitAge:
+			ps.log.Warn("dropping a snapshot wait that could not be finished for a week", "source", ps.src.String(),
+				"reason", w.Reason, "triggered_at", w.Ticket.TriggeredAt.Format(timeFormat))
+
+			expired[w.ID] = true
 		case w.Result != nil:
 			finished = append(finished, w)
 		default:
@@ -152,8 +171,10 @@ func (ps *pass) snapshots() error {
 		}
 	}
 
+	ps.removeWaits(expired)
+
 	reqs := ps.handleFinished(finished, status, mark)
-	reqs = append(reqs, ps.absorbedRetry(rec, status)...)
+	reqs = append(reqs, ps.absorbedRetry(rec, status, mark)...)
 	reqs = append(reqs, ps.requests()...)
 
 	if err := ps.trigger(reqs, status); err != nil {
@@ -168,14 +189,17 @@ func (ps *pass) snapshots() error {
 }
 
 // usable reports whether the pass can act on the wait w of its source's
-// record. Others, such as one written by a newer watcher, are left alone.
-func (ps *pass) usable(w state.SnapshotWait) bool {
+// record. Others, such as one written by a newer watcher, are left alone,
+// and logged at debug level if log is set.
+func (ps *pass) usable(w state.SnapshotWait, log bool) bool {
 	if w.ID != "" && w.Ticket.Source == ps.src && !w.Ticket.TriggeredAt.IsZero() {
 		return true
 	}
 
-	ps.log.Debug("leaving alone a snapshot wait the watcher cannot use", "source", ps.src.String(), "id", w.ID,
-		"ticket_source", w.Ticket.Source.String())
+	if log {
+		ps.log.Debug("leaving alone a snapshot wait the watcher cannot use", "source", ps.src.String(), "id", w.ID,
+			"ticket_source", w.Ticket.Source.String())
+	}
 
 	return false
 }
@@ -212,49 +236,41 @@ func (ps *pass) mark(rec state.Record, status *backend.SourceStatus) *time.Time 
 }
 
 // handleFinished logs how the snapshots of finished waits ended, describes
-// those they saved and removes the waits. A snapshot whose result is
-// unknown, and after which no complete snapshot was saved, is asked for
-// once more; its wait goes once that request is settled.
+// those they saved and removes the waits. A wait whose snapshot could not
+// be described for a passing reason stays, with its result logged, so that
+// a later pass describes it with the description worked out when it was
+// queued. A snapshot whose result is unknown, and after which no complete
+// snapshot was saved, is asked for once more; its wait goes once that
+// request is settled.
 func (ps *pass) handleFinished(finished []state.SnapshotWait, status *backend.SourceStatus, mark *time.Time) []snapRequest {
 	var (
-		reqs []snapRequest
-		done = map[string]bool{}
+		reqs   []snapRequest
+		done   = map[string]bool{}
+		logged = map[string]bool{}
 	)
 
 	for _, w := range finished {
 		res := w.Result
-		attrs := []any{"source", ps.src.String(), "reason", w.Reason, "outcome", string(res.Outcome)}
 
-		if res.TaskID != "" {
-			attrs = append(attrs, "task", res.TaskID)
-		}
-
-		if !res.SnapshotStart.IsZero() {
-			attrs = append(attrs, "start_time", res.SnapshotStart.Format(timeFormat))
-		}
-
-		switch res.Outcome {
-		case backend.SnapshotSucceeded:
-			ps.log.Info("snapshot finished", attrs...)
-		case backend.SnapshotIdentical:
-			ps.log.Info("snapshot finished without saving a new one: nothing changed since the last", attrs...)
-		case backend.SnapshotIncomplete:
-			ps.log.Warn("snapshot finished incomplete or with errors", attrs...)
-		case backend.SnapshotFailed:
-			ps.log.Error("snapshot failed", append(attrs, "error", res.Error)...)
-		case backend.SnapshotCanceled:
-			ps.log.Warn("snapshot canceled", attrs...)
-		default:
-			ps.log.Warn("the result of the snapshot is unknown: kopia server no longer lists its task, perhaps it restarted", attrs...)
+		if !w.Logged {
+			ps.logResult(w)
 		}
 
 		if !res.SnapshotStart.IsZero() && w.Description != "" && (mark == nil || res.SnapshotStart.After(*mark)) {
-			_ = ps.annotate(ps.src, res.SnapshotStart, w.Description)
+			err := ps.annotate(ps.src, res.SnapshotStart, w.Description)
+			if err != nil && !errors.Is(err, backend.ErrSnapshotNotFound) && !errors.Is(err, backend.ErrNotImplemented) &&
+				!backend.IsConfig(err) {
+				logged[w.ID] = true
+				continue
+			}
 		}
 
 		if res.Outcome == backend.SnapshotUnknown && !w.Retried && !completeSince(status, w.Ticket.TriggeredAt) {
+			// The first trigger passed the minimum interval, and no
+			// snapshot came of it.
 			reqs = append(reqs, snapRequest{stop: w.Stop, reason: "again: " + w.Reason, retry: true, replaces: w.ID,
-				description: w.Description, minInterval: labels.DefaultMinInterval})
+				description: w.Description})
+			logged[w.ID] = true
 
 			continue
 		}
@@ -264,27 +280,84 @@ func (ps *pass) handleFinished(finished []state.SnapshotWait, status *backend.So
 
 	ps.removeWaits(done)
 
+	if len(logged) > 0 {
+		ps.updateRecord(ps.src, func(r *state.Record) bool {
+			changed := false
+
+			for i := range r.SnapshotWaits {
+				if w := &r.SnapshotWaits[i]; logged[w.ID] && !w.Logged {
+					w.Logged, changed = true, true
+				}
+			}
+
+			return changed
+		})
+	}
+
 	return reqs
 }
 
+// logResult logs how the snapshot of the finished wait w ended.
+func (ps *pass) logResult(w state.SnapshotWait) {
+	res := w.Result
+	attrs := []any{"source", ps.src.String(), "reason", w.Reason, "outcome", string(res.Outcome)}
+
+	if res.TaskID != "" {
+		attrs = append(attrs, "task", res.TaskID)
+	}
+
+	if !res.SnapshotStart.IsZero() {
+		attrs = append(attrs, "start_time", res.SnapshotStart.Format(timeFormat))
+	}
+
+	if res.Error != "" {
+		attrs = append(attrs, "error", res.Error)
+	}
+
+	switch res.Outcome {
+	case backend.SnapshotSucceeded:
+		ps.log.Info("snapshot finished", attrs...)
+	case backend.SnapshotIdentical:
+		ps.log.Info("snapshot finished without saving a new one: nothing changed since the last", attrs...)
+	case backend.SnapshotIncomplete:
+		ps.log.Warn("snapshot finished incomplete or with errors", attrs...)
+	case backend.SnapshotFailed:
+		ps.log.Error("snapshot failed", attrs...)
+	case backend.SnapshotCanceled:
+		ps.log.Warn("snapshot canceled", attrs...)
+	default:
+		ps.log.Warn("the result of the snapshot is unknown: kopia server lost track of it, perhaps it restarted", attrs...)
+	}
+}
+
 // completeSince reports whether the source's last snapshot is complete
-// and started at t or later. A checkpoint or a canceled snapshot does not
-// count: kopia server saves one when an upload is cut short.
+// and started at t or later, by the watcher's clock give or take
+// clockSkew. A checkpoint or a canceled snapshot does not count: kopia
+// server saves one when an upload is cut short.
 func completeSince(status *backend.SourceStatus, t time.Time) bool {
 	return status != nil && status.LastSnapshot != nil && status.LastSnapshot.Incomplete == "" &&
-		!status.LastSnapshot.StartTime.Before(t)
+		!status.LastSnapshot.StartTime.Before(t.Add(-clockSkew))
 }
 
 // absorbedRetry asks for the stop snapshot once more when the pending
 // snapshot that absorbed a stop is over but no complete snapshot started
 // after the stop: kopia server lost the run, as when it restarts.
-func (ps *pass) absorbedRetry(rec state.Record, status *backend.SourceStatus) []snapRequest {
+//
+// When the pending snapshot saved one, it gets the description worked out
+// at the stop: the containers may be gone by now.
+func (ps *pass) absorbedRetry(rec state.Record, status *backend.SourceStatus, mark *time.Time) []snapRequest {
 	at := rec.StopAbsorbedAt
 
 	switch {
 	case at.IsZero():
 		return nil
 	case completeSince(status, at):
+		last := status.LastSnapshot
+		if desc := rec.StopAbsorbedDescription; desc != "" && last.Description == "" && (mark == nil || last.StartTime.After(*mark)) &&
+			!slices.ContainsFunc(ps.described, last.StartTime.Equal) {
+			_ = ps.annotate(ps.src, last.StartTime, desc)
+		}
+
 		ps.clearAbsorbed(at)
 
 		return nil
@@ -293,7 +366,7 @@ func (ps *pass) absorbedRetry(rec state.Record, status *backend.SourceStatus) []
 	}
 
 	return []snapRequest{{stop: true, reason: "again: the stop at " + at.Format(timeFormat) + ", whose pending snapshot saved nothing",
-		retry: true, absorbed: true}}
+		retry: true, absorbed: true, description: rec.StopAbsorbedDescription}}
 }
 
 // clearAbsorbed clears the stop absorbed at at.
@@ -304,6 +377,7 @@ func (ps *pass) clearAbsorbed(at time.Time) {
 		}
 
 		r.StopAbsorbedAt = time.Time{}
+		r.StopAbsorbedDescription = ""
 
 		return true
 	})
@@ -338,11 +412,12 @@ func (ps *pass) removeWaits(ids map[string]bool) {
 // come.
 func (ps *pass) requests() []snapRequest {
 	type seen struct {
-		last    docker.Event
-		start   *docker.Event
-		watcher bool
-		unseen  bool
-		died    *docker.Event
+		last        docker.Event
+		start       *docker.Event
+		watcher     bool
+		unseenStart bool
+		unseenStop  bool
+		died        *docker.Event
 	}
 
 	var (
@@ -367,9 +442,10 @@ func (ps *pass) requests() []snapRequest {
 		if ev.Kind == docker.KindStarted {
 			s.start = &ev
 			s.watcher = s.watcher || ev.Action == watcherStartAction
-			s.unseen = s.unseen || ev.Action == unseenStartAction
+			s.unseenStart = s.unseenStart || ev.Action == unseenStartAction
 		} else {
 			s.died = &ev
+			s.unseenStop = s.unseenStop || ev.Action == unseenStopAction
 		}
 	}
 
@@ -387,43 +463,44 @@ func (ps *pass) requests() []snapRequest {
 		}
 
 		sl := ps.snapshotLabels(pc)
+		c, found := ps.container(id)
+		running := found && c.State.Running()
+
+		// An event of a one-off container explains a change of the pause
+		// as well, but asks for no snapshot.
+		startAsked = startAsked || running && s.start != nil
+		stopAsked = stopAsked || !running && s.died != nil
+
 		if sl.oneOff {
 			ps.log.Debug("no snapshot for a one-off container of docker compose run", "container", s.last.Name)
 			continue
 		}
 
-		c, found := ps.container(id)
-
 		switch {
-		case found && c.State.Running():
+		case running:
 			if c.State == docker.StateRestarting && s.died != nil {
 				ps.keep = append(ps.keep, *s.died)
 			}
 
-			if s.start == nil {
-				continue
-			}
-
-			startAsked = true
-
-			if sl.onStart {
+			if s.start != nil && sl.onStart {
 				reason := "start of " + s.last.Name
 
 				switch {
 				case s.watcher:
 					reason = watcherStartAction + ": " + s.last.Name
-				case s.unseen:
+				case s.unseenStart:
 					reason = "start of " + s.last.Name + " without an event"
 				}
 
 				reqs = append(reqs, snapRequest{reason: reason, minInterval: sl.minInterval, container: sl.described, event: s.start})
 			}
-		case s.died != nil:
-			stopAsked = true
-
-			if sl.onStop {
-				reqs = append(reqs, snapRequest{stop: true, reason: "stop of " + s.last.Name, container: sl.described})
+		case s.died != nil && sl.onStop:
+			reason := "stop of " + s.last.Name
+			if s.unseenStop {
+				reason += " without an event"
 			}
+
+			reqs = append(reqs, snapRequest{stop: true, reason: reason, container: sl.described})
 		}
 	}
 
@@ -433,7 +510,9 @@ func (ps *pass) requests() []snapRequest {
 // unseenRequests asks for the snapshots of starts and stops no event told
 // of: when the pass paused a source the watcher had running, the stopped
 // owners whose labels ask for a snapshot at a stop; when it lifted the
-// pause, the running owners whose labels ask for one at a start.
+// pause, the running owners whose labels ask for one at a start. It makes
+// up an event for each, which the pass keeps if it fails, so that its
+// retry, which no longer sees the change of the pause, asks again.
 func (ps *pass) unseenRequests(startAsked, stopAsked bool) []snapRequest {
 	if !ps.plan.Known || ps.plan.Action == backend.ActionNone {
 		return nil
@@ -447,6 +526,8 @@ func (ps *pass) unseenRequests(startAsked, stopAsked bool) []snapRequest {
 		switch {
 		case o.snap.oneOff:
 		case !wasPaused && ps.want.Paused && !stopAsked && o.snap.onStop:
+			ps.events = append(ps.events, docker.Event{Kind: docker.KindDied, Action: unseenStopAction, ContainerID: o.id,
+				Name: o.name, Labels: o.labels, Time: ps.started})
 			reqs = append(reqs, snapRequest{stop: true, reason: "stop of " + o.name + " without an event", container: o.snap.described})
 		case wasPaused && !ps.want.Paused && !startAsked && o.snap.onStart && o.state.Running():
 			ev := docker.Event{Kind: docker.KindStarted, Action: unseenStartAction, ContainerID: o.id, Name: o.name,
@@ -522,7 +603,13 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 		return nil
 	case stop && st == backend.StatusPending:
 		ps.log.Info("not queuing a snapshot: the pending one starts after the stop and counts as the stop snapshot", attrs...)
-		ps.absorbStop(reqs)
+		ps.absorbStop(reqs, "")
+
+		return nil
+	case stop && st == backend.StatusUploading && ps.queuedWait(status.CurrentTask) != "":
+		ps.log.Info("not queuing a snapshot: one the watcher queued runs after the current upload and counts as the stop snapshot",
+			attrs...)
+		ps.absorbStop(reqs, ps.queuedWait(status.CurrentTask))
 
 		return nil
 	case stop:
@@ -564,11 +651,14 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 		return err
 	}
 
+	desc, tags := ps.description(reqs)
+	ps.warnTags(tags)
+
 	w := state.SnapshotWait{
 		Ticket:      ticket,
 		Stop:        stop,
 		Reason:      strings.Join(reasons, ", "),
-		Description: ps.description(reqs),
+		Description: desc,
 		Retried:     !slices.ContainsFunc(reqs, func(r snapRequest) bool { return !r.retry }),
 	}
 
@@ -651,11 +741,37 @@ func (ps *pass) settle(reqs []snapRequest, w *state.SnapshotWait) {
 	})
 }
 
-// absorbStop records a stop that a pending snapshot counts for. If the
-// pending snapshot is one the watcher queued and follows, its wait becomes
-// a stop snapshot, which is taken again if it is lost; otherwise the
-// state keeps the time of the stop.
-func (ps *pass) absorbStop(reqs []snapRequest) {
+// queuedWait returns the ID of the wait whose run kopia server has queued
+// behind the upload of task current: the current task was running when it
+// was triggered, and it has no task of its own yet. Empty if none.
+func (ps *pass) queuedWait(current string) string {
+	if current == "" {
+		return ""
+	}
+
+	rec, _ := ps.store.Get(ps.src)
+
+	for _, w := range rec.SnapshotWaits {
+		if ps.usable(w, false) && w.Result == nil && w.Ticket.TaskID == "" && slices.Contains(w.Ticket.TasksBefore, current) {
+			return w.ID
+		}
+	}
+
+	return ""
+}
+
+// absorbStop records a stop that a snapshot already queued counts for. A
+// stop while a snapshot is pending keeps its time and description in the
+// state, so that the stop snapshot is taken again if kopia server loses
+// the run. If the queued snapshot is one the watcher follows, the wait
+// with the given ID or, while pending, the one that has no task yet, it
+// becomes a stop snapshot, taken again if it is lost, with the description
+// worked out now.
+//
+// The stop counts from the start of the pass, before its policy write: a
+// run that was pending then reads the files after the stop, even if it
+// got its upload slot during the write.
+func (ps *pass) absorbStop(reqs []snapRequest, id string) {
 	var reasons []string
 
 	replaced := map[string]bool{}
@@ -670,23 +786,34 @@ func (ps *pass) absorbStop(reqs []snapRequest) {
 		}
 	}
 
-	now := ps.now()
+	desc, tags := ps.description(reqs)
+	ps.warnTags(tags)
 
 	ps.updateRecord(ps.src, func(r *state.Record) bool {
 		r.SnapshotWaits = slices.DeleteFunc(r.SnapshotWaits, func(x state.SnapshotWait) bool { return replaced[x.ID] })
 
 		i := slices.IndexFunc(r.SnapshotWaits, func(x state.SnapshotWait) bool {
-			return x.Result == nil && x.Ticket.TaskID == "" && x.Ticket.Source == ps.src
+			if id != "" {
+				return x.ID == id
+			}
+
+			return ps.usable(x, false) && x.Result == nil && x.Ticket.TaskID == ""
 		})
 
-		switch {
-		case i >= 0:
+		if i >= 0 {
 			w := &r.SnapshotWaits[i]
 			w.Stop = true
 			w.Retried = false
 			w.Reason += ", " + strings.Join(reasons, ", ")
-		case r.StopAbsorbedAt.IsZero():
-			r.StopAbsorbedAt = now
+
+			if desc != "" {
+				w.Description = desc
+			}
+		}
+
+		if id == "" && r.StopAbsorbedAt.IsZero() {
+			r.StopAbsorbedAt = ps.started
+			r.StopAbsorbedDescription = desc
 		}
 
 		return true
@@ -711,28 +838,37 @@ func newWaitID(waits []state.SnapshotWait, t time.Time) string {
 // server only when the last snapshot started after the mark. It stops
 // before the first snapshot the watcher still waits for, which gets the
 // description worked out when it was queued, and after maxAnnotations
-// descriptions. A snapshot whose description kopia server rejects is
-// skipped; any other failure stops the sweep until the next full
-// reconcile. Checkpoints of an upload are left alone.
+// attempts. A snapshot that is gone is skipped; any other failure stops
+// the sweep before it until the next full reconcile. Checkpoints of an
+// upload are left alone.
 func (ps *pass) sweep(status *backend.SourceStatus, mark *time.Time) {
 	if mark == nil || status == nil || status.LastSnapshot == nil || !status.LastSnapshot.StartTime.After(*mark) {
 		return
 	}
 
-	desc := ps.description(nil)
-	if desc == "" {
+	desc, tags := ps.description(nil)
+	if desc == "" || ps.cannotDescribe() {
 		return
 	}
 
 	// Snapshots from the first trigger the watcher waits for on belong to
-	// the waits.
+	// the waits, and so does the one that a pending run took after an
+	// absorbed stop.
 	var until time.Time
 
 	rec, _ := ps.store.Get(ps.src)
 	for _, w := range rec.SnapshotWaits {
-		if until.IsZero() || w.Ticket.TriggeredAt.Before(until) {
+		if ps.usable(w, false) && (until.IsZero() || w.Ticket.TriggeredAt.Before(until)) {
 			until = w.Ticket.TriggeredAt
 		}
+	}
+
+	if at := rec.StopAbsorbedAt; !at.IsZero() && (until.IsZero() || at.Before(until)) {
+		until = at
+	}
+
+	if !until.IsZero() {
+		until = until.Add(-clockSkew)
 	}
 
 	snaps, err := ps.backend.ListSnapshots(ps.ctx, ps.src)
@@ -751,23 +887,29 @@ func (ps *pass) sweep(status *backend.SourceStatus, mark *time.Time) {
 
 	slices.SortStableFunc(snaps, func(a, b backend.SnapshotInfo) int { return a.StartTime.Compare(b.StartTime) })
 
-	newMark, described := *mark, 0
+	newMark, tried, described := *mark, 0, 0
 
 loop:
 	for _, s := range snaps {
 		switch {
 		case !s.StartTime.After(*mark) || s.Incomplete == "checkpoint":
 			continue
-		case !until.IsZero() && !s.StartTime.Before(until), described == maxAnnotations:
+		case !until.IsZero() && !s.StartTime.Before(until), tried == maxAnnotations:
 			break loop
 		case s.Description == "":
-			err := ps.annotate(ps.src, s.StartTime, desc)
+			if tried == 0 {
+				ps.warnTags(tags)
+			}
 
-			switch {
+			tried++
+
+			switch err := ps.annotate(ps.src, s.StartTime, desc); {
 			case err == nil:
 				described++
-			case errors.Is(err, backend.ErrSnapshotNotFound), backend.IsConfig(err):
+			case errors.Is(err, backend.ErrSnapshotNotFound):
 			default:
+				// Another snapshot fares no better with the same
+				// description and kopia server.
 				break loop
 			}
 		}
@@ -796,9 +938,10 @@ loop:
 // start. A snapshot that is gone is ErrSnapshotNotFound, logged at debug
 // level; other errors are logged as warnings.
 func (ps *pass) annotate(src backend.Source, start time.Time, desc string) error {
-	ps.warnTags(desc)
-
 	err := ps.backend.AnnotateSnapshot(ps.ctx, src, start, desc, nil)
+	if err == nil {
+		ps.described = append(ps.described, start)
+	}
 
 	attrs := []any{"source", src.String(), "start_time", start.Format(timeFormat), "description", desc}
 
@@ -816,33 +959,49 @@ func (ps *pass) annotate(src backend.Source, start time.Time, desc string) error
 	return err
 }
 
+// cannotDescribe reports whether the backend said it cannot list or
+// describe snapshots, so the sweep does not ask again in this process.
+func (ps *pass) cannotDescribe() bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	return ps.warned[notDescribingKey]
+}
+
+// notDescribingKey is the warnOnce key of a backend that cannot describe
+// snapshots.
+const notDescribingKey = "AnnotateSnapshot"
+
 func (ps *pass) warnNotDescribing() {
-	ps.warnOnce("AnnotateSnapshot", "the backend cannot describe snapshots yet; "+
+	ps.warnOnce(notDescribingKey, "the backend cannot describe snapshots yet; "+
 		labels.Name(ps.labelPrefix, labels.KeyDescription)+" and "+labels.Name(ps.labelPrefix, labels.KeyTags)+" are not written")
 }
 
 // warnTags warns once per path and set of tags that the tags go into the
 // description.
-func (ps *pass) warnTags(desc string) {
-	i := strings.LastIndex(desc, " [")
-	if i < 0 || !strings.HasSuffix(desc, "]") {
+func (ps *pass) warnTags(tags []string) {
+	if len(tags) == 0 {
 		return
 	}
 
-	tags := desc[i+2 : len(desc)-1]
+	list := strings.Join(tags, " ")
 
-	ps.warnOnce("tags "+ps.path+" "+tags, labels.Name(ps.labelPrefix, labels.KeyTags)+
+	ps.warnOnce("tags "+ps.path+" "+list, labels.Name(ps.labelPrefix, labels.KeyTags)+
 		" are written into the snapshot description: kopia server cannot set the tags of a snapshot through its API yet",
-		"path", ps.path, "tags", tags)
+		"path", ps.path, "tags", list)
 }
 
 // description returns what a snapshot of the source is described as: for
 // each container that backs up the path, and each that asks for the
 // snapshot, its description label or else its name, each text once and in
-// the order of the names, then their tags as key=value in brackets. A
-// snapshot taken again keeps the description of the first attempt when
-// no container is left to describe it.
-func (ps *pass) description(reqs []snapRequest) string {
+// the order of the names, then their tags as key=value in brackets. It
+// returns the tags too. A snapshot taken again keeps the description of
+// the first attempt.
+func (ps *pass) description(reqs []snapRequest) (string, []string) {
+	if len(reqs) > 0 && !slices.ContainsFunc(reqs, func(r snapRequest) bool { return !r.retry || r.description == "" }) {
+		return reqs[0].description, nil
+	}
+
 	var cs []describedContainer
 
 	for _, o := range ps.owners {
@@ -879,11 +1038,11 @@ func (ps *pass) description(reqs []snapRequest) string {
 	if len(texts) == 0 {
 		for _, r := range reqs {
 			if r.description != "" {
-				return r.description
+				return r.description, nil
 			}
 		}
 
-		return ""
+		return "", nil
 	}
 
 	desc := strings.Join(texts, ", ")
@@ -891,7 +1050,7 @@ func (ps *pass) description(reqs []snapRequest) string {
 		desc += " [" + strings.Join(tags, " ") + "]"
 	}
 
-	return desc
+	return desc, tags
 }
 
 // updateRecord changes the snapshot fields of the record of src with fn,

@@ -339,6 +339,39 @@ func TestSnapshotWaitsAreNotValidated(t *testing.T) {
 	}
 }
 
+// A wait that cannot be decoded is dropped on its own, and snapshot fields
+// that cannot be decoded are dropped without the entry's policy fields.
+func TestSnapshotFieldsSalvaged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	content := `{"version":1,"sources":[` +
+		`{"source":{"host":"kopia","userName":"root","path":"/data/a"},"savedScheduling":{"cron":["0 * * * *"]},` +
+		`"snapshotWaits":[{"id":"bad","ticket":{"tasksBefore":[3]}},{"id":"good","ticket":{"triggeredAt":"2026-10-18T12:00:00Z"}}]},` +
+		`{"source":{"host":"kopia","userName":"root","path":"/data/b"},"savedScheduling":{"cron":["5 * * * *"]},"lastTriggered":5}]}`
+
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	log, logs := newLogger()
+	s := open(t, path, Options{Logger: log})
+
+	a, ok := s.Get(srcA)
+	if !ok || a.SavedScheduling == nil || len(a.SnapshotWaits) != 1 || a.SnapshotWaits[0].ID != "good" {
+		t.Errorf("record of a = %+v", a)
+	}
+
+	b, ok := s.Get(srcB)
+	if !ok || string(b.SavedScheduling) != `{"cron":["5 * * * *"]}` || !b.LastTriggered.IsZero() {
+		t.Errorf("record of b = %+v", b)
+	}
+
+	for _, want := range []string{"1 snapshot waits cannot be decoded", "the snapshot state cannot be decoded", "copy"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log lacks %q:\n%s", want, logs)
+		}
+	}
+}
+
 // A record stays, also when it holds nothing: the store lists every source
 // the watcher manages. Only Delete removes it.
 func TestRecordsStayUntilDeleted(t *testing.T) {
@@ -886,10 +919,11 @@ func TestKnownEntryKeys(t *testing.T) {
 			Pending:         &backend.PolicyPatch{},
 			StoredHash:      "h",
 		},
-		SnapshotWaits:  []SnapshotWait{{ID: "1", Ticket: backend.SnapshotTicket{Source: srcA, TriggeredAt: mark}}},
-		LastTriggered:  mark,
-		AnnotateAfter:  &mark,
-		StopAbsorbedAt: mark,
+		SnapshotWaits:           []SnapshotWait{{ID: "1", Ticket: backend.SnapshotTicket{Source: srcA, TriggeredAt: mark}}},
+		LastTriggered:           mark,
+		AnnotateAfter:           &mark,
+		StopAbsorbedAt:          mark,
+		StopAbsorbedDescription: "d",
 	}
 
 	data, err := json.Marshal(entryForTest{Source: srcA, Record: r})

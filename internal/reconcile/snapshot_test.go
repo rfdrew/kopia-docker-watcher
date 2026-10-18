@@ -470,9 +470,17 @@ func TestSnapshotOnWatcherStart(t *testing.T) {
 				t.Errorf("log:\n%s", h.logs)
 			}
 
-			// A later full reconcile is no watcher start.
+			// A later full reconcile is no watcher start, also once
+			// min-interval would allow a snapshot.
+			eventually(t, "the result is handled", func() bool { return len(h.waits(app)) == 0 })
+			c.add(time.Hour)
+
+			mu.Lock()
+			n := seen[app]
+			mu.Unlock()
+
 			h.r.ReconcileAll()
-			eventually(t, "the passes of the second full reconcile", passed("/data/db", 2))
+			eventually(t, "the passes of the second full reconcile", func() bool { return passed(app, n+1)() && passed("/data/db", 2)() })
 
 			if n := h.triggers(app); n != tt.want {
 				t.Errorf("after another full reconcile: %d triggers", n)
@@ -614,6 +622,16 @@ func TestStopWhilePending(t *testing.T) {
 		}
 	})
 
+	t.Run("uploading", func(t *testing.T) {
+		h, _, _ := setup(t)
+		h.fake.SetStatus(h.src(app), backend.SourceStatus{Status: backend.StatusUploading})
+		h.mustPass(app)
+
+		if n := h.triggers(app); n != 0 || h.record(app).StopAbsorbedAt.IsZero() {
+			t.Errorf("%d triggers while the absorbing run uploads", n)
+		}
+	})
+
 	t.Run("saved", func(t *testing.T) {
 		h, c, _ := setup(t)
 		c.add(time.Minute)
@@ -662,7 +680,9 @@ func TestStopAbsorbedByOwnSnapshot(t *testing.T) {
 	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
 	h.mustPass(app)
 
-	if w := h.onlyWait(app); !w.Stop || w.Reason != "start of app, stop of app" || !h.record(app).StopAbsorbedAt.IsZero() {
+	// The wait becomes a stop snapshot, and the stop is kept too, in case
+	// the wait's run was not the pending one.
+	if w := h.onlyWait(app); !w.Stop || w.Reason != "start of app, stop of app" || !h.record(app).StopAbsorbedAt.Equal(c.now()) {
 		t.Fatalf("wait = %+v, absorbed at %v", w, h.record(app).StopAbsorbedAt)
 	}
 
@@ -670,8 +690,12 @@ func TestStopAbsorbedByOwnSnapshot(t *testing.T) {
 	h.finish(app, state.SnapshotResult{Outcome: backend.SnapshotUnknown})
 	h.mustPass(app)
 
-	if n := h.triggers(app); n != 2 {
-		t.Errorf("%d triggers, want the lost stop snapshot again", n)
+	if n := h.triggers(app); n != 2 || !h.record(app).StopAbsorbedAt.IsZero() {
+		t.Errorf("%d triggers, want the lost stop snapshot again once; absorbed at %v", n, h.record(app).StopAbsorbedAt)
+	}
+
+	if w := h.onlyWait(app); !w.Stop || !w.Retried {
+		t.Errorf("wait = %+v", w)
 	}
 }
 
@@ -813,38 +837,35 @@ func TestOneOffContainersTakeNoSnapshots(t *testing.T) {
 // A container whose labels have an error takes the snapshots its snapshot
 // labels ask for; a bad snapshot label itself takes none.
 func TestSnapshotsWithLabelErrors(t *testing.T) {
-	h := newHarness(t, withStrict)
-	withClock(h)
-	ok := h.engine.run("app", enable, pathLabel(app), "kopia.typo=1")
-	bad := h.engine.run("bad", enable, pathLabel("/data/bad"), "kopia.snapshot-on-start=yes")
-	h.mustPass(app)
-	h.mustPass("/data/bad")
+	for _, tt := range []struct {
+		label string
+		want  int
+	}{
+		{"kopia.typo=1", 1},
+		{"kopia.snapshot-on-stop=yes", 0},
+	} {
+		t.Run(tt.label, func(t *testing.T) {
+			// Registered before the labels went wrong.
+			h := newHarness(t, withStrict)
+			withClock(h)
+			id := h.engine.run("app", enable, pathLabel(app), onStop)
+			h.mustPass(app)
 
-	h.r.HandleEvent(h.engine.event(docker.KindStarted, ok))
-	h.r.HandleEvent(h.engine.event(docker.KindStarted, bad))
-	h.mustPass(app)
-	h.mustPass("/data/bad")
+			h.engine.mu.Lock()
+			ctr := h.engine.containers[id]
+			k, v, _ := strings.Cut(tt.label, "=")
+			ctr.Labels[k] = v
+			ctr.State = docker.StateExited
+			h.engine.containers[id] = ctr
+			h.engine.mu.Unlock()
 
-	if a, b := h.triggers(app), h.triggers("/data/bad"); a != 0 || b != 0 {
-		// Neither is registered: their labels cannot be applied.
-		t.Fatalf("unregistered sources took snapshots: %d, %d", a, b)
-	}
+			h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+			h.mustPass(app)
 
-	// Registered before the labels went wrong.
-	h2 := newHarness(t, withStrict)
-	withClock(h2)
-	id := h2.engine.run("app", enable, pathLabel(app))
-	h2.mustPass(app)
-	h2.engine.mu.Lock()
-	ctr := h2.engine.containers[id]
-	ctr.Labels["kopia.typo"] = "1"
-	h2.engine.containers[id] = ctr
-	h2.engine.mu.Unlock()
-	h2.r.HandleEvent(h2.engine.event(docker.KindStarted, id))
-	h2.mustPass(app)
-
-	if n := h2.triggers(app); n != 1 {
-		t.Errorf("%d triggers for a container with an unrelated label error\nlog:\n%s", n, h2.logs)
+			if n := h.triggers(app); n != tt.want || !h.paused(app) {
+				t.Errorf("%d triggers, paused %v\nlog:\n%s", n, h.paused(app), h.logs)
+			}
+		})
 	}
 }
 
@@ -911,10 +932,31 @@ func TestTriggerRetried(t *testing.T) {
 
 // A dry run takes no snapshots, also with SNAPSHOT_ON_WATCHER_START.
 func TestDryRunTakesNoSnapshots(t *testing.T) {
-	h := newHarness(t, func(o *Options) { o.DryRun = true }, withSnapshotOnWatcherStart)
-	h.engine.run("app", enable, pathLabel(app))
+	h := newHarness(t)
+	withClock(h)
+	id := h.engine.run("app", enable, pathLabel(app))
+	h.mustPass(app)
 
-	if err := h.r.RunOnce(t.Context()); err != nil {
+	if err := h.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ro, err := state.Open(h.statePath, state.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opts := h.opts
+	opts.Store, opts.DryRun, opts.SnapshotOnWatcherStart = ro, true, true
+
+	r, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r.HandleEvent(h.engine.event(docker.KindStarted, id))
+
+	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1037,7 +1079,9 @@ func TestSweepLimits(t *testing.T) {
 		h, src := setup(t, 3)
 
 		if err := h.store.Update(src, func(r *state.Record) error {
-			r.SnapshotWaits = []state.SnapshotWait{{ID: "w", Ticket: backend.SnapshotTicket{Source: src, TriggeredAt: t0.Add(2 * time.Minute)}}}
+			// The wait's snapshot may start up to clockSkew before its
+			// trigger by kopia server's clock.
+			r.SnapshotWaits = []state.SnapshotWait{{ID: "w", Ticket: backend.SnapshotTicket{Source: src, TriggeredAt: t0.Add(3 * time.Minute)}}}
 			return nil
 		}); err != nil {
 			t.Fatal(err)
@@ -1070,16 +1114,25 @@ func TestSweepLimits(t *testing.T) {
 		h.fake.FailNextFor(src, backendtest.AnnotateSnapshot,
 			&backend.Error{Op: "AnnotateSnapshot", Kind: backend.ErrConfig, Err: errors.New("rejected")})
 		h.fake.FailNextFor(src, backendtest.AnnotateSnapshot, temporary("AnnotateSnapshot"))
-		h.fullPass(app)
 
-		if m := h.record(app).AnnotateAfter; len(h.fake.Annotations(src)) != 0 || !m.Equal(t0.Add(time.Minute)) {
-			t.Fatalf("mark = %v, annotations %+v", m, h.fake.Annotations(src))
+		// A rejected description and a temporary failure stop the sweep
+		// where they happen, one attempt each.
+		for range 2 {
+			n := len(h.fake.CallsFor(src, backendtest.AnnotateSnapshot))
+			h.fullPass(app)
+
+			if m := h.record(app).AnnotateAfter; len(h.fake.Annotations(src)) != 0 || !m.Equal(t0) ||
+				len(h.fake.CallsFor(src, backendtest.AnnotateSnapshot)) != n+1 {
+				t.Fatalf("mark = %v, annotations %+v", m, h.fake.Annotations(src))
+			}
 		}
 
+		// A snapshot that is gone is skipped.
+		h.fake.FailNextFor(src, backendtest.AnnotateSnapshot, &backend.Error{Op: "AnnotateSnapshot", Err: backend.ErrSnapshotNotFound})
 		h.fullPass(app)
 
-		if got := h.fake.Annotations(src); len(got) != 2 {
-			t.Errorf("annotations = %+v", got)
+		if got := h.fake.Annotations(src); len(got) != 2 || !h.record(app).AnnotateAfter.Equal(t0.Add(3*time.Minute)) {
+			t.Errorf("annotations = %+v, mark %v", got, h.record(app).AnnotateAfter)
 		}
 	})
 }
@@ -1196,12 +1249,26 @@ func TestSnapshotMethodsNotImplemented(t *testing.T) {
 		t.Errorf("%d WaitSnapshot calls, want one per snapshot", n)
 	}
 
-	// Descriptions cannot be written either.
+	// Descriptions cannot be written either, and the snapshots are not
+	// listed again.
 	fake.AddSnapshot(h.src(app), backend.SnapshotInfo{StartTime: c.now().Add(time.Second)})
 	h.r.ReconcileAll()
 	eventually(t, "a listing", func() bool { return b.calls.get(backendtest.ListSnapshots) == 1 })
+
+	for drained := false; !drained; {
+		select {
+		case <-passes:
+		default:
+			drained = true
+		}
+	}
+
 	h.r.ReconcileAll()
-	eventually(t, "another listing", func() bool { return b.calls.get(backendtest.ListSnapshots) == 2 })
+	waitPasses(t, passes, app)
+
+	if n := b.calls.get(backendtest.ListSnapshots); n != 1 {
+		t.Errorf("%d listings", n)
+	}
 
 	if a, d := h.count("the backend cannot follow snapshots yet"), h.count("the backend cannot describe snapshots yet"); a != 1 || d != 1 {
 		t.Errorf("warnings: follow %d, describe %d\nlog:\n%s", a, d, h.logs)
@@ -1253,6 +1320,14 @@ func TestWaitOutsideThePass(t *testing.T) {
 
 	if w := h.onlyWait(app); w.Result != nil {
 		t.Fatalf("the held snapshot ended: %+v", w)
+	}
+
+	// The passes start no second waiter for the snapshot.
+	h.r.ReconcileAll()
+	waitPasses(t, passes, app)
+
+	if n := len(h.fake.CallsFor(src, backendtest.WaitSnapshot)); n != 1 {
+		t.Errorf("%d WaitSnapshot calls for one snapshot", n)
 	}
 
 	h.fake.ReleaseSnapshots(src)
@@ -1396,12 +1471,49 @@ func TestUnusableWaitsLeftAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h.start()
+	passes := h.start()
 	h.r.ReconcileAll()
-	time.Sleep(50 * time.Millisecond)
+	waitPasses(t, passes, app)
 
 	if got := h.waits(app); len(got) != 2 || len(h.fake.CallsTo(backendtest.WaitSnapshot)) != 0 {
 		t.Errorf("waits = %+v", got)
+	}
+}
+
+// Waits the watcher cannot use do not absorb a stop and do not hold back
+// the descriptions.
+func TestUnusableWaitsIgnored(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	src := h.src(app)
+	id := h.engine.run("app", enable, pathLabel(app), onStop)
+	h.mustPass(app)
+
+	if err := h.store.Update(src, func(r *state.Record) error {
+		r.SnapshotWaits = []state.SnapshotWait{{ID: "", Ticket: backend.SnapshotTicket{Source: src, TriggeredAt: c.now().Add(30 * time.Second)}}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 1; i <= 2; i++ {
+		at := c.now().Add(time.Duration(i) * time.Minute)
+		h.fake.AddSnapshot(src, backend.SnapshotInfo{StartTime: at, EndTime: at})
+	}
+
+	h.fullPass(app)
+
+	if got := h.fake.Annotations(src); len(got) != 2 {
+		t.Errorf("annotations = %+v", got)
+	}
+
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusPending})
+	h.engine.setState(id, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+	h.mustPass(app)
+
+	if rec := h.record(app); rec.StopAbsorbedAt.IsZero() || rec.SnapshotWaits[0].Stop {
+		t.Errorf("record = %+v", rec)
 	}
 }
 
@@ -1435,5 +1547,406 @@ func TestCompact(t *testing.T) {
 
 	if fmt.Sprint(names) != "[3 4 5]" {
 		t.Errorf("compact = %v", names)
+	}
+}
+
+// A description that fails for a passing reason keeps the wait, logged
+// once, and the next pass describes the snapshot with the description
+// worked out when it was queued.
+func TestDescriptionRetried(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	src := h.src(app)
+	id := h.engine.run("app", enable, pathLabel(app), onStop, "kopia.description=Main DB")
+	h.mustPass(app)
+
+	c.add(time.Minute)
+	h.engine.setState(id, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+	h.r.HandleEvent(h.engine.remove(id))
+	h.mustPass(app)
+	h.r.wait(t.Context(), h.onlyWait(app))
+
+	h.fake.FailNextFor(src, backendtest.AnnotateSnapshot, temporary("AnnotateSnapshot"))
+	h.mustPass(app)
+
+	if w := h.onlyWait(app); !w.Logged || len(h.fake.Annotations(src)) != 0 {
+		t.Fatalf("wait = %+v", w)
+	}
+
+	h.mustPass(app)
+
+	if got := h.fake.Annotations(src); len(got) != 1 || got[0].Description != "Main DB" || len(h.waits(app)) != 0 {
+		t.Errorf("annotations = %+v, waits %+v", got, h.waits(app))
+	}
+
+	if n := h.count("snapshot finished"); n != 1 {
+		t.Errorf("logged %d times", n)
+	}
+}
+
+// A stop that a pending snapshot absorbs keeps its description for that
+// snapshot, also when its container is gone by then.
+func TestAbsorbedStopDescription(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	src := h.src(app)
+	id := h.engine.run("app", enable, pathLabel(app), onStop, "kopia.description=Main DB")
+	h.mustPass(app)
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusPending})
+
+	c.add(time.Minute)
+	h.engine.setState(id, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+	h.r.HandleEvent(h.engine.remove(id))
+	h.mustPass(app)
+
+	if rec := h.record(app); rec.StopAbsorbedDescription != "Main DB" || h.triggers(app) != 0 {
+		t.Fatalf("record = %+v", rec)
+	}
+
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusIdle})
+	h.fake.AddSnapshot(src, backend.SnapshotInfo{StartTime: c.now().Add(time.Second), EndTime: c.now().Add(time.Second)})
+	h.mustPass(app)
+
+	if got := h.fake.Annotations(src); len(got) != 1 || got[0].Description != "Main DB" || !h.record(app).StopAbsorbedAt.IsZero() {
+		t.Errorf("annotations = %+v, record %+v", got, h.record(app))
+	}
+}
+
+// A snapshot taken again keeps the description of the first attempt.
+func TestRetryKeepsDescription(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	id := h.engine.run("app", enable, pathLabel(app), onStop, "kopia.description=Main DB", "kopia.tags=env:prod")
+	h.engine.run("sidecar", enable, pathLabel(app))
+	h.mustPass(app)
+
+	h.engine.setState(id, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+	h.r.HandleEvent(h.engine.remove(id))
+	h.mustPass(app)
+
+	const want = "Main DB, sidecar [env=prod]"
+
+	if w := h.onlyWait(app); w.Description != want {
+		t.Fatalf("description = %q", w.Description)
+	}
+
+	c.add(time.Minute)
+	h.finish(app, state.SnapshotResult{Outcome: backend.SnapshotUnknown})
+	h.mustPass(app)
+
+	if w := h.onlyWait(app); !w.Retried || w.Description != want {
+		t.Errorf("wait = %+v", w)
+	}
+}
+
+// The tags warning comes from the tags label, not from brackets in the
+// description.
+func TestTagsWarning(t *testing.T) {
+	for _, tt := range []struct {
+		labels []string
+		want   int
+	}{
+		{[]string{"kopia.description=Main DB [primary]"}, 0},
+		{[]string{"kopia.tags=env:prod"}, 1},
+	} {
+		h := newHarness(t)
+		withClock(h)
+		id := h.engine.run("app", append([]string{enable, pathLabel(app), noInterval}, tt.labels...)...)
+		h.mustPass(app)
+
+		for range 2 {
+			h.r.HandleEvent(h.engine.event(docker.KindStarted, id))
+			h.mustPass(app)
+		}
+
+		if n := h.count("kopia.tags are written into the snapshot description"); n != tt.want || h.triggers(app) != 2 {
+			t.Errorf("%v: warned %d times, %d triggers", tt.labels, n, h.triggers(app))
+		}
+	}
+}
+
+// A stop seen only in the pause is asked for again when queuing it fails:
+// the retry no longer sees the change of the pause.
+func TestStopWithoutEventRetried(t *testing.T) {
+	h := newHarness(t)
+	withClock(h)
+	id := h.engine.run("app", enable, pathLabel(app), onStop)
+	h.mustPass(app)
+
+	h.engine.setState(id, docker.StateExited)
+	h.fake.FailNextFor(h.src(app), backendtest.TriggerSnapshot, temporary("TriggerSnapshot"))
+
+	if res := h.pass(app); !res.retry || !h.paused(app) {
+		t.Fatalf("retry %v, paused %v", res.retry, h.paused(app))
+	}
+
+	h.mustPass(app)
+
+	if w := h.onlyWait(app); h.triggers(app) != 2 || !w.Stop || w.Reason != "stop of app without an event" {
+		t.Errorf("%d triggers, wait %+v", h.triggers(app), w)
+	}
+}
+
+// A one-off container's start and stop explain the changes of the pause
+// they cause: no stop snapshot of the main container comes of them.
+func TestOneOffChangesThePause(t *testing.T) {
+	h := newHarness(t)
+	withClock(h)
+	main := h.engine.run("app", enable, pathLabel(app), onStop)
+	h.mustPass(app)
+
+	h.engine.setState(main, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, main))
+	h.mustPass(app)
+	h.finish(app, state.SnapshotResult{Outcome: backend.SnapshotSucceeded})
+	h.mustPass(app)
+
+	run := h.engine.run("app-run-1", enable, pathLabel(app), onStop, oneOffLabel+"=True")
+	h.r.HandleEvent(h.engine.event(docker.KindStarted, run))
+	h.mustPass(app)
+
+	if h.paused(app) {
+		t.Fatal("the one-off did not lift the pause")
+	}
+
+	h.engine.setState(run, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, run))
+	h.r.HandleEvent(h.engine.remove(run))
+	h.mustPass(app)
+
+	if n := h.triggers(app); n != 1 || !h.paused(app) {
+		t.Errorf("%d triggers, paused %v\nlog:\n%s", n, h.paused(app), h.logs)
+	}
+}
+
+// A run that gets its upload slot during the pass's policy write still
+// counts as the stop snapshot: the stop counts from the start of the pass.
+func TestStopAbsorbedAtPassStart(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	src := h.src(app)
+	id := h.engine.run("app", enable, pathLabel(app), onStop)
+	h.mustPass(app)
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusPending})
+
+	start := c.now()
+	h.fake.SetHook(func(call backendtest.Call) error {
+		if call.Method == backendtest.ApplyPlan {
+			c.add(time.Second)
+		}
+
+		return nil
+	})
+
+	h.engine.setState(id, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+	h.mustPass(app)
+	h.fake.SetHook(nil)
+
+	if got := h.record(app).StopAbsorbedAt; !got.Equal(start) {
+		t.Fatalf("absorbed at %v, want %v", got, start)
+	}
+
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusIdle})
+	h.fake.AddSnapshot(src, backend.SnapshotInfo{StartTime: start.Add(500 * time.Millisecond), EndTime: c.now()})
+	h.mustPass(app)
+
+	if n := h.triggers(app); n != 0 || !h.record(app).StopAbsorbedAt.IsZero() {
+		t.Errorf("%d triggers", n)
+	}
+}
+
+// A lost start snapshot is taken again without the container's minimum
+// interval: the first trigger passed it, and no snapshot came of it.
+func TestLostStartRetriedWithoutMinInterval(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	id := h.engine.run("app", enable, pathLabel(app), "kopia.min-interval=5m")
+	h.mustPass(app)
+	h.fake.AddSnapshot(h.src(app), backend.SnapshotInfo{StartTime: c.now().Add(-6 * time.Minute)})
+
+	h.r.HandleEvent(h.engine.event(docker.KindStarted, id))
+	h.mustPass(app)
+	h.finish(app, state.SnapshotResult{Outcome: backend.SnapshotUnknown})
+	h.mustPass(app)
+
+	if n := h.triggers(app); n != 2 {
+		t.Errorf("%d triggers", n)
+	}
+}
+
+// A wait that could not be finished for a week is dropped.
+func TestOldWaitDropped(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	src := h.src(app)
+	h.engine.run("app", enable, pathLabel(app))
+	h.mustPass(app)
+
+	if err := h.store.Update(src, func(r *state.Record) error {
+		r.SnapshotWaits = []state.SnapshotWait{{ID: "old", Ticket: backend.SnapshotTicket{Source: src, TriggeredAt: c.now().Add(-8 * 24 * time.Hour)}}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	h.mustPass(app)
+
+	if ws := h.waits(app); len(ws) != 0 || !h.logged("dropping a snapshot wait") {
+		t.Errorf("waits = %+v", ws)
+	}
+}
+
+// A second stop while the snapshot the first one queued waits behind the
+// current upload counts that snapshot again rather than queuing another,
+// which kopia server would drop.
+func TestSecondStopWhileQueued(t *testing.T) {
+	h := newHarness(t)
+	withClock(h)
+	src := h.src(app)
+	id := h.engine.run("app", enable, pathLabel(app), onStop)
+	h.mustPass(app)
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusUploading, CurrentTask: "5"})
+
+	stop := func() {
+		t.Helper()
+		h.engine.setState(id, docker.StateExited)
+		h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+		h.mustPass(app)
+	}
+
+	stop()
+
+	// The REST backend lists the running task in the ticket.
+	if err := h.store.Update(src, func(r *state.Record) error {
+		r.SnapshotWaits[0].Ticket.TasksBefore = []string{"5"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	h.engine.setState(id, docker.StateRunning)
+	h.r.HandleEvent(h.engine.event(docker.KindStarted, id))
+	h.mustPass(app)
+	stop()
+
+	if w := h.onlyWait(app); h.triggers(app) != 1 || w.Reason != "stop of app, stop of app" {
+		t.Errorf("%d triggers, wait %+v", h.triggers(app), w)
+	}
+}
+
+// waitTracker is the fake with a WaitSnapshot that holds until its context
+// ends and then takes a moment to return, like a request that is torn
+// down.
+type waitTracker struct {
+	*backendtest.Fake
+	returned atomicFlag
+}
+
+type atomicFlag struct {
+	mu  sync.Mutex
+	set bool
+}
+
+func (f *atomicFlag) store() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.set = true
+}
+
+func (f *atomicFlag) load() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.set
+}
+
+func (b *waitTracker) WaitSnapshot(ctx context.Context, _ backend.SnapshotTicket, _ func(backend.SnapshotTicket)) (backend.SnapshotResult, error) {
+	<-ctx.Done()
+	time.Sleep(50 * time.Millisecond)
+	b.returned.store()
+
+	return backend.SnapshotResult{}, ctx.Err()
+}
+
+// Run returns only after its snapshot waiters.
+func TestRunWaitsForWaiters(t *testing.T) {
+	fake := backendtest.New()
+	b := &waitTracker{Fake: fake}
+	h := newHarness(t, withBackend(b))
+	h.fake = fake
+	withClock(h)
+	id := h.engine.run("app", enable, pathLabel(app))
+	h.mustPass(app)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+
+	go func() {
+		h.r.Run(ctx)
+		close(done)
+	}()
+
+	h.r.HandleEvent(h.engine.event(docker.KindStarted, id))
+	eventually(t, "a waiter", func() bool {
+		h.r.mu.Lock()
+		defer h.r.mu.Unlock()
+
+		return len(h.r.waiting) == 1
+	})
+
+	cancel()
+	<-done
+
+	if !b.returned.load() {
+		t.Error("Run returned before its waiter")
+	}
+}
+
+// While kopia server does not run snapshots of the source (paused through
+// its control API), none is queued.
+func TestNoSnapshotWhilePaused(t *testing.T) {
+	h := newHarness(t)
+	withClock(h)
+	id := h.engine.run("app", enable, pathLabel(app), onStop)
+	h.mustPass(app)
+	h.fake.SetStatus(h.src(app), backend.SourceStatus{Status: backend.StatusPaused})
+
+	h.r.HandleEvent(h.engine.event(docker.KindStarted, id))
+	h.mustPass(app)
+	h.engine.setState(id, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+	h.mustPass(app)
+
+	if n := h.triggers(app); n != 0 || !h.logged("not queuing a snapshot: kopia server does not run snapshots") {
+		t.Errorf("%d triggers\nlog:\n%s", n, h.logs)
+	}
+}
+
+// A pass of a full reconcile that fails keeps its flags for the retry,
+// which describes the snapshots.
+func TestFlagsKeptForTheRetry(t *testing.T) {
+	h := newHarness(t)
+	withClock(h)
+	src := h.src(app)
+	h.engine.run("app", enable, pathLabel(app))
+	h.mustPass(app)
+	h.fake.AddSnapshot(src, backend.SnapshotInfo{StartTime: t0.Add(time.Minute), EndTime: t0.Add(time.Minute)})
+
+	h.r.restoreFlags(app, false, true)
+	h.fake.FailNextFor(src, backendtest.PlanSource, temporary("PlanSource"))
+
+	if res := h.pass(app); !res.retry {
+		t.Fatalf("pass: %v", res.err)
+	}
+
+	h.mustPass(app)
+
+	if got := h.fake.Annotations(src); len(got) != 1 {
+		t.Errorf("annotations = %+v", got)
 	}
 }

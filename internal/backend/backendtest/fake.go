@@ -1081,7 +1081,7 @@ func (f *Fake) finishSnapshot(t backend.SnapshotTicket) (backend.SnapshotResult,
 
 	s, ok := f.sources[t.Source]
 	if !ok {
-		return backend.SnapshotResult{Outcome: backend.SnapshotUnknown}, nil
+		return backend.SnapshotResult{Outcome: backend.SnapshotUnknown, Error: "kopia server does not know the source"}, nil
 	}
 
 	var r backend.SnapshotResult

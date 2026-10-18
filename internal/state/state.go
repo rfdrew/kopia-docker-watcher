@@ -151,7 +151,8 @@ type Record struct {
 	// waits for, and those whose result a pass has yet to act on. After a
 	// restart the watcher waits for the first again and acts on the
 	// others. The reconciler skips a wait it cannot use and leaves it as
-	// it is, so a wait never makes the entry unreadable.
+	// it is, and a wait that cannot be decoded is dropped on its own, so
+	// a wait never makes the entry unreadable.
 	SnapshotWaits []SnapshotWait `json:"snapshotWaits,omitempty"`
 
 	// LastTriggered is when the watcher last queued a snapshot of the
@@ -173,8 +174,10 @@ type Record struct {
 	// StopAbsorbedAt is when a container stopped while a snapshot of the
 	// source was pending, which then counts as the stop snapshot; zero if
 	// none. If kopia server loses that run, the stop snapshot is taken
-	// once more.
-	StopAbsorbedAt time.Time `json:"stopAbsorbedAt,omitzero"`
+	// once more. StopAbsorbedDescription is the description worked out at
+	// the stop, for that snapshot.
+	StopAbsorbedAt          time.Time `json:"stopAbsorbedAt,omitzero"`
+	StopAbsorbedDescription string    `json:"stopAbsorbedDescription,omitempty"`
 }
 
 // SnapshotWait is a snapshot the watcher queued and has not finished with.
@@ -199,6 +202,9 @@ type SnapshotWait struct {
 	// Retried marks a snapshot taken once more because the first one was
 	// lost; it is not taken a third time.
 	Retried bool `json:"retried,omitempty"`
+	// Logged marks a result that was logged already, for a wait a pass
+	// could not finish with yet.
+	Logged bool `json:"logged,omitempty"`
 	// Result is how the snapshot ended, once the watcher knows; nil while
 	// it waits. A pass acts on it and then removes the wait.
 	Result *SnapshotResult `json:"result,omitempty"`
@@ -577,7 +583,7 @@ func (s *Store) load() error {
 	s.records, s.extra = records, extra
 
 	if len(problems) > 0 {
-		return s.keepCorrupt(data, "state file has entries that cannot be read; they are dropped", problems)
+		return s.keepCorrupt(data, "state file has entries that cannot be read in full; what cannot be read is dropped", problems)
 	}
 
 	return nil
@@ -713,11 +719,15 @@ func decode(data []byte) (records map[backend.Source]entry, extra map[string]jso
 	records = make(map[backend.Source]entry, len(raws))
 
 	for i, raw := range raws {
-		src, e, err := decodeEntry(raw)
+		src, e, note, err := decodeEntry(raw)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("entry %d: %v", i, err))
 
 			continue
+		}
+
+		if note != "" {
+			problems = append(problems, fmt.Sprintf("entry %d: %s: %s", i, src, note))
 		}
 
 		if _, dup := records[src]; dup {
@@ -741,28 +751,59 @@ func cmpRaw(raw json.RawMessage) json.RawMessage {
 	return raw
 }
 
-func decodeEntry(raw json.RawMessage) (backend.Source, entry, error) {
+// snapshotKeys are the keys of an entry that hold the snapshot lifecycle
+// rather than the policy. An entry whose snapshot fields cannot be decoded
+// keeps its policy fields.
+var snapshotKeys = func() map[string]bool {
+	keys := jsonKeys(reflect.TypeFor[Record]())
+	for k := range jsonKeys(reflect.TypeFor[backend.Applied]()) {
+		delete(keys, k)
+	}
+
+	return keys
+}()
+
+// decodeEntry decodes one entry of the file. note tells what of it could
+// not be read and was dropped: snapshot waits that do not decode, or all
+// the snapshot fields if they keep the entry from decoding.
+func decodeEntry(raw json.RawMessage) (src backend.Source, e entry, note string, err error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
-		return backend.Source{}, entry{}, fmt.Errorf("not a JSON object: %w", err)
+		return backend.Source{}, entry{}, "", fmt.Errorf("not a JSON object: %w", err)
 	}
 
 	if fields == nil {
-		return backend.Source{}, entry{}, errors.New("not a JSON object: null")
+		return backend.Source{}, entry{}, "", errors.New("not a JSON object: null")
 	}
 
-	var src backend.Source
 	if err := json.Unmarshal(cmpRaw(fields["source"]), &src); err != nil {
-		return backend.Source{}, entry{}, fmt.Errorf("source: %w", err)
+		return backend.Source{}, entry{}, "", fmt.Errorf("source: %w", err)
 	}
 
 	if err := src.Validate(); err != nil {
-		return backend.Source{}, entry{}, err
+		return backend.Source{}, entry{}, "", err
+	}
+
+	var notes []string
+
+	if n := dropBadWaits(fields); n > 0 {
+		notes = append(notes, fmt.Sprintf("%d snapshot waits cannot be decoded", n))
 	}
 
 	var r Record
-	if err := json.Unmarshal(raw, &r); err != nil {
-		return src, entry{}, fmt.Errorf("%s: %w", src, err)
+	if err := unmarshalFields(fields, &r); err != nil {
+		for k := range fields {
+			if isSnapshotKey(k) {
+				delete(fields, k)
+			}
+		}
+
+		r = Record{}
+		if unmarshalFields(fields, &r) != nil {
+			return src, entry{}, "", fmt.Errorf("%s: %w", src, err)
+		}
+
+		notes = append(notes, "the snapshot state cannot be decoded: "+err.Error())
 	}
 
 	// A null value means the same as a missing one.
@@ -774,15 +815,15 @@ func decodeEntry(raw json.RawMessage) (backend.Source, entry, error) {
 	}
 
 	if err := r.Validate(); err != nil {
-		return src, entry{}, fmt.Errorf("%s: %w", src, err)
+		return src, entry{}, "", fmt.Errorf("%s: %w", src, err)
 	}
 
 	enc, err := encodeRecord(r)
 	if err != nil {
-		return src, entry{}, fmt.Errorf("%s: %w", src, err)
+		return src, entry{}, "", fmt.Errorf("%s: %w", src, err)
 	}
 
-	e := entry{record: enc}
+	e = entry{record: enc}
 
 	for k, v := range fields {
 		if isKnownEntryKey(k) {
@@ -796,7 +837,68 @@ func decodeEntry(raw json.RawMessage) (backend.Source, entry, error) {
 		e.extra[k] = v
 	}
 
-	return src, e, nil
+	return src, e, strings.Join(notes, "; "), nil
+}
+
+// dropBadWaits removes from the snapshotWaits of fields the waits that do
+// not decode, all of them if the value is no list, and returns how many.
+func dropBadWaits(fields map[string]json.RawMessage) int {
+	for k, raw := range fields {
+		if !strings.EqualFold(k, "snapshotWaits") {
+			continue
+		}
+
+		var list []json.RawMessage
+		if err := json.Unmarshal(raw, &list); err != nil {
+			delete(fields, k)
+			return 1
+		}
+
+		var (
+			keep    []json.RawMessage
+			dropped int
+		)
+
+		for _, item := range list {
+			var w SnapshotWait
+			if json.Unmarshal(item, &w) != nil {
+				dropped++
+				continue
+			}
+
+			keep = append(keep, item)
+		}
+
+		if dropped > 0 {
+			fields[k] = mustEncode(keep)
+		}
+
+		return dropped
+	}
+
+	return 0
+}
+
+// unmarshalFields decodes the fields of an entry into r.
+func unmarshalFields(fields map[string]json.RawMessage, r *Record) error {
+	data, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+
+	return json.Unmarshal(data, r)
+}
+
+// isSnapshotKey reports whether encoding/json decodes key into a snapshot
+// field of a Record.
+func isSnapshotKey(key string) bool {
+	for k := range snapshotKeys {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // isKnownEntryKey reports whether encoding/json decodes key into a field of
