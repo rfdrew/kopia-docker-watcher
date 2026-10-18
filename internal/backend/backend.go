@@ -319,8 +319,11 @@ const (
 type SnapshotResult struct {
 	Outcome SnapshotOutcome
 	TaskID  string
-	// Snapshot is the snapshot the task saved; nil if it saved none.
+	// Snapshot is the snapshot the task saved, for SnapshotSucceeded and
+	// SnapshotIncomplete; nil otherwise.
 	Snapshot *SnapshotInfo
-	// Error is the task's error message for a failed snapshot.
+	// Error tells why the outcome is not SnapshotSucceeded or
+	// SnapshotIdentical, such as the task's error message for a failed
+	// snapshot; empty for those two.
 	Error string
 }

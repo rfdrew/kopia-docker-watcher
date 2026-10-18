@@ -189,9 +189,10 @@ func (c *Client) ResolvePath(ctx context.Context, path string) (SourceInfo, erro
 	return resp.Source, nil
 }
 
-// ListSnapshots returns the snapshots of src, newest first. With all
-// false kopia merges snapshots with the same root and keeps the oldest of
-// them; pass true to see every manifest, including checkpoints.
+// ListSnapshots returns the snapshots of src, oldest first: by start time,
+// then by end time. With all false kopia merges snapshots with the same
+// root and keeps the oldest of them; pass true to see every manifest,
+// including checkpoints.
 func (c *Client) ListSnapshots(ctx context.Context, src SourceInfo, all bool) (*SnapshotsResponse, error) {
 	if err := src.requireFull(); err != nil {
 		return nil, err

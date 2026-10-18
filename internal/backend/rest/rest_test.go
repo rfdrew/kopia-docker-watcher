@@ -1143,28 +1143,6 @@ func TestTriggerSnapshot(t *testing.T) {
 	}
 }
 
-func TestSnapshotMethodsNotImplemented(t *testing.T) {
-	f := newFakeKopia()
-	b := newBackend(t, f)
-	s := src("/data/app")
-
-	_, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: s}, nil)
-	assertError(t, err, opWaitSnapshot, s, nil)
-
-	if !errors.Is(err, backend.ErrNotImplemented) {
-		t.Errorf("WaitSnapshot: %v", err)
-	}
-
-	err = b.AnnotateSnapshot(t.Context(), s, time.Now(), "d", nil)
-	assertError(t, err, opAnnotateSnapshot, s, nil)
-
-	if !errors.Is(err, backend.ErrNotImplemented) {
-		t.Errorf("AnnotateSnapshot: %v", err)
-	}
-
-	assertRoutes(t, f)
-}
-
 // Every request about a source carries its host, user name and path, so it
 // never matches another user's source.
 func TestEveryRequestNamesTheSource(t *testing.T) {
@@ -1185,7 +1163,24 @@ func TestEveryRequestNamesTheSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := b.TriggerSnapshot(t.Context(), s); err != nil {
+	ticket, err := b.TriggerSnapshot(t.Context(), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Date(2026, 10, 18, 9, 0, 0, 0, time.UTC)
+	f.set(func(f *fakeKopia) {
+		f.tasks = []kopiaclient.TaskInfo{snapTask("1", "/data/app", start, kopiaclient.TaskSuccess)}
+		f.snapshots[info("/data/app")] = []kopiaclient.Snapshot{snapshot("a", start, start, "")}
+	})
+
+	ticket.TriggeredAt = start
+
+	if res, err := b.WaitSnapshot(t.Context(), ticket, nil); err != nil || res.Outcome != backend.SnapshotSucceeded {
+		t.Fatalf("WaitSnapshot = %+v, %v", res, err)
+	}
+
+	if err := b.AnnotateSnapshot(t.Context(), s, start, "d", []string{"p"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1198,10 +1193,15 @@ func TestEveryRequestNamesTheSource(t *testing.T) {
 	f.mu.Unlock()
 
 	for _, r := range requests {
-		switch r.Route {
-		case "GET tasks":
+		switch {
+		case r.Route == "GET tasks", strings.HasPrefix(r.Route, "GET tasks/"):
 			continue
-		case "POST sources":
+		case r.Route == "POST snapshots/edit":
+			// The snapshot's ID, read for exactly this source.
+			if len(r.Query) != 0 || !bytes.Contains(r.Body, []byte(`"snapshots":["a"]`)) {
+				t.Errorf("%s %v %s", r.Route, r.Query, r.Body)
+			}
+		case r.Route == "POST sources":
 			// The source is kopia server's own user@host with this path.
 			if len(r.Query) != 0 || !bytes.Contains(r.Body, []byte(`"path":"/data/app"`)) {
 				t.Errorf("%s %v %s", r.Route, r.Query, r.Body)
@@ -1268,6 +1268,18 @@ func TestContextDone(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Errorf("err = %v, want context.Canceled", err)
 		}
+
+		_, err = b.WaitSnapshot(ctx, backend.SnapshotTicket{Source: s}, nil)
+		assertError(t, err, opWaitSnapshot, s, nil)
+
+		err = b.AnnotateSnapshot(ctx, s, time.Now(), "d", nil)
+		assertError(t, err, opAnnotateSnapshot, s, nil)
+
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want context.Canceled", err)
+		}
+
+		assertRoutes(t, f)
 	})
 
 	t.Run("canceled while kopia server answers 500", func(t *testing.T) {
@@ -1415,6 +1427,11 @@ func TestErrorKinds(t *testing.T) {
 
 			return err
 		}},
+		"edit": {"POST snapshots/edit", func(t *testing.T, b *Backend, f *fakeKopia) error {
+			f.set(func(f *fakeKopia) { f.snapshots[info("/data/app")] = []kopiaclient.Snapshot{snapshot("a", t0, t0, "")} })
+
+			return b.AnnotateSnapshot(t.Context(), s, t0, "d", nil)
+		}},
 	}
 
 	tests := []struct {
@@ -1512,6 +1529,16 @@ func TestErrorKinds(t *testing.T) {
 		{"upload", answer{status: 404, body: `{"code":"NOT_FOUND","error":"no source matching the provided filters"}`}, backend.ErrTemporary},
 		{"upload", answer{status: 500, body: internal}, backend.ErrTemporary},
 		{"upload", answer{status: 400, body: `{"code":"PATH_NOT_FOUND","error":"x"}`}, nil},
+
+		// POST /api/v1/snapshots/edit: the snapshot changed since it was
+		// listed, which the next call sees.
+		{"edit", answer{status: 500, body: `{"code":"INTERNAL","error":"internal server error: unable to load snapshot: manifest not found"}`}, backend.ErrTemporary},
+		{"edit", answer{status: 500, body: readOnly}, nil},
+		{"edit", answer{status: 400, body: malformed}, nil},
+		{"edit", answer{status: 400, body: notConn}, backend.ErrUnavailable},
+		{"edit", answer{status: 413, body: tooLarge}, nil},
+		{"edit", answer{status: 400, body: notFound}, nil},
+		{"edit", answer{err: errors.New("connection reset")}, backend.ErrUnavailable},
 	}
 
 	for _, tt := range tests {
@@ -1731,6 +1758,11 @@ func TestWrongIdentityEverywhere(t *testing.T) {
 				_, err := b.TriggerSnapshot(t.Context(), other)
 				return err
 			},
+			opWaitSnapshot: func() error {
+				_, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: other, TaskID: "1"}, nil)
+				return err
+			},
+			opAnnotateSnapshot: func() error { return b.AnnotateSnapshot(t.Context(), other, time.Now(), "d", nil) },
 		}
 
 		for name, call := range calls {
@@ -1779,6 +1811,11 @@ func TestRelativePathRefused(t *testing.T) {
 				_, err := b.TriggerSnapshot(t.Context(), s)
 				return err
 			},
+			opWaitSnapshot: func() error {
+				_, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: s, TaskID: "1"}, nil)
+				return err
+			},
+			opAnnotateSnapshot: func() error { return b.AnnotateSnapshot(t.Context(), s, time.Now(), "d", nil) },
 		}
 
 		for op, call := range calls {
@@ -1828,6 +1865,21 @@ func TestReadRequestKinds(t *testing.T) {
 			_, err := b.TriggerSnapshot(t.Context(), s)
 			return err
 		}},
+		{"tasks of a wait", "GET tasks", opWaitSnapshot, s, func(t *testing.T, b *Backend) error {
+			_, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: s}, nil)
+			return err
+		}},
+		{"task", "GET tasks/1", opWaitSnapshot, s, func(t *testing.T, b *Backend) error {
+			_, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: s, TaskID: "1"}, nil)
+			return err
+		}},
+		{"snapshots of a wait", "GET snapshots", opWaitSnapshot, s, func(t *testing.T, b *Backend) error {
+			_, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: s, TaskID: "1", TaskDescription: taskDesc("/data/app", t0)}, nil)
+			return err
+		}},
+		{"snapshots of an annotation", "GET snapshots", opAnnotateSnapshot, s, func(t *testing.T, b *Backend) error {
+			return b.AnnotateSnapshot(t.Context(), s, t0, "d", nil)
+		}},
 	}
 
 	answers := []struct {
@@ -1845,13 +1897,16 @@ func TestReadRequestKinds(t *testing.T) {
 
 	for _, site := range sites {
 		for _, a := range answers {
-			if site.route == "GET policy" && a.status == http.StatusNotFound {
-				continue // no policy, not an error
+			if (site.route == "GET policy" || site.route == "GET tasks/1") && a.status == http.StatusNotFound {
+				continue // no policy, or the task is gone: not an error
 			}
 
 			t.Run(fmt.Sprintf("%s %d %s", site.name, a.status, a.body), func(t *testing.T) {
 				f := newFakeKopia()
 				b := newBackend(t, f)
+				f.set(func(f *fakeKopia) {
+					f.tasks = []kopiaclient.TaskInfo{snapTask("1", "/data/app", t0, kopiaclient.TaskSuccess)}
+				})
 				f.inject(site.route, injection{status: a.status, body: a.body})
 
 				assertError(t, site.call(t, b), site.op, site.src, a.want)
