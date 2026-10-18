@@ -398,7 +398,14 @@ func (f *Fake) FailNextAfter(m Method, err error) {
 }
 
 // FailNextAfterFor is FailNextAfter for the next call of m about src only.
+// It panics on an ErrConfig error of ApplyPlan: kopia server checks a
+// policy before it stores it, so a write that took effect is never
+// refused (see backend.ActionRegister).
 func (f *Fake) FailNextAfterFor(src backend.Source, m Method, err error) {
+	if m == ApplyPlan && backend.IsConfig(err) {
+		panic("backendtest: an ApplyPlan that took effect cannot fail with ErrConfig")
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -409,7 +416,9 @@ func (f *Fake) FailNextAfterFor(src backend.Source, m Method, err error) {
 // FailRegisterPut makes the next registration stop after its POST: the
 // source is known with the policy, but kopia server's scheduler does not
 // have it, and ApplyPlan fails with err. A registration that fails before
-// the POST uses it up too.
+// the POST uses it up too. It panics on an ErrConfig error, which a
+// registration returns only when kopia server stored nothing (see
+// backend.ActionRegister).
 func (f *Fake) FailRegisterPut(err error) {
 	f.FailRegisterPutFor(backend.Source{}, err)
 }
@@ -417,6 +426,10 @@ func (f *Fake) FailRegisterPut(err error) {
 // FailRegisterPutFor is FailRegisterPut for the next registration of src
 // only.
 func (f *Fake) FailRegisterPutFor(src backend.Source, err error) {
+	if backend.IsConfig(err) {
+		panic("backendtest: a registration whose POST succeeded cannot fail with ErrConfig")
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 

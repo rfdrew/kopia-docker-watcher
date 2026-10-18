@@ -832,3 +832,25 @@ func TestWaitUnknownSource(t *testing.T) {
 		t.Errorf("WaitSnapshot = %+v, %v, known %v", r, err, f.Known(src))
 	}
 }
+
+// A registration whose POST succeeded cannot fail with ErrConfig.
+func TestFailRegisterPutRejectsConfigErrors(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("no panic")
+		}
+	}()
+
+	New().FailRegisterPut(&backend.Error{Op: "ApplyPlan", Kind: backend.ErrConfig, Err: errors.New("refused")})
+}
+
+// A write that took effect cannot fail with ErrConfig.
+func TestFailNextAfterRejectsConfigErrors(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("no panic")
+		}
+	}()
+
+	New().FailNextAfter(ApplyPlan, &backend.Error{Op: "ApplyPlan", Kind: backend.ErrConfig, Err: errors.New("refused")})
+}

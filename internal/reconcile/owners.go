@@ -1,0 +1,226 @@
+package reconcile
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
+	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
+	"github.com/rfdrew/kopia-docker-watcher/internal/labels"
+)
+
+// parsed is a container with its labels read.
+type parsed struct {
+	container docker.Container
+	spec      labels.ContainerSpec
+	issues    labels.Issues
+	// paths are the source paths of the path label that are valid, in
+	// label order, each once.
+	paths []string
+	// badPaths are the label paths that make no source path, with why.
+	badPaths []pathError
+}
+
+type pathError struct {
+	path string
+	err  error
+}
+
+func (e pathError) String() string { return e.err.Error() }
+
+// parse reads the labels of c.
+func (r *Reconciler) parse(c docker.Container) parsed {
+	spec, issues := labels.Parse(c.Labels, labels.Options{Prefix: r.labelPrefix, Strict: r.strict})
+	pc := parsed{container: c, spec: spec, issues: issues}
+
+	for _, p := range spec.Paths {
+		sp, err := labels.SourcePath(r.hostPrefix, p)
+		if err != nil {
+			pc.badPaths = append(pc.badPaths, pathError{path: p, err: err})
+			continue
+		}
+
+		if !slices.Contains(pc.paths, sp) {
+			pc.paths = append(pc.paths, sp)
+		}
+	}
+
+	return pc
+}
+
+// valid reports whether the labels can be applied.
+func (pc parsed) valid() bool { return !pc.issues.HasErrors() }
+
+// patch returns the policy fields the labels set.
+func (pc parsed) patch() backend.PolicyPatch {
+	return backend.PolicyPatch{
+		Scheduling: backend.SchedulingPatch{Cron: slices.Clone(pc.spec.Policy.Scheduling.Cron)},
+	}
+}
+
+// owner is a container that uses a path.
+type owner struct {
+	name  string
+	state docker.State
+	// valid reports whether its labels can be applied; patch is only set
+	// then.
+	valid  bool
+	patch  backend.PolicyPatch
+	issues labels.Issues
+}
+
+// owners returns the containers that back up path p, stopped ones
+// included, sorted by name.
+func (r *Reconciler) owners(p string, containers []docker.Container) []owner {
+	var out []owner
+
+	for _, c := range containers {
+		pc := r.parse(c)
+		if !pc.spec.Enable || !slices.Contains(pc.paths, p) {
+			continue
+		}
+
+		o := owner{name: c.Name, state: c.State, valid: pc.valid(), issues: pc.issues}
+		if o.valid {
+			o.patch = pc.patch()
+		}
+
+		out = append(out, o)
+	}
+
+	slices.SortFunc(out, func(a, b owner) int { return strings.Compare(a.name, b.name) })
+
+	return out
+}
+
+// ownerNames returns the names of owners in their order.
+func ownerNames(owners []owner) []string {
+	names := make([]string, len(owners))
+	for i, o := range owners {
+		names[i] = o.name
+	}
+
+	return names
+}
+
+// anyRunning reports whether an owner counts as running: a crash-looping
+// owner, restarting between its runs, does.
+func anyRunning(owners []owner) bool {
+	return slices.ContainsFunc(owners, func(o owner) bool { return o.state.Running() })
+}
+
+// anyRestarting reports whether an owner is restarting, which can end in
+// exited without an event.
+func anyRestarting(owners []owner) bool {
+	return slices.ContainsFunc(owners, func(o owner) bool { return o.state == docker.StateRestarting })
+}
+
+// policyOwners returns the owners whose labels decide the policy: the
+// running ones, or all of them when none runs. A stopped container keeps
+// the labels it was created with, so a leftover one (an old one-off of
+// docker compose run, the old version of a blue/green deploy) must not
+// hold back the labels of the containers that run.
+func policyOwners(owners []owner) []owner {
+	var running []owner
+
+	for _, o := range owners {
+		if o.state.Running() {
+			running = append(running, o)
+		}
+	}
+
+	if len(running) == 0 {
+		return owners
+	}
+
+	return running
+}
+
+// commonPatch returns the patch every owner asks for. It fails when an
+// owner's labels cannot be applied or when owners ask for different policy
+// fields; the error says which containers and fields.
+func commonPatch(owners []owner) (backend.PolicyPatch, error) {
+	var invalid []string
+
+	for _, o := range owners {
+		if !o.valid {
+			invalid = append(invalid, fmt.Sprintf("%s (%s)", o.name, errorIssues(o.issues)))
+		}
+	}
+
+	if len(invalid) > 0 {
+		return backend.PolicyPatch{}, &labelsError{msg: "labels of " + strings.Join(invalid, ", ") + " cannot be applied"}
+	}
+
+	// Group the owners by the patch they ask for, in name order.
+	type group struct {
+		patch backend.PolicyPatch
+		names []string
+	}
+
+	var groups []group
+
+	for _, o := range owners {
+		i := slices.IndexFunc(groups, func(g group) bool { return g.patch.Equal(o.patch) })
+		if i < 0 {
+			groups = append(groups, group{patch: o.patch})
+			i = len(groups) - 1
+		}
+
+		groups[i].names = append(groups[i].names, o.name)
+	}
+
+	if len(groups) == 1 {
+		return groups[0].patch, nil
+	}
+
+	parts := make([]string, len(groups))
+	for i, g := range groups {
+		parts[i] = strings.Join(g.names, ", ") + ": " + describePatch(g.patch)
+	}
+
+	return backend.PolicyPatch{}, &disagreeError{msg: "containers that share the path ask for different policies: " + strings.Join(parts, "; ")}
+}
+
+// errorIssues joins the issues that are errors.
+func errorIssues(issues labels.Issues) string {
+	var out []string
+
+	for _, is := range issues {
+		if is.Severity == labels.Error {
+			out = append(out, is.String())
+		}
+	}
+
+	return strings.Join(out, "; ")
+}
+
+// describePatch lists the fields of a patch, e.g. scheduling.cron=["0 * * * *"].
+func describePatch(p backend.PolicyPatch) string {
+	fields, err := p.Fields()
+	if err != nil {
+		return "invalid policy: " + err.Error()
+	}
+
+	if len(fields) == 0 {
+		return "no policy fields"
+	}
+
+	out := make([]string, len(fields))
+	for i, f := range fields {
+		out[i] = f.Name() + "=" + string(f.Value)
+	}
+
+	return strings.Join(out, ", ")
+}
+
+// labelsError: an owner's labels cannot be applied.
+type labelsError struct{ msg string }
+
+func (e *labelsError) Error() string { return e.msg }
+
+// disagreeError: owners of a path ask for different policy fields.
+type disagreeError struct{ msg string }
+
+func (e *disagreeError) Error() string { return e.msg }
