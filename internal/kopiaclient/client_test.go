@@ -181,8 +181,8 @@ func TestUIDisabled(t *testing.T) {
 		t.Fatalf("err = %v, want ErrUIDisabled", err)
 	}
 
-	if !strings.Contains(err.Error(), "--ui=false") {
-		t.Errorf("error does not mention --ui=false: %v", err)
+	if !strings.Contains(err.Error(), "--no-ui") {
+		t.Errorf("error does not mention --no-ui: %v", err)
 	}
 }
 

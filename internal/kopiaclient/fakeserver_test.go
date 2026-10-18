@@ -98,7 +98,7 @@ func (f *fakeKopia) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	uiDisabled := f.uiDisabled
 	f.mu.Unlock()
 
-	// With --ui=false neither the page nor the UI API is registered.
+	// With --no-ui neither the page nor the UI API is registered.
 	if uiDisabled {
 		http.NotFound(w, r)
 		return

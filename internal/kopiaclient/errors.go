@@ -23,8 +23,9 @@ var (
 	// ErrAccessDenied: 403. The UI API only admits the --server-username user.
 	ErrAccessDenied = errors.New("access denied: only the kopia server --server-username user may use the UI API")
 	// ErrUIDisabled: 404 without a JSON body. The UI page and the whole UI
-	// API are only registered when kopia server runs with --ui (the default).
-	ErrUIDisabled = errors.New("kopia server UI API is not available: is kopia server running with --ui=false, or is KOPIA_SERVER_URL wrong?")
+	// API are only registered when kopia server runs with --ui (the default);
+	// kopia's CLI turns it off with --no-ui.
+	ErrUIDisabled = errors.New("kopia server UI API is not available: is kopia server running with --no-ui, or is KOPIA_SERVER_URL wrong?")
 
 	ErrNotFound         = errors.New("not found")                // code NOT_FOUND, with status 400 or 404
 	ErrNotConnected     = errors.New("repository not connected") // code NOT_CONNECTED
