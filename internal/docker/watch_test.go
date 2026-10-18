@@ -158,8 +158,16 @@ func (r *watchRun) nextDelay(t *testing.T) time.Duration {
 
 var resync = Event{Kind: KindResync}
 
+// base keeps event times realistic, so a since before them stays after
+// 1970.
+const base = int64(1_760_000_000_000_000_000)
+
+func at(nano int64) time.Time {
+	return time.Unix(0, base+nano)
+}
+
 func ev(kind Kind, action, id string, nano int64) Event {
-	return Event{Kind: kind, Action: action, ContainerID: id, Name: id, Time: time.Unix(0, nano)}
+	return Event{Kind: kind, Action: action, ContainerID: id, Name: id, Time: at(nano)}
 }
 
 func TestWatcherFirstSubscriptionStartsWithResync(t *testing.T) {
@@ -209,15 +217,39 @@ func TestWatcherResumesSinceLastEvent(t *testing.T) {
 		t.Errorf("delay = %v, want %v", delay, DefaultMinDelay)
 	}
 
+	// The new subscription starts a little before the last event.
 	sub = e.nextSub(t)
-	if !sub.since.Equal(time.Unix(0, 200)) {
-		t.Errorf("since = %d, want 200", sub.since.UnixNano())
+	if want := at(200).Add(-replayOverlap); !sub.since.Equal(want) {
+		t.Errorf("since = %v, want %v", sub.since, want)
 	}
 
-	// The replay repeats b and c; their arrival proves nothing was lost,
-	// so there is no resync.
-	sub.send(t, b, c, d, f)
+	// The replay repeats a, b and c; their arrival proves nothing was
+	// lost, so there is no resync.
+	sub.send(t, a, b, c, d, f)
 	r.expect(t, d, f)
+}
+
+func TestWatcherDeliversEventMissedBeforeLast(t *testing.T) {
+	e := newFakeEngine()
+	r := startWatcher(t, e, time.Hour)
+
+	// The daemon stamped m before l and buffered it first, but published
+	// it after l; the stream broke in between.
+	m := ev(KindDied, "die", "m", 290)
+	l := ev(KindStarted, "start", "l", 300)
+	n := ev(KindStarted, "start", "m", 400)
+
+	sub := e.nextSub(t)
+	sub.send(t, l)
+	r.expect(t, resync, l)
+	sub.fail(io.EOF)
+	r.nextDelay(t)
+
+	// The replay brings both in buffer order: m is delivered, l proves
+	// that nothing else is missing.
+	sub = e.nextSub(t)
+	sub.send(t, m, l, n)
+	r.expect(t, m, n)
 }
 
 func TestWatcherResyncsAfterGap(t *testing.T) {
@@ -253,11 +285,118 @@ func TestWatcherResyncsWhenReconnectHasNoReplay(t *testing.T) {
 
 	// A restarted daemon replays nothing.
 	sub = e.nextSub(t)
-	if !sub.since.Equal(a.Time) {
-		t.Errorf("since = %v, want %v", sub.since, a.Time)
+	if want := a.Time.Add(-replayOverlap); !sub.since.Equal(want) {
+		t.Errorf("since = %v, want %v", sub.since, want)
 	}
 
 	r.expect(t, resync)
+}
+
+func TestWatcherResyncsOnce(t *testing.T) {
+	e := newFakeEngine()
+	r := startWatcher(t, e, 10*time.Millisecond)
+
+	a := ev(KindStarted, "start", "a", 100)
+
+	sub := e.nextSub(t)
+	sub.send(t, a)
+	r.expect(t, resync, a)
+
+	// The settle timer runs out later; that is no reason for another one.
+	select {
+	case got := <-r.got:
+		t.Fatalf("unexpected %v %s", got.Kind, got.Action)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestWatcherQuietSubscriptionsKeepTheShortDelay(t *testing.T) {
+	e := newFakeEngine()
+	r := startWatcher(t, e, 10*time.Millisecond)
+
+	// A proxy that cuts idle streams: each subscription stays up past the
+	// settle time without an event, so each counts as working.
+	for range 3 {
+		sub := e.nextSub(t)
+		r.expect(t, resync)
+		sub.fail(io.EOF)
+
+		if d := r.nextDelay(t); d != DefaultMinDelay {
+			t.Fatalf("delay = %v, want %v", d, DefaultMinDelay)
+		}
+	}
+}
+
+func TestWatcherDuplicateInOneSubscriptionProvesNothing(t *testing.T) {
+	e := newFakeEngine()
+	r := startWatcher(t, e, time.Hour)
+
+	a := ev(KindStarted, "start", "a", 0)
+	o := ev(KindStarted, "start", "o", -2*int64(time.Second))
+	n := ev(KindStarted, "start", "n", int64(time.Second))
+
+	sub := e.nextSub(t)
+	sub.send(t, a)
+	r.expect(t, resync, a)
+	sub.fail(io.EOF)
+	r.nextDelay(t)
+
+	// After a backward clock step the replay stops short of a and brings
+	// only o, which the daemon then also sends live: o was added just as
+	// the subscription began. Its second copy proves nothing.
+	sub = e.nextSub(t)
+	sub.send(t, o, o, n)
+	r.expect(t, o, resync, n)
+}
+
+func TestWatcherUnprovenSubscriptionLeavesResync(t *testing.T) {
+	e := newFakeEngine()
+	r := startWatcher(t, e, time.Hour)
+
+	a := ev(KindStarted, "start", "a", 0)
+	o := ev(KindStarted, "start", "o", -2*int64(time.Second))
+	n := ev(KindStarted, "start", "n", int64(time.Second))
+
+	sub := e.nextSub(t)
+	sub.send(t, a)
+	r.expect(t, resync, a)
+	sub.fail(io.EOF)
+	r.nextDelay(t)
+
+	// This subscription only brings o, older than a, and ends before it
+	// is clear whether anything was lost.
+	sub = e.nextSub(t)
+	sub.send(t, o)
+	r.expect(t, o)
+	sub.fail(io.EOF)
+	r.nextDelay(t)
+
+	// o coming again is no proof: the gap before it was never closed.
+	sub = e.nextSub(t)
+	sub.send(t, o, n)
+	r.expect(t, resync, n)
+}
+
+func TestWatcherKeepsReplayedEventsAfterClockStep(t *testing.T) {
+	e := newFakeEngine()
+	r := startWatcher(t, e, time.Hour)
+
+	// z was stamped before the daemon's clock stepped back by 9s, y after.
+	y := ev(KindDied, "die", "y", 0)
+	z := ev(KindStarted, "start", "z", 9*int64(time.Second))
+	w := ev(KindStarted, "start", "w", 10*int64(time.Second))
+
+	sub := e.nextSub(t)
+	sub.send(t, y)
+	r.expect(t, resync, y)
+	sub.fail(io.EOF)
+	r.nextDelay(t)
+
+	// The replay brings z first, far after y, and then y again, which must
+	// still be known as delivered.
+	sub = e.nextSub(t)
+	sub.send(t, z, y, w)
+	r.expect(t, resync, z, w)
 }
 
 func TestWatcherBackoff(t *testing.T) {
@@ -325,6 +464,12 @@ func TestWatcherStopsWhileWaiting(t *testing.T) {
 	w := NewWatcher(e, nil)
 	w.minDelay = time.Hour
 
+	waiting := make(chan struct{})
+	w.wait = func(ctx context.Context, d time.Duration) bool {
+		close(waiting)
+		return sleep(ctx, d)
+	}
+
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 
@@ -334,7 +479,14 @@ func TestWatcherStopsWhileWaiting(t *testing.T) {
 	}()
 
 	e.nextSub(t).fail(errors.New("connection refused"))
-	// Run is now in its hour-long wait.
+
+	select {
+	case <-waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not wait to reconnect")
+	}
+
+	// Run is in its hour-long wait now.
 	cancel()
 
 	select {
@@ -344,50 +496,142 @@ func TestWatcherStopsWhileWaiting(t *testing.T) {
 	}
 }
 
+func TestSleep(t *testing.T) {
+	if !sleep(t.Context(), time.Millisecond) {
+		t.Error("sleep reported a canceled context")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if sleep(ctx, time.Hour) {
+		t.Error("sleep did not stop on the canceled context")
+	}
+}
+
 func TestCursor(t *testing.T) {
 	var c cursor
 
 	a := ev(KindStarted, "start", "a", 100)
-	if c.delivered(a) || !c.since().IsZero() {
+	if c.delivered(a) || !c.later(a) || !c.since().IsZero() {
 		t.Fatal("empty cursor knows an event")
 	}
 
 	b := ev(KindDied, "die", "a", 200)
-	b2 := ev(KindChanged, "create", "b", 200)
+	b2 := ev(KindChanged, "create", "b", 200) // the same nanosecond as b
 
 	for _, e := range []Event{a, b, b2} {
 		c.record(e)
 	}
 
-	if !c.since().Equal(time.Unix(0, 200)) {
-		t.Errorf("since = %v", c.since())
+	if want := at(200).Add(-replayOverlap); !c.since().Equal(want) {
+		t.Errorf("since = %v, want %v", c.since(), want)
 	}
 
-	for _, e := range []Event{b, b2} {
+	for _, e := range []Event{a, b, b2} {
 		if !c.delivered(e) {
-			t.Errorf("%+v not delivered", e)
+			t.Errorf("%s %s at %d not delivered", e.Action, e.ContainerID, e.Time.UnixNano()-base)
 		}
 	}
 
-	// Only the last nanosecond is replayed, and only the same event is a
-	// repeat there.
-	for _, e := range []Event{a, ev(KindStarted, "start", "a", 200), ev(KindDied, "die", "a", 300)} {
+	// The same action of the same container at another time is another
+	// event.
+	for _, e := range []Event{ev(KindStarted, "start", "a", 200), ev(KindDied, "die", "a", 300)} {
 		if c.delivered(e) {
-			t.Errorf("%+v counted as delivered", e)
+			t.Errorf("%s %s at %d counted as delivered", e.Action, e.ContainerID, e.Time.UnixNano()-base)
 		}
 	}
 
-	// An event that trails the latest one does not move the cursor.
-	c.record(ev(KindStarted, "start", "c", 150))
-
-	if !c.since().Equal(time.Unix(0, 200)) || !c.delivered(b) {
-		t.Errorf("cursor moved back: since %v", c.since())
+	if c.later(ev(KindStarted, "start", "c", 150)) || c.later(ev(KindStarted, "start", "c", 200)) ||
+		!c.later(ev(KindStarted, "start", "c", 201)) {
+		t.Error("later is wrong")
 	}
 
-	c.record(ev(KindRemoved, "destroy", "a", 300))
+	// An event that trails the latest one within the overlap is
+	// remembered, and the cursor stays.
+	trail := ev(KindStarted, "start", "c", 150)
+	c.record(trail)
 
-	if c.delivered(b) || !c.delivered(ev(KindRemoved, "destroy", "a", 300)) {
-		t.Error("cursor did not move on")
+	if !c.delivered(trail) || !c.since().Equal(at(200).Add(-replayOverlap)) {
+		t.Errorf("trailing event: delivered %v, since %v", c.delivered(trail), c.since())
+	}
+
+	// Once the latest event is more than the overlap ahead, the older ones
+	// are forgotten: no replay brings them.
+	far := ev(KindRemoved, "destroy", "a", 201+int64(replayOverlap))
+	c.record(far)
+
+	for _, e := range []Event{a, b, b2, trail} {
+		if c.delivered(e) {
+			t.Errorf("%s %s at %d still remembered", e.Action, e.ContainerID, e.Time.UnixNano()-base)
+		}
+	}
+
+	if !c.delivered(far) {
+		t.Error("latest event forgotten")
+	}
+
+	old := ev(KindStarted, "start", "d", 150)
+	if c.record(old); c.delivered(old) {
+		t.Error("event older than the overlap remembered")
+	}
+}
+
+func TestCursorProof(t *testing.T) {
+	var c cursor
+
+	c.begin()
+
+	a := ev(KindStarted, "start", "a", 100)
+	c.record(a)
+
+	if c.proves(a) {
+		t.Error("an event proves its own subscription")
+	}
+
+	c.release()
+
+	if since := c.begin(); !since.Equal(a.Time.Add(-replayOverlap)) {
+		t.Errorf("since = %v", since)
+	}
+
+	if !c.proves(a) {
+		t.Error("an event of the previous subscription is no proof")
+	}
+
+	c.unproven = true
+	if c.proves(a) {
+		t.Error("proof accepted after a subscription left a gap open")
+	}
+}
+
+func TestCursorHoldsReplayWindow(t *testing.T) {
+	var c cursor
+
+	c.begin()
+
+	y := ev(KindDied, "die", "y", 0)
+	c.record(y)
+	c.release()
+
+	// During the next replay an event far after y must not push y out.
+	c.begin()
+
+	z := ev(KindStarted, "start", "z", 9*int64(time.Second))
+	c.record(z)
+
+	if !c.delivered(y) {
+		t.Fatal("y forgotten while the replay runs")
+	}
+
+	// Once the replay is over the window is the overlap again.
+	c.release()
+
+	w := ev(KindStarted, "start", "w", 10*int64(time.Second))
+	c.record(w)
+
+	if c.delivered(y) || !c.delivered(z) || !c.delivered(w) {
+		t.Errorf("after the replay: y %v, z %v, w %v", c.delivered(y), c.delivered(z), c.delivered(w))
 	}
 }
 
@@ -404,15 +648,15 @@ func TestWatcherWithDocker(t *testing.T) {
 			Type:     events.ContainerEventType,
 			Action:   action,
 			Actor:    events.Actor{ID: id, Attributes: map[string]string{"name": id, "kopia.enable": "true"}},
-			Time:     nano / int64(time.Second),
-			TimeNano: nano,
+			Time:     (base + nano) / int64(time.Second),
+			TimeNano: base + nano,
 		}
 	}
 
 	const (
-		t1 = 1_760_000_000_000_000_100
-		t2 = 1_760_000_000_000_000_200
-		t3 = 1_760_000_001_000_000_000
+		t1 = 100
+		t2 = 200
+		t3 = 1_000_000_000
 	)
 
 	// The first request fails with 500.
@@ -436,7 +680,8 @@ func TestWatcherWithDocker(t *testing.T) {
 	}
 
 	sub = f.nextSub(t)
-	if got := sub.query.Get("since"); got != "1760000000.000000200" {
+	// Five seconds before the last event, to the nanosecond.
+	if got := sub.query.Get("since"); got != "1759999995.000000200" {
 		t.Errorf("since = %q", got)
 	}
 

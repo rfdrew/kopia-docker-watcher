@@ -92,10 +92,12 @@ func TestEventFromDocker(t *testing.T) {
 		{"start", msg(events.ActionStart, attrs()), KindStarted},
 		{"die", msg(events.ActionDie, attrs("exitCode", "137", "execDuration", "12")), KindDied},
 		{"destroy", msg(events.ActionDestroy, attrs()), KindRemoved},
+		// docker stop of a container waiting for its restart policy sends
+		// stop without die.
+		{"stop", msg(events.ActionStop, attrs()), KindDied},
 
 		// kill is only a signal: docker kill -s HUP keeps the container running.
 		{"kill", msg(events.ActionKill, attrs("signal", "1")), 0},
-		{"stop", msg(events.ActionStop, attrs()), 0},
 		{"restart", msg(events.ActionRestart, attrs()), 0},
 		{"oom", msg(events.ActionOOM, attrs()), 0},
 		{"pause", msg(events.ActionPause, attrs()), 0},

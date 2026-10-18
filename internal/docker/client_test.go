@@ -197,7 +197,7 @@ func TestEventsQuery(t *testing.T) {
 
 	want := map[string]map[string]bool{
 		"type":  {"container": true},
-		"event": {"create": true, "start": true, "die": true, "destroy": true, "rename": true},
+		"event": {"create": true, "start": true, "die": true, "stop": true, "destroy": true, "rename": true},
 	}
 	if !reflect.DeepEqual(filters, want) {
 		t.Errorf("filters = %v, want %v", filters, want)

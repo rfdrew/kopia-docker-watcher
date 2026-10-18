@@ -21,7 +21,8 @@ const testImage = "busybox:1.37"
 
 // TestIntegrationDocker drives a real Docker daemon, the one DOCKER_HOST
 // or the local socket points to: lifecycle events through Watcher, list
-// and inspect, a replay from since, kill -s HUP and a restart policy.
+// and inspect, a replay from since, kill -s HUP, and a restart policy with
+// a stop during the restart delay.
 func TestIntegrationDocker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
@@ -70,7 +71,8 @@ func TestIntegrationDocker(t *testing.T) {
 			t.Errorf("start event = %+v", started)
 		}
 
-		// A new subscription from the create event replays it first.
+		// A new subscription from just before the create event replays it
+		// first.
 		checkReplay(ctx, t, c, id, created)
 
 		ctr, err := c.Inspect(ctx, id)
@@ -87,7 +89,10 @@ func TestIntegrationDocker(t *testing.T) {
 			t.Errorf("mounts = %+v", ctr.Mounts)
 		}
 
-		// kill -s HUP is only a signal: no event, the container runs on.
+		// kill -s HUP only signals the process, and the container runs on.
+		// The daemon records a kill event, which the subscription leaves
+		// out. (It also marks the container as stopped by hand, which can
+		// switch off a restart policy; this container has none.)
 		if _, err := c.api.ContainerKill(ctx, id, client.ContainerKillOptions{Signal: "HUP"}); err != nil {
 			t.Fatal(err)
 		}
@@ -103,7 +108,17 @@ func TestIntegrationDocker(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		waitEvent(t, evs, id, KindDied)
+		// docker stop sends kill, which is left out, then die and stop in
+		// no fixed order: the stop waits only until the state changes,
+		// while die is recorded after the state is saved.
+		got := map[string]bool{}
+		for range 2 {
+			got[waitEvent(t, evs, id, KindDied).Action] = true
+		}
+
+		if !got["die"] || !got["stop"] {
+			t.Errorf("events after docker stop: %v, want die and stop", got)
+		}
 
 		ctr, err = c.Inspect(ctx, id)
 		if err != nil {
@@ -147,9 +162,11 @@ func TestIntegrationDocker(t *testing.T) {
 	})
 
 	t.Run("restart policy", func(t *testing.T) {
+		// A crash loop: the restart delay doubles from 100ms, so the
+		// container soon spends nearly all its time restarting.
 		id := createContainer(t, c, run+"-b", &container.Config{
 			Image:  testImage,
-			Cmd:    []string{"sh", "-c", "sleep 1; exit 3"},
+			Cmd:    []string{"sh", "-c", "exit 3"},
 			Labels: labels,
 		}, &container.HostConfig{RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyAlways}})
 
@@ -170,6 +187,26 @@ func TestIntegrationDocker(t *testing.T) {
 
 		if StoppedByDie(true, ctr.State) {
 			t.Errorf("state after die = %q, counted as stopped", ctr.State)
+		}
+
+		// docker stop during the restart delay: Docker cancels the restart
+		// and sends stop without die.
+		waitState(ctx, t, c, id, StateRestarting)
+
+		timeout := 1
+		if _, err := c.api.ContainerStop(ctx, id, client.ContainerStopOptions{Timeout: &timeout}); err != nil {
+			t.Fatal(err)
+		}
+
+		waitAction(t, evs, id, "stop")
+
+		ctr, err = c.Inspect(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if ctr.State != StateExited || !StoppedByDie(true, ctr.State) {
+			t.Errorf("after stop: state %q", ctr.State)
 		}
 	})
 }
@@ -222,6 +259,50 @@ func waitEvent(t *testing.T, evs <-chan Event, id string, kind Kind) Event {
 	}
 }
 
+// waitAction returns the first event of container id with the action,
+// skipping the container's other events.
+func waitAction(t *testing.T, evs <-chan Event, id, action string) Event {
+	t.Helper()
+
+	timeout := time.After(time.Minute)
+
+	for {
+		select {
+		case ev := <-evs:
+			if ev.ContainerID == id && ev.Action == action {
+				return ev
+			}
+		case <-timeout:
+			t.Fatalf("no %s event for %s", action, id)
+		}
+	}
+}
+
+// waitState polls until the container is in state.
+func waitState(ctx context.Context, t *testing.T, c *Client, id string, state State) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+
+	for {
+		ctr, err := c.Inspect(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if ctr.State == state {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			t.Fatalf("container %s stays %q, want %q", id, ctr.State, state)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 func noEvent(t *testing.T, evs <-chan Event, id string, d time.Duration) {
 	t.Helper()
 
@@ -239,15 +320,17 @@ func noEvent(t *testing.T, evs <-chan Event, id string, d time.Duration) {
 	}
 }
 
-// checkReplay subscribes from the time of from and expects it first among
-// the events of its container.
+// checkReplay subscribes from shortly before the time of from, as Watcher
+// does, and expects from first among the events of its container. From
+// its exact time the replay could stop short of it: the daemon's buffer is
+// not quite in time order.
 func checkReplay(ctx context.Context, t *testing.T, c *Client, id string, from Event) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	evs, errs := c.Events(ctx, from.Time)
+	evs, errs := c.Events(ctx, from.Time.Add(-replayOverlap))
 
 	for {
 		select {

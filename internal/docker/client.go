@@ -25,8 +25,9 @@ var _ Engine = (*Client)(nil)
 // DOCKER_API_VERSION, DOCKER_CERT_PATH and DOCKER_TLS_VERIFY. DOCKER_HOST
 // points it at a docker-socket-proxy, e.g. tcp://docker-socket-proxy:2375;
 // unset or empty, it means the local socket. Unless DOCKER_API_VERSION fixes
-// the API version, the client negotiates it with the daemon on the first
-// request, so both older and newer daemons work.
+// the API version, the client negotiates it down to the daemon's on the
+// first request, so any daemon from API 1.40 (Docker 19.03) on works; an
+// older one rejects every request.
 func New(userAgent string) (*Client, error) {
 	return newClient(client.FromEnv, client.WithUserAgent(userAgent))
 }
@@ -141,16 +142,19 @@ func (c *Client) Events(ctx context.Context, since time.Time) (<-chan Event, <-c
 	return out, errc
 }
 
-// eventKinds maps the container actions the watcher subscribes to. The rest
-// either come with one of these (kill, stop and oom with die, restart with
-// start) or change nothing that matters for backups (pause keeps the
-// container a running owner); exec and health_status events, which every
-// health check produces, are kept out by the daemon-side filter.
+// eventKinds maps the container actions the watcher subscribes to. stop
+// is among them because a container stopped while it waits for its restart
+// policy gets no die. The rest either come with one of these (kill and oom
+// before die, restart with start) or change nothing that matters for
+// backups (pause keeps the container a running owner); exec and
+// health_status events, which every health check produces, are kept out by
+// the daemon-side filter.
 var eventKinds = map[events.Action]Kind{
 	events.ActionCreate:  KindChanged,
 	events.ActionRename:  KindChanged,
 	events.ActionStart:   KindStarted,
 	events.ActionDie:     KindDied,
+	events.ActionStop:    KindDied,
 	events.ActionDestroy: KindRemoved,
 }
 
