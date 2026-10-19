@@ -54,6 +54,56 @@
 // logs and prints what it would do for every path, including the paths it
 // would not register and the passes that fail.
 //
+// # Snapshots
+//
+// After the policy, a pass over a source kopia server knows takes the
+// snapshots its containers ask for, one at most per pass, with
+// Backend.TriggerSnapshot. The labels of the container whose event it is
+// decide: a start asks for one if the snapshot-on-start label is true and
+// the container still runs; a stop if snapshot-on-stop is true and the
+// container has stopped or is gone (its labels come from the event then).
+// A die after which the container is restarting is no stop; the event is
+// kept until a pass sees the container run again or stay stopped, so a
+// crash loop takes no snapshots at its stops. The one-off containers of
+// docker compose run take none. A start or stop the watcher missed shows
+// in the pause: a pass that pauses a source the watcher had running, or
+// lifts its pause, decides as if the event had come. With
+// SnapshotOnWatcherStart the first full reconcile of Run makes up a start
+// event for every running container; without it, a restart of the
+// watcher takes no snapshots.
+//
+// The pause at a stop is applied first and does not wait for anything. A
+// start snapshot is not taken while one is pending or uploading, nor
+// before the container's min-interval has passed since the later of the
+// last snapshot's start and the watcher's last trigger, which counts a
+// snapshot that failed and saved nothing. A stop snapshot is taken
+// regardless: while one uploads, kopia server runs it after that one;
+// while one is pending, that one counts, since it reads the files after
+// the stop. A policy write can make kopia server start a missed scheduled
+// snapshot at once, so a pass that wrote the policy puts its start
+// snapshot off to a pass EventDelay later, which sees the status after the
+// write.
+//
+// Backend.WaitSnapshot follows each snapshot outside the passes, in a
+// goroutine of Run, so a snapshot that runs for hours holds up neither the
+// pause nor new labels. The wait is stored in the state with its ticket,
+// so it is followed again after a restart, and so is the result until a
+// pass has acted on it: logged it, described a saved snapshot, and taken
+// a lost one once more. Waits are taken up by the passes over their
+// source, so those of another kopia server identity are left alone.
+//
+// A snapshot is described by the description labels of the path's
+// containers, or their names, with their tags in brackets: kopia server
+// cannot set snapshot tags through its API. Besides the watcher's own
+// snapshots, each full reconcile describes the source's snapshots that
+// have no description and started after the mark in the state, scheduled
+// ones included; the mark starts at the source's last snapshot when the
+// watcher first manages it and moves past every snapshot described, so
+// snapshots taken before the watcher stay as they are.
+//
+// A backend that cannot do one of these yet (backend.ErrNotImplemented) is
+// reported once, and the rest goes on without it.
+//
 // # Errors
 //
 // A temporary error of kopia server or Docker retries the path with an
@@ -205,6 +255,12 @@ type Options struct {
 	// A canceled pass loses nothing, since the intent is stored before a
 	// policy is written, but the next start writes the policy again.
 	ShutdownGrace time.Duration
+
+	// SnapshotOnWatcherStart is SNAPSHOT_ON_WATCHER_START: the first full
+	// reconcile of Run takes a snapshot of every path with a running
+	// container that asks for one at its start, as far as the minimum
+	// interval allows.
+	SnapshotOnWatcherStart bool
 }
 
 // Reconciler reconciles source paths. Create it with New, start it with
@@ -228,6 +284,10 @@ type Reconciler struct {
 	eventDelay             time.Duration
 	restartRecheck         time.Duration
 	shutdownGrace          time.Duration
+	snapshotOnWatcherStart bool
+
+	// now is the clock of the snapshot steps; tests replace it.
+	now func() time.Time
 
 	queue   *queue
 	scan    chan struct{}
@@ -252,11 +312,29 @@ type Reconciler struct {
 	// scans counts full reconciles.
 	scans uint64
 
+	// runCtx is Run's context, which the snapshot waiters run on; nil
+	// before Run.
+	runCtx context.Context
+	// waiters counts the running snapshot waiters, waiting holds their
+	// keys.
+	waiters sync.WaitGroup
+	waiting map[waitKey]bool
+	// startScanned is set once the first full reconcile is queued.
+	startScanned bool
+	// deferred holds the paths whose start snapshot a pass put off until
+	// the next one; sweepDue those a full reconcile queued.
+	deferred map[string]bool
+	sweepDue map[string]bool
+	// warned holds the keys of the warnings logged once per process.
+	warned map[string]bool
+
 	// dockerTimeout bounds every container listing.
 	dockerTimeout time.Duration
 
 	// afterPass, if set, is called after every pass of Run; for tests.
 	afterPass func(path string, res passResult)
+	// afterWait, if set, is called after every snapshot waiter; for tests.
+	afterWait func(w state.SnapshotWait)
 }
 
 // labelReport is what was reported about a container's labels.
@@ -311,6 +389,7 @@ func New(opts Options) (*Reconciler, error) {
 		eventDelay:     orDefault(opts.EventDelay, DefaultEventDelay),
 		restartRecheck: orDefault(opts.RestartRecheck, DefaultRestartRecheck),
 		shutdownGrace:  max(opts.ShutdownGrace, 0),
+		now:            time.Now,
 		queue:          newQueue(),
 		scan:           make(chan struct{}, 1),
 		failures:       map[string]int{},
@@ -318,6 +397,12 @@ func New(opts Options) (*Reconciler, error) {
 		pending:        map[string][]docker.Event{},
 		reportedErrors: map[string]map[string]uint64{},
 		dockerTimeout:  dockerTimeout,
+		waiting:        map[waitKey]bool{},
+		warned:         map[string]bool{},
+		deferred:       map[string]bool{},
+		sweepDue:       map[string]bool{},
+
+		snapshotOnWatcherStart: opts.SnapshotOnWatcherStart,
 	}
 
 	if r.labelPrefix == "" {
@@ -352,13 +437,19 @@ func orDefault[T int | time.Duration](v, def T) T {
 // turns into ReconcileAll.
 //
 // When ctx is done, Run takes no more paths and gives the passes that are
-// running ShutdownGrace to finish. It returns once every goroutine it
-// started has returned; after that it calls neither the store nor the
-// backend, so the caller may close them. Run must be called once.
+// running ShutdownGrace to finish. The snapshot waiters stop at once; their
+// waits stay in the state for the next start. Run returns once every
+// goroutine it started has returned, the waiters after the passes; after
+// that it calls neither the store nor the backend, so the caller may close
+// them. Run must be called once.
 func (r *Reconciler) Run(ctx context.Context) {
 	if !r.running.CompareAndSwap(false, true) {
 		panic("reconcile: Run called twice or along with RunOnce")
 	}
+
+	r.mu.Lock()
+	r.runCtx = ctx
+	r.mu.Unlock()
 
 	// Passes run on their own context, canceled ShutdownGrace after ctx.
 	passCtx, cancelPasses := context.WithCancel(context.WithoutCancel(ctx))
@@ -379,6 +470,10 @@ func (r *Reconciler) Run(ctx context.Context) {
 	defer grace.Stop()
 
 	wg.Wait()
+
+	// The waiters run on ctx and stop at once; their waits stay in the
+	// state for the next start.
+	r.waiters.Wait()
 }
 
 // work takes paths until ctx is done and runs their passes with passCtx.
@@ -422,6 +517,10 @@ func (r *Reconciler) schedule(ctx context.Context, p string, res passResult) {
 	if res.retry {
 		r.log.Debug("retrying the path later", "path", p, "delay", delay.String())
 		r.queue.retryAfter(p, delay)
+	}
+
+	if res.recheck {
+		r.queue.addAfter(p, r.eventDelay)
 	}
 
 	// A pending retry comes first; it looks at the restarting owner too.
@@ -484,7 +583,7 @@ func (r *Reconciler) HandleEvent(ev docker.Event) {
 
 	r.mu.Lock()
 	for _, p := range pc.paths {
-		r.pending[p] = latest(append(r.pending[p], ev))
+		r.pending[p] = compact(append(r.pending[p], ev))
 	}
 	r.mu.Unlock()
 
@@ -514,7 +613,34 @@ func (r *Reconciler) restorePending(p string, evs []docker.Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.pending[p] = latest(append(slices.Clone(evs), r.pending[p]...))
+	r.pending[p] = compact(append(slices.Clone(evs), r.pending[p]...))
+}
+
+// takeFlags takes the flags kept for path p: whether a pass put its start
+// snapshot off, and whether a full reconcile queued it.
+func (r *Reconciler) takeFlags(p string) (deferred, sweep bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	deferred, sweep = r.deferred[p], r.sweepDue[p]
+	delete(r.deferred, p)
+	delete(r.sweepDue, p)
+
+	return deferred, sweep
+}
+
+// restoreFlags sets the flags of path p that are true.
+func (r *Reconciler) restoreFlags(p string, deferred, sweep bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if deferred {
+		r.deferred[p] = true
+	}
+
+	if sweep {
+		r.sweepDue[p] = true
+	}
 }
 
 // latest returns the last maxPending events of evs.

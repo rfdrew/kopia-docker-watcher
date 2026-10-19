@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"slices"
 	"testing"
+	"time"
 )
 
 // spec returns Default() changed by mod.
@@ -44,6 +45,7 @@ func checkParse(t *testing.T, labels map[string]string, opts Options, want Conta
 func TestDefault(t *testing.T) {
 	want := ContainerSpec{
 		SnapshotOnStart: true,
+		MinInterval:     10 * time.Minute,
 		Policy:          Policy{Scheduling: Scheduling{Cron: []string{"0 * * * *"}}},
 	}
 
@@ -106,6 +108,7 @@ func TestParse(t *testing.T) {
 				Paths:           []string{"/data", "/logs"},
 				SnapshotOnStart: false,
 				SnapshotOnStop:  true,
+				MinInterval:     DefaultMinInterval,
 				Description:     "my app",
 				Tags:            []Tag{{"env", "prod"}, {"app", "myapp"}},
 				Policy:          Policy{Scheduling: Scheduling{Cron: []string{"30 2 * * *"}}},
@@ -344,6 +347,35 @@ func TestParseTags(t *testing.T) {
 				spec(func(s *ContainerSpec) { s.Tags = tt.want }), tt.issues)
 		})
 	}
+}
+
+func TestParseMinInterval(t *testing.T) {
+	tests := []struct {
+		value  string
+		want   time.Duration
+		issues []string
+	}{
+		{"10m", 10 * time.Minute, nil},
+		{" 1h30m ", 90 * time.Minute, nil},
+		{"0", 0, nil},
+		{"0s", 0, nil},
+		{"", DefaultMinInterval, []string{"warning kopia.min-interval: empty value, the default 10m0s is used; " + minIntervalHint}},
+		{"10", DefaultMinInterval, []string{`warning kopia.min-interval: invalid duration "10", the default 10m0s is used; ` + minIntervalHint}},
+		{"1d", DefaultMinInterval, []string{`warning kopia.min-interval: invalid duration "1d", the default 10m0s is used; ` + minIntervalHint}},
+		{"-5m", DefaultMinInterval, []string{`warning kopia.min-interval: negative duration "-5m", the default 10m0s is used; ` + minIntervalHint}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			checkParse(t, map[string]string{"kopia.min-interval": tt.value}, Options{},
+				spec(func(s *ContainerSpec) { s.MinInterval = tt.want }), tt.issues)
+		})
+	}
+
+	t.Run("strict", func(t *testing.T) {
+		checkParse(t, map[string]string{"kopia.min-interval": "1d"}, Options{Strict: true}, Default(),
+			[]string{`error kopia.min-interval: invalid duration "1d"; ` + minIntervalHint})
+	})
 }
 
 func TestParseUnknownKeys(t *testing.T) {

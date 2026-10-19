@@ -6,9 +6,12 @@
 // container labels. For every source the watcher has reconciled, the store
 // keeps a Record, which holds backend.Applied: the policy patch last
 // applied, the scheduling section a pause replaced, an apply in progress,
-// the fingerprint of the stored policy. A record stays until it is
-// deleted, also when it holds nothing else, so the store lists every
-// source the watcher manages.
+// the fingerprint of the stored policy. It also holds what the snapshot
+// lifecycle needs across restarts: the snapshots the watcher queued and
+// still waits for, when it last queued one, and the mark after which
+// snapshots get a description. A record stays until it is deleted, also
+// when it holds nothing else, so the store lists every source the watcher
+// manages.
 //
 // # Using the store
 //
@@ -38,7 +41,11 @@
 //	      "source": {"host": "kopia", "userName": "root", "path": "/data/app"},
 //	      "patch": {"scheduling": {"cron": ["0 * * * *"]}},
 //	      "savedScheduling": {"cron": ["0 * * * *"], "runMissed": true},
-//	      "storedHash": "sha256:…"
+//	      "storedHash": "sha256:…",
+//	      "snapshotWaits": [{"ticket": {…}, "stop": true, "reason": "stop of app", "description": "app"}],
+//	      "lastTriggered": "2026-10-18T12:00:00Z",
+//	      "annotateAfter": "2026-10-18T11:00:00Z",
+//	      "stopAbsorbedAt": "2026-10-18T12:30:00Z"
 //	    }
 //	  ]
 //	}
@@ -75,11 +82,9 @@
 // goes into a new top-level field of the file. Fields are never renamed or
 // given a new meaning in place; Version is raised, with a migration in
 // load, only for a change an older watcher would misread. Planned
-// additions: pending snapshot waits and the annotation mark per source
-// (a record from before the mark existed has none, which must not be read
-// as "annotate everything"), owners and the cleanup mode per source, and
-// containers the watcher stopped itself. Records of another kopia server
-// identity than the current one must never be cleaned up automatically.
+// additions: owners and the cleanup mode per source, and containers the
+// watcher stopped itself. Records of another kopia server identity than
+// the current one must never be cleaned up automatically.
 package state
 
 import (
@@ -140,9 +145,91 @@ type Record struct {
 	// A field added here must not be named "source", which holds the
 	// entry's source, nor share a JSON name with a field of
 	// backend.Applied: encoding/json would quietly drop one of the two.
+
+	// SnapshotWaits are the snapshots the watcher queued and has not
+	// finished with yet, in the order they were queued: those it still
+	// waits for, and those whose result a pass has yet to act on. After a
+	// restart the watcher waits for the first again and acts on the
+	// others. The reconciler skips a wait it cannot use and leaves it as
+	// it is, and a wait that cannot be decoded is dropped on its own, so
+	// a wait never makes the entry unreadable.
+	SnapshotWaits []SnapshotWait `json:"snapshotWaits,omitempty"`
+
+	// LastTriggered is when the watcher last queued a snapshot of the
+	// source; zero if never. The minimum interval between snapshots counts
+	// from it as well as from the last saved snapshot: a snapshot that
+	// fails saves none.
+	LastTriggered time.Time `json:"lastTriggered,omitzero"`
+
+	// AnnotateAfter is the mark of the source's snapshot descriptions: a
+	// snapshot that started after it and has no description gets the one
+	// of the path's containers, and the mark then moves past it. It is set
+	// to the start of the source's last snapshot when the watcher first
+	// manages the source, so the snapshots taken before stay as they are,
+	// or to the time the watcher looked if kopia server reported none. Nil
+	// means no mark yet, as in a record written before marks existed, and
+	// is never read as "annotate everything".
+	AnnotateAfter *time.Time `json:"annotateAfter,omitempty"`
+
+	// StopAbsorbedAt is when a container stopped while a snapshot of the
+	// source was pending, which then counts as the stop snapshot; zero if
+	// none. If kopia server loses that run, the stop snapshot is taken
+	// once more. StopAbsorbedDescription is the description worked out at
+	// the stop, for that snapshot. StopAbsorbedLastStart is the start of
+	// the source's last snapshot at the stop by kopia server's clock: only
+	// a snapshot that started later can be the pending one.
+	StopAbsorbedAt          time.Time `json:"stopAbsorbedAt,omitzero"`
+	StopAbsorbedDescription string    `json:"stopAbsorbedDescription,omitempty"`
+	StopAbsorbedLastStart   time.Time `json:"stopAbsorbedLastStart,omitzero"`
 }
 
-// Validate reports whether r can be stored.
+// SnapshotWait is a snapshot the watcher queued and has not finished with.
+//
+// Its fields are closed: an older watcher that rewrites the record drops
+// fields it does not know inside a wait, so new data about a wait goes
+// into a new field of the entry, keyed by the wait's ID.
+type SnapshotWait struct {
+	// ID tells the waits of a source apart.
+	ID string `json:"id"`
+	// Ticket follows the snapshot, as WaitSnapshot last updated it. Its
+	// JSON form is part of STATE_FILE.
+	Ticket backend.SnapshotTicket `json:"ticket"`
+	// Stop marks a snapshot taken because a container stopped.
+	Stop bool `json:"stop,omitempty"`
+	// StopAt is when the last stop that this queued snapshot also counts
+	// for happened; zero if none. Only a snapshot that started after it
+	// counts for that stop.
+	StopAt time.Time `json:"stopAt,omitzero"`
+	// Reason says for the log why it was taken, e.g. "start of app".
+	Reason string `json:"reason,omitempty"`
+	// Description is what the snapshot is described as once it is saved,
+	// worked out when it was queued: by the time it ends, the containers
+	// may be gone.
+	Description string `json:"description,omitempty"`
+	// Retried marks a snapshot taken once more because the first one was
+	// lost; it is not taken a third time.
+	Retried bool `json:"retried,omitempty"`
+	// Logged marks a result that was logged already, for a wait a pass
+	// could not finish with yet.
+	Logged bool `json:"logged,omitempty"`
+	// Result is how the snapshot ended, once the watcher knows; nil while
+	// it waits. A pass acts on it and then removes the wait.
+	Result *SnapshotResult `json:"result,omitempty"`
+}
+
+// SnapshotResult is how a snapshot the watcher waited for ended.
+type SnapshotResult struct {
+	Outcome backend.SnapshotOutcome `json:"outcome"`
+	TaskID  string                  `json:"taskID,omitempty"`
+	// Error is the error message of a failed snapshot.
+	Error string `json:"error,omitempty"`
+	// SnapshotStart is the start of the snapshot the task saved; zero if
+	// it saved none.
+	SnapshotStart time.Time `json:"snapshotStart,omitzero"`
+}
+
+// Validate reports whether r can be stored. The snapshot waits are not
+// checked: the reconciler skips those it cannot use.
 func (r Record) Validate() error {
 	return r.Applied.Validate()
 }
@@ -503,7 +590,7 @@ func (s *Store) load() error {
 	s.records, s.extra = records, extra
 
 	if len(problems) > 0 {
-		return s.keepCorrupt(data, "state file has entries that cannot be read; they are dropped", problems)
+		return s.keepCorrupt(data, "state file has entries that cannot be read in full; what cannot be read is dropped", problems)
 	}
 
 	return nil
@@ -639,11 +726,15 @@ func decode(data []byte) (records map[backend.Source]entry, extra map[string]jso
 	records = make(map[backend.Source]entry, len(raws))
 
 	for i, raw := range raws {
-		src, e, err := decodeEntry(raw)
+		src, e, note, err := decodeEntry(raw)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("entry %d: %v", i, err))
 
 			continue
+		}
+
+		if note != "" {
+			problems = append(problems, fmt.Sprintf("entry %d: %s: %s", i, src, note))
 		}
 
 		if _, dup := records[src]; dup {
@@ -667,28 +758,70 @@ func cmpRaw(raw json.RawMessage) json.RawMessage {
 	return raw
 }
 
-func decodeEntry(raw json.RawMessage) (backend.Source, entry, error) {
+// snapshotKeys are the keys of an entry that hold the snapshot lifecycle
+// rather than the policy. An entry whose snapshot fields cannot be decoded
+// keeps its policy fields.
+var snapshotKeys = func() map[string]bool {
+	keys := jsonKeys(reflect.TypeFor[Record]())
+	for k := range jsonKeys(reflect.TypeFor[backend.Applied]()) {
+		delete(keys, k)
+	}
+
+	return keys
+}()
+
+// decodeEntry decodes one entry of the file. note tells what of it could
+// not be read and was dropped: snapshot waits that do not decode, or all
+// the snapshot fields if they keep the entry from decoding.
+func decodeEntry(raw json.RawMessage) (src backend.Source, e entry, note string, err error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
-		return backend.Source{}, entry{}, fmt.Errorf("not a JSON object: %w", err)
+		return backend.Source{}, entry{}, "", fmt.Errorf("not a JSON object: %w", err)
 	}
 
 	if fields == nil {
-		return backend.Source{}, entry{}, errors.New("not a JSON object: null")
+		return backend.Source{}, entry{}, "", errors.New("not a JSON object: null")
 	}
 
-	var src backend.Source
 	if err := json.Unmarshal(cmpRaw(fields["source"]), &src); err != nil {
-		return backend.Source{}, entry{}, fmt.Errorf("source: %w", err)
+		return backend.Source{}, entry{}, "", fmt.Errorf("source: %w", err)
 	}
 
 	if err := src.Validate(); err != nil {
-		return backend.Source{}, entry{}, err
+		return backend.Source{}, entry{}, "", err
 	}
 
-	var r Record
-	if err := json.Unmarshal(raw, &r); err != nil {
-		return src, entry{}, fmt.Errorf("%s: %w", src, err)
+	var (
+		notes []string
+		r     Record
+	)
+
+	// An entry is decoded as it is, unless a snapshot wait or another
+	// snapshot field keeps it from decoding: then that part is dropped.
+	dropped := dropBadWaits(fields)
+	if dropped > 0 {
+		notes = append(notes, fmt.Sprintf("%d snapshot waits cannot be decoded", dropped))
+	}
+
+	err = json.Unmarshal(raw, &r)
+	if dropped > 0 {
+		r = Record{}
+		err = unmarshalFields(fields, &r)
+	}
+
+	if err != nil {
+		for k := range fields {
+			if isSnapshotKey(k) {
+				delete(fields, k)
+			}
+		}
+
+		r = Record{}
+		if err2 := unmarshalFields(fields, &r); err2 != nil {
+			return src, entry{}, "", fmt.Errorf("%s: %w", src, err2)
+		}
+
+		notes = append(notes, "the snapshot state cannot be decoded: "+err.Error())
 	}
 
 	// A null value means the same as a missing one.
@@ -700,15 +833,15 @@ func decodeEntry(raw json.RawMessage) (backend.Source, entry, error) {
 	}
 
 	if err := r.Validate(); err != nil {
-		return src, entry{}, fmt.Errorf("%s: %w", src, err)
+		return src, entry{}, "", fmt.Errorf("%s: %w", src, err)
 	}
 
 	enc, err := encodeRecord(r)
 	if err != nil {
-		return src, entry{}, fmt.Errorf("%s: %w", src, err)
+		return src, entry{}, "", fmt.Errorf("%s: %w", src, err)
 	}
 
-	e := entry{record: enc}
+	e = entry{record: enc}
 
 	for k, v := range fields {
 		if isKnownEntryKey(k) {
@@ -722,7 +855,69 @@ func decodeEntry(raw json.RawMessage) (backend.Source, entry, error) {
 		e.extra[k] = v
 	}
 
-	return src, e, nil
+	return src, e, strings.Join(notes, "; "), nil
+}
+
+// dropBadWaits removes from the snapshot waits of fields, under any key
+// encoding/json reads them from, the waits that do not decode, all of them
+// if the value is no list, and returns how many.
+func dropBadWaits(fields map[string]json.RawMessage) int {
+	dropped := 0
+
+	for k, raw := range fields {
+		if !strings.EqualFold(k, "snapshotWaits") {
+			continue
+		}
+
+		var list []json.RawMessage
+		if err := json.Unmarshal(raw, &list); err != nil {
+			delete(fields, k)
+			dropped++
+
+			continue
+		}
+
+		var (
+			keep []json.RawMessage
+			bad  int
+		)
+
+		for _, item := range list {
+			var w SnapshotWait
+			if json.Unmarshal(item, &w) != nil {
+				bad++
+				continue
+			}
+
+			keep = append(keep, item)
+		}
+
+		if bad > 0 {
+			fields[k] = mustEncode(keep)
+			dropped += bad
+		}
+	}
+
+	return dropped
+}
+
+// unmarshalFields decodes the fields of an entry into r. The fields are
+// encoded again without escaping <, > and &, so raw values decode as
+// they were.
+func unmarshalFields(fields map[string]json.RawMessage, r *Record) error {
+	return json.Unmarshal(mustEncode(fields), r)
+}
+
+// isSnapshotKey reports whether encoding/json decodes key into a snapshot
+// field of a Record.
+func isSnapshotKey(key string) bool {
+	for k := range snapshotKeys {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // isKnownEntryKey reports whether encoding/json decodes key into a field of

@@ -566,6 +566,9 @@ func TestWrongIdentityEverywhere(t *testing.T) {
 	check("WaitSnapshot", err)
 	check("AnnotateSnapshot", f.AnnotateSnapshot(ctx, src, time.Unix(1, 0), "x", nil))
 
+	_, err = f.ListSnapshots(ctx, src)
+	check("ListSnapshots", err)
+
 	if got, err := f.ListSources(ctx); err != nil || len(got) != 0 {
 		t.Errorf("ListSources of the new identity = %v, %v", got, err)
 	}
@@ -845,6 +848,124 @@ func TestAnnotateEndedFirst(t *testing.T) {
 
 	if snaps := f.Snapshots(src); snaps[1].Description != "app" || snaps[0].Description != "" {
 		t.Errorf("snapshots = %+v", snaps)
+	}
+}
+
+func TestListSnapshots(t *testing.T) {
+	f := New()
+	src := f.Source("/data/app")
+	t0 := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+
+	if got, err := f.ListSnapshots(ctx, src); err != nil || got != nil || f.Known(src) {
+		t.Errorf("snapshots of an unknown source = %v, %v", got, err)
+	}
+
+	f.AddSnapshot(src, backend.SnapshotInfo{StartTime: t0.Add(time.Hour), Description: "later"})
+	f.AddSnapshot(src, backend.SnapshotInfo{StartTime: t0, Incomplete: "checkpoint"})
+	f.AddSnapshot(src, backend.SnapshotInfo{StartTime: t0, EndTime: t0.Add(time.Minute)})
+
+	got, err := f.ListSnapshots(ctx, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []backend.SnapshotInfo{
+		{StartTime: t0, Incomplete: "checkpoint"},
+		{StartTime: t0, EndTime: t0.Add(time.Minute)},
+		{StartTime: t0.Add(time.Hour), Description: "later"},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("snapshots = %+v, want %+v", got, want)
+	}
+
+	// The listing is a copy.
+	got[0].Description = "changed"
+
+	if f.Snapshots(src)[1].Description != "" {
+		t.Error("ListSnapshots shares memory with the fake")
+	}
+
+	boom := &backend.Error{Op: "ListSnapshots", Kind: backend.ErrTemporary, Err: errors.New("boom")}
+	f.FailNextAfter(ListSnapshots, boom)
+
+	if got, err := f.ListSnapshots(ctx, src); !errors.Is(err, boom) || got != nil {
+		t.Errorf("failed listing = %v, %v", got, err)
+	}
+
+	if calls := f.CallsFor(src, ListSnapshots); len(calls) != 3 {
+		t.Errorf("calls = %+v", calls)
+	}
+}
+
+func TestHoldSnapshots(t *testing.T) {
+	f := New()
+	src := f.Source("/data/app")
+	t0 := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	f.SetClock(func() time.Time { return t0 })
+	f.AddSource(src)
+	f.HoldSnapshots(src)
+	f.HoldSnapshots(src) // twice is once
+
+	ticket, err := f.TriggerSnapshot(ctx, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A held call saves the task, then returns when its context ends.
+	saved := make(chan backend.SnapshotTicket, 4)
+	waitCtx, cancel := context.WithCancel(ctx)
+	errs := make(chan error, 1)
+
+	go func() {
+		_, err := f.WaitSnapshot(waitCtx, ticket, func(t backend.SnapshotTicket) { saved <- t })
+		errs <- err
+	}()
+
+	held := <-saved
+	if held.TaskID == "" || held.TaskDescription != "root@kopia:/data/app at 2026-10-18T12:00:00Z" {
+		t.Errorf("saved ticket = %+v", held)
+	}
+
+	cancel()
+
+	if err := <-errs; !errors.Is(err, context.Canceled) || backend.IsTemporary(err) || backend.IsConfig(err) {
+		t.Errorf("held call after cancel: %v", err)
+	}
+
+	if len(f.Snapshots(src)) != 0 {
+		t.Error("a canceled wait saved a snapshot")
+	}
+
+	// With the saved ticket, a call holds without saving again, and ends
+	// with the task once released.
+	res := make(chan backend.SnapshotResult, 1)
+
+	go func() {
+		r, err := f.WaitSnapshot(ctx, held, func(backend.SnapshotTicket) { t.Error("saved again") })
+		if err != nil {
+			t.Error(err)
+		}
+
+		res <- r
+	}()
+
+	select {
+	case <-res:
+		t.Fatal("the call did not hold")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	f.ReleaseSnapshots(src)
+	f.ReleaseSnapshots(src) // twice is once
+
+	if r := <-res; r.Outcome != backend.SnapshotSucceeded || r.TaskID != held.TaskID {
+		t.Errorf("result = %+v", r)
+	}
+
+	// Released: later calls do not hold.
+	if r, err := f.WaitSnapshot(ctx, ticket, nil); err != nil || r.Outcome != backend.SnapshotSucceeded {
+		t.Errorf("after release: %+v, %v", r, err)
 	}
 }
 

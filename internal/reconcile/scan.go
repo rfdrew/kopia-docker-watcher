@@ -23,8 +23,26 @@ func (r *Reconciler) scanLoop(ctx context.Context) {
 		}
 
 		for attempt := 1; ; attempt++ {
-			paths, err := r.paths(ctx)
+			paths, containers, err := r.listPaths(ctx)
 			if err == nil {
+				r.mu.Lock()
+
+				// The first full reconcile is the one of the watcher's
+				// start.
+				if !r.startScanned {
+					r.startScanned = true
+
+					if r.snapshotOnWatcherStart {
+						r.watcherStart(containers)
+					}
+				}
+
+				for _, p := range paths {
+					r.sweepDue[p] = true
+				}
+
+				r.mu.Unlock()
+
 				for _, p := range paths {
 					r.queue.addUnlessRetrying(p)
 				}
@@ -88,6 +106,13 @@ func (r *Reconciler) RunOnce(ctx context.Context) error {
 // state. It reports label problems on the way, once per container and set
 // of labels.
 func (r *Reconciler) paths(ctx context.Context) ([]string, error) {
+	paths, _, err := r.listPaths(ctx)
+
+	return paths, err
+}
+
+// listPaths is paths that returns the containers it listed too.
+func (r *Reconciler) listPaths(ctx context.Context) ([]string, []docker.Container, error) {
 	// Reports made after the listing, by events, are newer than it.
 	r.mu.Lock()
 	listed := r.reports
@@ -95,7 +120,7 @@ func (r *Reconciler) paths(ctx context.Context) ([]string, error) {
 
 	containers, err := r.containers(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	r.forgetReported()
@@ -137,7 +162,7 @@ func (r *Reconciler) paths(ctx context.Context) ([]string, error) {
 
 	slices.Sort(out)
 
-	return out, nil
+	return out, containers, nil
 }
 
 // reportLabels logs the label problems of a container that has labels

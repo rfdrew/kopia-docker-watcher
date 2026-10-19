@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
@@ -24,6 +25,11 @@ type passResult struct {
 	retry bool
 	// restarting reports an owner that was restarting.
 	restarting bool
+	// recheck asks for another pass after EventDelay, which decides on the
+	// start snapshot this pass put off.
+	recheck bool
+	// sweep reports a pass of a full reconcile.
+	sweep bool
 	// problems were reported on the way; the pass went on without them.
 	problems []error
 }
@@ -35,10 +41,28 @@ type pass struct {
 	ctx  context.Context
 	path string
 	log  *slog.Logger
+	// started is when the pass began.
+	started time.Time
 
 	// events are the Docker events that queued the path since its last
-	// pass.
+	// pass; keep are those to put back after the pass, as a die of a
+	// container that is restarting.
 	events []docker.Event
+	keep   []docker.Event
+
+	// containers is the listing of the pass.
+	containers []docker.Container
+
+	// described are the start times of the snapshots the pass described;
+	// annotateAfter is the description mark of its source.
+	described     []time.Time
+	annotateAfter *time.Time
+
+	// wrote reports that the pass wrote the policy. deferred reports that
+	// an earlier pass put the start snapshot off already, deferStart that
+	// this one does. sweepDue reports a pass of a full reconcile, which
+	// describes the snapshots that have no description.
+	wrote, deferred, deferStart, sweepDue bool
 
 	src backend.Source
 	// last is what the state says was applied to the source; had reports
@@ -66,11 +90,13 @@ type pass struct {
 
 // reconcile runs one pass over path p.
 func (r *Reconciler) reconcile(ctx context.Context, p string) passResult {
-	ps := &pass{Reconciler: r, ctx: ctx, path: p, log: r.log.With("path", p), events: r.takePending(p)}
+	ps := &pass{Reconciler: r, ctx: ctx, path: p, log: r.log.With("path", p), started: r.now(), events: r.takePending(p)}
+	ps.deferred, ps.sweepDue = r.takeFlags(p)
 	ps.log.Debug("reconciling the path", "events", eventNames(ps.events))
 
 	err := ps.run()
-	res := passResult{restarting: anyRestarting(ps.owners), problems: ps.problems}
+	res := passResult{restarting: anyRestarting(ps.owners), problems: ps.problems, recheck: err == nil && ps.deferStart,
+		sweep: ps.sweepDue}
 
 	switch {
 	case err == nil:
@@ -86,6 +112,10 @@ func (r *Reconciler) reconcile(ctx context.Context, p string) passResult {
 
 	if err != nil {
 		r.restorePending(p, ps.events)
+		r.restoreFlags(p, ps.deferred, ps.sweepDue)
+	} else {
+		r.restorePending(p, ps.keep)
+		r.restoreFlags(p, ps.deferStart, false)
 	}
 
 	// A temporary error says nothing about whether the problems of the
@@ -193,11 +223,12 @@ func (ps *pass) run() error {
 
 	ps.src = src
 
-	containers, err := ps.containers(ps.ctx)
+	containers, err := ps.Reconciler.containers(ps.ctx)
 	if err != nil {
 		return &dockerError{err: err}
 	}
 
+	ps.containers = containers
 	ps.owners = ps.Reconciler.owners(ps.path, containers)
 
 	rec, had := ps.store.Get(src)
@@ -244,7 +275,11 @@ func (ps *pass) run() error {
 		return nil
 	}
 
-	return ps.apply(plan)
+	if err := ps.apply(plan); err != nil {
+		return err
+	}
+
+	return ps.snapshots()
 }
 
 // desire works out the desired state of the source from its owners. It
@@ -407,6 +442,8 @@ func (ps *pass) apply(plan backend.Plan) error {
 		}
 	}
 
+	ps.wrote = true
+
 	if err := ps.storeApplied(applied); err != nil {
 		return err
 	}
@@ -430,10 +467,13 @@ func (ps *pass) storeApplied(a backend.Applied) error {
 // restoreRecord puts the source's record back as the pass found it, after
 // a registration that kopia server refused. A record that holds nothing
 // confirmed, only the intent of an earlier registration that never went
-// through, is removed instead.
+// through, is removed instead, unless it holds the state of snapshots.
 func (ps *pass) restoreRecord() error {
+	rec, _ := ps.store.Get(ps.src)
+	snapshots := len(rec.SnapshotWaits) > 0 || !rec.LastTriggered.IsZero() || rec.AnnotateAfter != nil
+
 	confirmed := !ps.last.Patch.IsZero() || ps.last.SavedScheduling != nil || ps.last.StoredHash != ""
-	if ps.had && confirmed {
+	if ps.had && (confirmed || snapshots) {
 		return ps.storeApplied(ps.last)
 	}
 

@@ -261,6 +261,7 @@ kopia.path               /data/, logs/./
 kopia.schedule           0 2 * * *
 kopia.snapshot-on-start  true
 kopia.snapshot-on-stop   false
+kopia.min-interval       10m0s
 kopia.description        (container name)
 kopia.tags               (none)
 
@@ -467,6 +468,7 @@ kopia.path               /srv/db
 kopia.schedule           0 * * * *
 kopia.snapshot-on-start  true
 kopia.snapshot-on-stop   false
+kopia.min-interval       10m0s
 kopia.description        (container name)
 kopia.tags               (none)
 
@@ -481,6 +483,7 @@ kopia.path               /srv/web
 kopia.schedule           0 * * * *
 kopia.snapshot-on-start  true
 kopia.snapshot-on-stop   false
+kopia.min-interval       10m0s
 kopia.description        (container name)
 kopia.tags               (none)
 

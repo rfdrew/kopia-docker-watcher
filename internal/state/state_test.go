@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
 )
@@ -236,6 +237,139 @@ func TestRoundTrip(t *testing.T) {
 	s = reopen(t, s)
 	assertApplied(t, s, srcA, a)
 	assertApplied(t, s, srcB, b)
+}
+
+// The snapshot fields round-trip next to Applied, and each part of the
+// watcher changes only its own fields.
+func TestSnapshotFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := open(t, path, Options{})
+
+	t0 := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	zero := time.Time{}
+	wait := SnapshotWait{
+		ID: "2026-10-18T12:00:00Z",
+		Ticket: backend.SnapshotTicket{Source: srcA, TriggeredAt: t0, LastSnapshotStart: t0.Add(-time.Hour),
+			TasksBefore: []string{"3"}, TaskID: "4", TaskDescription: "root@kopia:/data/a at 2026-10-18T12:00:00Z"},
+		Stop:        true,
+		Reason:      "stop of app",
+		Description: "app [env=prod]",
+		Result:      &SnapshotResult{Outcome: backend.SnapshotSucceeded, TaskID: "4", SnapshotStart: t0.Add(time.Second)},
+	}
+
+	if err := s.Update(srcA, func(r *Record) error {
+		r.SnapshotWaits = []SnapshotWait{wait}
+		r.LastTriggered = t0
+		r.AnnotateAfter = &zero
+
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The reconciler sets Applied without touching them.
+	if err := setApplied(s, srcA, applied("0 * * * *", "")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The encoded form of a wait is part of the file.
+	var file struct {
+		Sources []map[string]json.RawMessage `json:"sources"`
+	}
+
+	if err := json.Unmarshal([]byte(readFile(t, path)), &file); err != nil {
+		t.Fatal(err)
+	}
+
+	e := file.Sources[0]
+	assertCompact(t, "snapshotWaits", e["snapshotWaits"], `[{"id":"2026-10-18T12:00:00Z","ticket":{"source":{"host":"kopia",`+
+		`"userName":"root","path":"/data/a"},"triggeredAt":"2026-10-18T12:00:00Z","lastSnapshotStart":"2026-10-18T11:00:00Z",`+
+		`"tasksBefore":["3"],"taskID":"4","taskDescription":"root@kopia:/data/a at 2026-10-18T12:00:00Z"},"stop":true,`+
+		`"reason":"stop of app","description":"app [env=prod]","result":{"outcome":"succeeded","taskID":"4",`+
+		`"snapshotStart":"2026-10-18T12:00:01Z"}}]`)
+	assertCompact(t, "lastTriggered", e["lastTriggered"], `"2026-10-18T12:00:00Z"`)
+	assertCompact(t, "annotateAfter", e["annotateAfter"], `"0001-01-01T00:00:00Z"`)
+
+	s = reopen(t, s)
+
+	got, ok := s.Get(srcA)
+	if !ok || len(got.SnapshotWaits) != 1 || !reflect.DeepEqual(got.SnapshotWaits[0], wait) || !got.LastTriggered.Equal(t0) ||
+		got.AnnotateAfter == nil || !got.AnnotateAfter.IsZero() || !got.Patch.Equal(applied("0 * * * *", "").Patch) {
+		t.Errorf("record = %+v", got)
+	}
+
+	// A record without the fields has no mark: nil, not the zero time.
+	if err := setApplied(s, srcB, applied("", "")); err != nil {
+		t.Fatal(err)
+	}
+
+	s = reopen(t, s)
+
+	if got, _ := s.Get(srcB); got.AnnotateAfter != nil || got.SnapshotWaits != nil || !got.LastTriggered.IsZero() {
+		t.Errorf("record without snapshot fields = %+v", got)
+	}
+
+	if strings.Contains(readFile(t, path), "null") {
+		t.Errorf("empty fields written:\n%s", readFile(t, path))
+	}
+}
+
+// A snapshot wait the reconciler cannot use, as one a newer watcher wrote,
+// does not make its entry unreadable.
+func TestSnapshotWaitsAreNotValidated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	content := `{"version":1,"sources":[{"source":{"host":"kopia","userName":"root","path":"/data/a"},` +
+		`"patch":{"scheduling":{"cron":["0 * * * *"]}},"savedScheduling":{"cron":["0 * * * *"]},` +
+		`"snapshotWaits":[{"id":"x","ticket":{"source":{"path":"/data/a"},"triggeredAt":"0001-01-01T00:00:00Z"}}]}]}`
+
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	log, logs := newLogger()
+	s := open(t, path, Options{Logger: log})
+
+	got, ok := s.Get(srcA)
+	if !ok || len(got.SnapshotWaits) != 1 || got.SnapshotWaits[0].ID != "x" || got.SavedScheduling == nil {
+		t.Errorf("record = %+v; log:\n%s", got, logs)
+	}
+
+	if strings.Contains(logs.String(), "cannot be read") {
+		t.Errorf("entry reported as unreadable:\n%s", logs)
+	}
+}
+
+// A wait that cannot be decoded is dropped on its own, and snapshot fields
+// that cannot be decoded are dropped without the entry's policy fields.
+func TestSnapshotFieldsSalvaged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	content := `{"version":1,"sources":[` +
+		`{"source":{"host":"kopia","userName":"root","path":"/data/a"},"savedScheduling":{"cron":["0 * * * *"]},` +
+		`"snapshotWaits":[{"id":"bad","ticket":{"tasksBefore":[3]}},{"id":"good","ticket":{"triggeredAt":"2026-10-18T12:00:00Z"}}]},` +
+		`{"source":{"host":"kopia","userName":"root","path":"/data/b"},"savedScheduling":{"cron":["5 * * * *"]},"lastTriggered":5}]}`
+
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	log, logs := newLogger()
+	s := open(t, path, Options{Logger: log})
+
+	a, ok := s.Get(srcA)
+	if !ok || a.SavedScheduling == nil || len(a.SnapshotWaits) != 1 || a.SnapshotWaits[0].ID != "good" {
+		t.Errorf("record of a = %+v", a)
+	}
+
+	b, ok := s.Get(srcB)
+	if !ok || string(b.SavedScheduling) != `{"cron":["5 * * * *"]}` || !b.LastTriggered.IsZero() {
+		t.Errorf("record of b = %+v", b)
+	}
+
+	for _, want := range []string{"1 snapshot waits cannot be decoded", "the snapshot state cannot be decoded", "copy"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log lacks %q:\n%s", want, logs)
+		}
+	}
 }
 
 // A record stays, also when it holds nothing: the store lists every source
@@ -777,12 +911,21 @@ func assertCompact(t *testing.T, name string, got json.RawMessage, want string) 
 // Every key the code knows is in knownEntryKeys, so none of them is kept
 // as an unknown field next to the real one.
 func TestKnownEntryKeys(t *testing.T) {
-	r := Record{Applied: backend.Applied{
-		Patch:           backend.PolicyPatch{Scheduling: backend.SchedulingPatch{Cron: []string{"x"}}},
-		SavedScheduling: json.RawMessage(`{}`),
-		Pending:         &backend.PolicyPatch{},
-		StoredHash:      "h",
-	}}
+	mark := time.Unix(1, 0)
+	r := Record{
+		Applied: backend.Applied{
+			Patch:           backend.PolicyPatch{Scheduling: backend.SchedulingPatch{Cron: []string{"x"}}},
+			SavedScheduling: json.RawMessage(`{}`),
+			Pending:         &backend.PolicyPatch{},
+			StoredHash:      "h",
+		},
+		SnapshotWaits:           []SnapshotWait{{ID: "1", Ticket: backend.SnapshotTicket{Source: srcA, TriggeredAt: mark}}},
+		LastTriggered:           mark,
+		AnnotateAfter:           &mark,
+		StopAbsorbedAt:          mark,
+		StopAbsorbedDescription: "d",
+		StopAbsorbedLastStart:   mark,
+	}
 
 	data, err := json.Marshal(entryForTest{Source: srcA, Record: r})
 	if err != nil {
@@ -1299,5 +1442,56 @@ func TestRecordKeysDoNotCollide(t *testing.T) {
 
 	if len(knownEntryKeys) != len(applied)+len(own) {
 		t.Errorf("knownEntryKeys = %v, want the keys of Applied, Record and source", knownEntryKeys)
+	}
+}
+
+// An entry is read as it is: <, > and & in raw values stay as they are.
+func TestRawValuesReadAsTheyAre(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	content := `{"version":1,"sources":[{"source":{"host":"kopia","userName":"root","path":"/data/a"},` +
+		`"savedScheduling":{"x":"a && b 2>&1 <c>"}}]}`
+
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := open(t, path, Options{})
+
+	if got, _ := s.Get(srcA); string(got.SavedScheduling) != `{"x":"a && b 2>&1 <c>"}` {
+		t.Errorf("saved scheduling = %s", got.SavedScheduling)
+	}
+
+	if !strings.Contains(readFile(t, path), `"a && b 2>&1 <c>"`) {
+		t.Errorf("file:\n%s", readFile(t, path))
+	}
+}
+
+// Every list of snapshot waits is cleaned, under any key encoding/json
+// reads it from, and the entry decodes the same way every time.
+func TestBadWaitsUnderEveryKey(t *testing.T) {
+	raw := json.RawMessage(`{"source":{"host":"kopia","userName":"root","path":"/data/a"},"lastTriggered":"2026-10-18T12:00:00Z",` +
+		`"SnapshotWaits":[{"id":5}],"snapshotWaits":[{"id":"ok","ticket":{"triggeredAt":"2026-10-18T12:00:00Z"}},{"id":6}]}`)
+
+	for range 50 {
+		_, e, note, err := decodeEntry(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		r := mustDecode(e.record)
+		if len(r.SnapshotWaits) != 1 || r.SnapshotWaits[0].ID != "ok" || r.LastTriggered.IsZero() || !strings.Contains(note, "2 snapshot waits") {
+			t.Fatalf("record = %+v, note %q", r, note)
+		}
+	}
+}
+
+// An entry that cannot be read even without its snapshot fields is
+// reported by the field that keeps it from decoding.
+func TestUnreadableEntryNamesItsField(t *testing.T) {
+	raw := json.RawMessage(`{"source":{"host":"kopia","userName":"root","path":"/data/a"},"patch":"x","lastTriggered":5}`)
+
+	_, _, _, err := decodeEntry(raw)
+	if err == nil || !strings.Contains(err.Error(), "Record.patch") {
+		t.Errorf("error = %v", err)
 	}
 }

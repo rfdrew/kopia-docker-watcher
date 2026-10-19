@@ -354,6 +354,8 @@ func (w *watcher) reconciler(kopia *kopiaclient.Client, store *state.Store, engi
 		DryRun:        w.dryRun,
 		Output:        w.d.stdout,
 		ShutdownGrace: w.shutdownGrace(),
+
+		SnapshotOnWatcherStart: w.cfg.SnapshotOnWatcherStart,
 	})
 }
 

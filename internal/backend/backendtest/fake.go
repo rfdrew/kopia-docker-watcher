@@ -127,6 +127,7 @@ type Fake struct {
 	results     map[backend.Source][]backend.SnapshotResult
 	nextTaskID  int
 	annotations map[backend.Source][]Annotation
+	holds       map[backend.Source]chan struct{}
 }
 
 type sourceState struct {
@@ -162,6 +163,7 @@ func New() *Fake {
 		failRegPut:  map[backend.Source][]error{},
 		results:     map[backend.Source][]backend.SnapshotResult{},
 		annotations: map[backend.Source][]Annotation{},
+		holds:       map[backend.Source]chan struct{}{},
 	}
 }
 
@@ -364,6 +366,31 @@ func (f *Fake) QueueSnapshotResult(src backend.Source, r backend.SnapshotResult)
 	defer f.mu.Unlock()
 
 	f.results[src] = append(f.results[src], r)
+}
+
+// HoldSnapshots makes the WaitSnapshot calls for src hold, as while a
+// snapshot runs: a call gives a ticket without a task a task ID and saves
+// it, then waits until ReleaseSnapshots or until its context is done,
+// when it returns an error of neither kind that wraps ctx.Err().
+func (f *Fake) HoldSnapshots(src backend.Source) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if _, ok := f.holds[src]; !ok {
+		f.holds[src] = make(chan struct{})
+	}
+}
+
+// ReleaseSnapshots lets the held WaitSnapshot calls for src go on; later
+// calls do not hold.
+func (f *Fake) ReleaseSnapshots(src backend.Source) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if ch, ok := f.holds[src]; ok {
+		close(ch)
+		delete(f.holds, src)
+	}
 }
 
 // Annotations returns the AnnotateSnapshot calls that found their
@@ -991,12 +1018,38 @@ func (f *Fake) TriggerSnapshot(ctx context.Context, src backend.Source) (backend
 // WaitSnapshot implements backend.Backend. It returns the next result
 // queued for the ticket's source, saving its snapshot if it has one, or
 // else saves a complete snapshot started when the ticket was triggered and
-// reports success. A result with a task ID is passed to save first. The
-// snapshot of a source kopia server does not know is SnapshotUnknown.
+// reports success, with the ticket's task ID if it has one. The task ID
+// of a result is saved first if the ticket does not have it yet. The snapshot of a source kopia server
+// does not know is SnapshotUnknown. See HoldSnapshots for a call that
+// waits.
 func (f *Fake) WaitSnapshot(ctx context.Context, t backend.SnapshotTicket, save func(backend.SnapshotTicket)) (backend.SnapshotResult, error) {
 	after, err := f.enter(ctx, Call{Method: WaitSnapshot, Source: t.Source, Ticket: t})
 	if err != nil {
 		return backend.SnapshotResult{}, err
+	}
+
+	f.mu.Lock()
+	hold := f.holds[t.Source]
+	saveTask := hold != nil && t.TaskID == ""
+
+	if saveTask {
+		f.nextTaskID++
+		t.TaskID = fmt.Sprint(f.nextTaskID)
+		t.TaskDescription = t.Source.String() + " at " + t.TriggeredAt.Format(time.RFC3339)
+	}
+
+	f.mu.Unlock()
+
+	if hold != nil {
+		if saveTask && save != nil {
+			save(t)
+		}
+
+		select {
+		case <-hold:
+		case <-ctx.Done():
+			return backend.SnapshotResult{}, &backend.Error{Op: string(WaitSnapshot), Source: t.Source, Err: ctx.Err()}
+		}
 	}
 
 	r, err := f.finishSnapshot(t)
@@ -1004,7 +1057,7 @@ func (f *Fake) WaitSnapshot(ctx context.Context, t backend.SnapshotTicket, save 
 		return backend.SnapshotResult{}, err
 	}
 
-	if r.TaskID != "" && save != nil {
+	if r.TaskID != "" && r.TaskID != t.TaskID && save != nil {
 		t.TaskID = r.TaskID
 		t.TaskDescription = t.Source.String() + " at " + t.TriggeredAt.Format(time.RFC3339)
 		save(t)
@@ -1028,7 +1081,7 @@ func (f *Fake) finishSnapshot(t backend.SnapshotTicket) (backend.SnapshotResult,
 
 	s, ok := f.sources[t.Source]
 	if !ok {
-		return backend.SnapshotResult{Outcome: backend.SnapshotUnknown}, nil
+		return backend.SnapshotResult{Outcome: backend.SnapshotUnknown, Error: "kopia server does not know the source"}, nil
 	}
 
 	var r backend.SnapshotResult
@@ -1036,10 +1089,15 @@ func (f *Fake) finishSnapshot(t backend.SnapshotTicket) (backend.SnapshotResult,
 	if q := f.results[t.Source]; len(q) > 0 {
 		f.results[t.Source], r = q[1:], q[0]
 	} else {
-		f.nextTaskID++
+		id := t.TaskID
+		if id == "" {
+			f.nextTaskID++
+			id = fmt.Sprint(f.nextTaskID)
+		}
+
 		r = backend.SnapshotResult{
 			Outcome:  backend.SnapshotSucceeded,
-			TaskID:   fmt.Sprint(f.nextTaskID),
+			TaskID:   id,
 			Snapshot: &backend.SnapshotInfo{StartTime: t.TriggeredAt, EndTime: t.TriggeredAt},
 		}
 	}

@@ -127,17 +127,34 @@ func TestTemporaryErrorKeepsReported(t *testing.T) {
 // At most maxPending events are kept per path, the latest ones.
 func TestPendingEventsBounded(t *testing.T) {
 	h := newHarness(t)
-	id := h.engine.run("app", enable, pathLabel(app))
 
 	for i := range 40 {
-		ev := h.engine.event(docker.KindStarted, id)
-		ev.Name = fmt.Sprint(i)
-		h.r.HandleEvent(ev)
+		id := h.engine.run(fmt.Sprint(i), enable, pathLabel(app))
+		h.r.HandleEvent(h.engine.event(docker.KindStarted, id))
 	}
 
 	got := h.r.takePending(app)
 	if len(got) != maxPending || got[0].Name != "8" || got[len(got)-1].Name != "39" {
 		t.Errorf("%d pending, first %s, last %s", len(got), got[0].Name, got[len(got)-1].Name)
+	}
+}
+
+// Of each container's events only the last of each kind is kept, so a
+// crash-looping container does not push the stop of another one out.
+func TestPendingEventsCompacted(t *testing.T) {
+	h := newHarness(t)
+	loop := h.engine.run("loop", enable, pathLabel(app))
+	app2 := h.engine.run("app", enable, pathLabel(app))
+
+	h.r.HandleEvent(h.engine.event(docker.KindDied, app2))
+
+	for range 40 {
+		h.r.HandleEvent(h.engine.event(docker.KindDied, loop))
+		h.r.HandleEvent(h.engine.event(docker.KindStarted, loop))
+	}
+
+	if got := eventNames(h.r.takePending(app)); strings.Join(got, ",") != "die app,die loop,start loop" {
+		t.Errorf("pending = %v", got)
 	}
 }
 
@@ -170,7 +187,7 @@ func TestRestoredEventsFirst(t *testing.T) {
 // A pass that ends without an error uses up its events.
 func TestEventsUsedUp(t *testing.T) {
 	h := newHarness(t)
-	id := h.engine.run("app", enable, pathLabel(app))
+	id := h.engine.run("app", enable, pathLabel(app), "kopia.snapshot-on-start=false")
 	h.r.HandleEvent(h.engine.event(docker.KindStarted, id))
 	h.mustPass(app)
 

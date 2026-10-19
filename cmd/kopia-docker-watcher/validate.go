@@ -695,6 +695,7 @@ func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 	row(labels.KeySchedule, orNone(strings.Join(spec.Policy.Scheduling.Cron, "; "), "(inherit from the parent policies)"))
 	row(labels.KeySnapshotOnStart, strconv.FormatBool(spec.SnapshotOnStart))
 	row(labels.KeySnapshotOnStop, strconv.FormatBool(spec.SnapshotOnStop))
+	row(labels.KeyMinInterval, minInterval(spec.MinInterval))
 	row(labels.KeyDescription, orNone(spec.Description, "(container name)"))
 
 	tags := make([]string, 0, len(spec.Tags))
@@ -715,6 +716,15 @@ func printable(s string) string {
 	}
 
 	return s
+}
+
+// minInterval formats the min-interval label's value, e.g. 10m0s.
+func minInterval(d time.Duration) string {
+	if d == 0 {
+		return "0 (no minimum)"
+	}
+
+	return d.String()
 }
 
 func orNone(s, none string) string {

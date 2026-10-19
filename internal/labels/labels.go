@@ -20,6 +20,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/config"
 )
@@ -27,6 +28,11 @@ import (
 // DefaultSchedule is the cron expression used when the schedule label is
 // absent, as in the Python version.
 const DefaultSchedule = "0 * * * *"
+
+// DefaultMinInterval is the shortest time between two snapshots of a
+// source that a container start asks for, when the min-interval label is
+// absent.
+const DefaultMinInterval = 10 * time.Minute
 
 // ContainerSpec is what the labels of one container ask for.
 type ContainerSpec struct {
@@ -40,6 +46,11 @@ type ContainerSpec struct {
 
 	SnapshotOnStart bool
 	SnapshotOnStop  bool
+
+	// MinInterval is the shortest time between the last snapshot of a
+	// source and one that a start of this container asks for; zero means
+	// no minimum. A snapshot at a stop is taken regardless.
+	MinInterval time.Duration
 
 	// Description is the snapshot description; empty means the container
 	// name.
@@ -78,6 +89,7 @@ type Scheduling struct {
 func Default() ContainerSpec {
 	return ContainerSpec{
 		SnapshotOnStart: true,
+		MinInterval:     DefaultMinInterval,
 		Policy: Policy{
 			Scheduling: Scheduling{Cron: []string{DefaultSchedule}},
 		},
@@ -275,6 +287,34 @@ func (p *parser) schedule(v string) {
 		if item = strings.TrimSpace(item); item != "" {
 			p.spec.Policy.Scheduling.Cron = append(p.spec.Policy.Scheduling.Cron, item)
 		}
+	}
+}
+
+// minIntervalHint names the accepted values of the min-interval label.
+const minIntervalHint = "use a Go duration such as 10m, 1h or 24h (d is not a unit), or 0 for no minimum"
+
+// minInterval parses a Go duration such as 10m or 1h30m; zero means no
+// minimum. The label only paces snapshots, so a value that is empty, does
+// not parse or is negative keeps the default with a warning rather than
+// keeping the labels from being applied.
+func (p *parser) minInterval(v string) {
+	workaround := "the default " + DefaultMinInterval.String() + " is used"
+
+	s := strings.TrimSpace(v)
+	if s == "" {
+		p.warn("empty value", workaround, minIntervalHint)
+		return
+	}
+
+	d, err := time.ParseDuration(s)
+
+	switch {
+	case err != nil:
+		p.warn(fmt.Sprintf("invalid duration %q", v), workaround, minIntervalHint)
+	case d < 0:
+		p.warn(fmt.Sprintf("negative duration %q", v), workaround, minIntervalHint)
+	default:
+		p.spec.MinInterval = d
 	}
 }
 
