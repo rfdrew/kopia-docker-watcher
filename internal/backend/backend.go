@@ -235,7 +235,10 @@ const (
 	// task yet.
 	StatusPending   Status = "PENDING"
 	StatusUploading Status = "UPLOADING"
-	// StatusPaused: paused through the control API, not by the policy.
+	// StatusPaused: kopia server dropped a run because the source is
+	// paused through the control API, not by the policy. It stays until
+	// the next run, also after the source is resumed; a paused source
+	// that has dropped no run yet shows IDLE.
 	StatusPaused  Status = "PAUSED"
 	StatusFailed  Status = "FAILED"
 	StatusStopped Status = "STOPPED"
@@ -300,10 +303,13 @@ type SnapshotTicket struct {
 	TaskDescription string `json:"taskDescription,omitempty"`
 	// LastTaskID is the newest task kopia server listed before the
 	// trigger, of any kind, and LastTaskStart its start; "0" and zero if
-	// it listed none. kopia server numbers its tasks up from 1, and anew
-	// when it restarts and loses queued runs, so tasks numbered at or
-	// below it, or another task under its ID, tell WaitSnapshot that
-	// kopia server restarted. Empty in a ticket made before the field.
+	// it listed none. WaitSnapshot moves them to the newest task it sees
+	// while the run's task does not show. kopia server numbers its tasks
+	// up from 1, and anew when it restarts and loses queued runs: a list
+	// without a task numbered at or above LastTaskID, another task under
+	// that ID, or a run's task numbered at or below it tells WaitSnapshot
+	// that kopia server restarted. Empty in a ticket made before the
+	// field.
 	LastTaskID    string    `json:"lastTaskID,omitempty"`
 	LastTaskStart time.Time `json:"lastTaskStart,omitzero"`
 }

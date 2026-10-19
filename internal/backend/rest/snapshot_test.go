@@ -117,6 +117,17 @@ func newWaitBackend(t *testing.T, f *fakeKopia) (*Backend, *[]time.Duration) {
 	return b, &delays
 }
 
+// waitCtx bounds a WaitSnapshot of a test, which would otherwise poll
+// until the test binary times out when a regression keeps it waiting.
+func waitCtx(t *testing.T) context.Context {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	t.Cleanup(cancel)
+
+	return ctx
+}
+
 // saves records the tickets WaitSnapshot saves.
 type saves struct {
 	mu      sync.Mutex
@@ -210,7 +221,7 @@ func TestWaitSnapshotSucceeded(t *testing.T) {
 
 	var sv saves
 
-	res, err := b.WaitSnapshot(t.Context(), ticket, sv.save)
+	res, err := b.WaitSnapshot(waitCtx(t), ticket, sv.save)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +256,7 @@ func TestWaitSnapshotSucceeded(t *testing.T) {
 	})
 	f.script("GET tasks/6", nil, nil, nil, func(f *fakeKopia) { f.finish("6", kopiaclient.TaskSuccess, "") })
 
-	if _, err := b.WaitSnapshot(t.Context(), want, nil); err != nil {
+	if _, err := b.WaitSnapshot(waitCtx(t), want, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -287,7 +298,7 @@ func TestWaitSnapshotFailedBetweenPolls(t *testing.T) {
 
 		var sv saves
 
-		res, err := b.WaitSnapshot(t.Context(), ticket, sv.save)
+		res, err := b.WaitSnapshot(waitCtx(t), ticket, sv.save)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -327,7 +338,7 @@ func TestWaitSnapshotFailedQuietly(t *testing.T) {
 		f.taskLogs["2"] = []string{"0|debug", "1|info", "2|warning"}
 	})
 
-	res, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
+	res, err := b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +355,7 @@ func TestWaitSnapshotFailedQuietly(t *testing.T) {
 		}
 	})
 
-	res, err = b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
+	res, err = b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +409,7 @@ func TestWaitSnapshotQueuedBehindUpload(t *testing.T) {
 		f.snapshots[si] = append(f.snapshots[si], snapshot("ours", t0.Add(61*time.Second), t0.Add(90*time.Second), ""))
 	})
 
-	res, err := b.WaitSnapshot(t.Context(), ticket, nil)
+	res, err := b.WaitSnapshot(waitCtx(t), ticket, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +439,7 @@ func TestWaitSnapshotPendingWithoutTask(t *testing.T) {
 	}
 	f.script("GET sources", steps...)
 
-	res, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
+	res, err := b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,7 +470,7 @@ func TestWaitSnapshotDropped(t *testing.T) {
 			f.set(func(f *fakeKopia) { f.setStatus(si, status, "") })
 		}
 
-		res, err := b.WaitSnapshot(t.Context(), ticket, nil)
+		res, err := b.WaitSnapshot(waitCtx(t), ticket, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -487,7 +498,7 @@ func TestWaitSnapshotDropped(t *testing.T) {
 		},
 	)
 
-	res, err := b.WaitSnapshot(t.Context(), ticket, nil)
+	res, err := b.WaitSnapshot(waitCtx(t), ticket, nil)
 	if err != nil || res.Outcome != backend.SnapshotCanceled || res.TaskID != "9" {
 		t.Errorf("result = %+v, %v", res, err)
 	}
@@ -503,7 +514,7 @@ func TestWaitSnapshotDropped(t *testing.T) {
 			f.setStatus(si, kopiaclient.SourceStatusIdle, "")
 		})
 
-		res, err := b.WaitSnapshot(t.Context(), ticket, nil)
+		res, err := b.WaitSnapshot(waitCtx(t), ticket, nil)
 		if err != nil || res.Outcome != backend.SnapshotUnknown {
 			t.Errorf("%q: result = %+v, %v", status, res, err)
 		}
@@ -541,7 +552,7 @@ func TestWaitSnapshotDropped(t *testing.T) {
 				f.script("GET sources", nil, nil, nil, func(f *fakeKopia) { f.finish("9", kopiaclient.TaskSuccess, "") })
 			}
 
-			res, err := b.WaitSnapshot(t.Context(), ticket, nil)
+			res, err := b.WaitSnapshot(waitCtx(t), ticket, nil)
 			if err != nil || res.Outcome != backend.SnapshotUnknown {
 				t.Errorf("%q, slot held %v: result = %+v, %v", status, slot, res, err)
 			}
@@ -590,7 +601,7 @@ func TestWaitSnapshotPicksTheRunsTask(t *testing.T) {
 	// None of them is the run's.
 	f.set(func(f *fakeKopia) { f.tasks = slices.Clone(noise) })
 
-	res, err := b.WaitSnapshot(t.Context(), ticket, nil)
+	res, err := b.WaitSnapshot(waitCtx(t), ticket, nil)
 	if err != nil || res.Outcome != backend.SnapshotUnknown {
 		t.Fatalf("result = %+v, %v", res, err)
 	}
@@ -617,7 +628,7 @@ func TestWaitSnapshotPicksTheRunsTask(t *testing.T) {
 	} {
 		f.set(func(f *fakeKopia) { f.tasks = append(slices.Clone(tc.tasks), noise...) })
 
-		res, err := b.WaitSnapshot(t.Context(), ticket, nil)
+		res, err := b.WaitSnapshot(waitCtx(t), ticket, nil)
 		if err != nil || res.TaskID != tc.want {
 			t.Errorf("%v: result = %+v, %v; want task %s", tc.tasks, res, err, tc.want)
 		}
@@ -667,13 +678,20 @@ func TestWaitSnapshotFindsTheSnapshot(t *testing.T) {
 		// snapshot was deleted since, e.g. by the retention of a run right
 		// after.
 		{"none at all", nil, backend.SnapshotResult{Outcome: backend.SnapshotUnknown},
-			"the task saved no snapshot, and the source has none it could be identical to: the snapshot has been deleted since"},
+			"the task saved no snapshot, and the source has no complete one it could be identical to: the snapshot has been deleted since"},
 		{"only later ones", []kopiaclient.Snapshot{snapshot("later", start.Add(time.Minute+time.Nanosecond), start.Add(2*time.Minute), "")},
 			backend.SnapshotResult{Outcome: backend.SnapshotUnknown},
-			"the task saved no snapshot, and the source has none it could be identical to: the snapshot has been deleted since"},
-		// A checkpoint of an earlier upload counts as the latest snapshot.
-		{"identical to a checkpoint", []kopiaclient.Snapshot{
+			"the task saved no snapshot, and the source has no complete one it could be identical to: the snapshot has been deleted since"},
+		// kopia server compares a new snapshot with the latest complete
+		// one: never identical to a checkpoint or a canceled snapshot.
+		{"only incomplete ones before", []kopiaclient.Snapshot{
 			snapshot("cp", start.Add(-time.Hour), start.Add(-time.Hour), incompleteCheckpoint),
+			snapshot("canceled", start.Add(-time.Hour), start.Add(-time.Hour), "canceled"),
+		}, backend.SnapshotResult{Outcome: backend.SnapshotUnknown},
+			"the task saved no snapshot, and the source has no complete one it could be identical to: the snapshot has been deleted since"},
+		// The upper bound alone: a later run's snapshot is not the task's.
+		{"identical, then a later run", []kopiaclient.Snapshot{
+			snapshot("old", start.Add(-time.Hour), start.Add(-time.Hour), ""),
 			snapshot("later", start.Add(time.Minute+time.Nanosecond), start.Add(2*time.Minute), ""),
 		}, backend.SnapshotResult{Outcome: backend.SnapshotIdentical}, ""},
 		// Canceled through sources/cancel or a pause, the task succeeds.
@@ -701,7 +719,7 @@ func TestWaitSnapshotFindsTheSnapshot(t *testing.T) {
 				f.snapshots[si] = tt.snaps
 			})
 
-			res, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
+			res, err := b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -769,7 +787,7 @@ func TestWaitSnapshotErrorsInTheSnapshot(t *testing.T) {
 			f.snapshots[si] = []kopiaclient.Snapshot{tt.snap}
 		})
 
-		res, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
+		res, err := b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -791,7 +809,7 @@ func TestWaitSnapshotErrorsInTheSnapshot(t *testing.T) {
 		f.snapshots[si] = []kopiaclient.Snapshot{withErrors}
 	})
 
-	res, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
+	res, err := b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
 	if err != nil || res.Outcome != backend.SnapshotIncomplete || res.Error != "the snapshot has 7 errors and 1 ignored" {
 		t.Errorf("result = %+v, %v", res, err)
 	}
@@ -822,7 +840,7 @@ func TestWaitSnapshotKnownTask(t *testing.T) {
 
 		var sv saves
 
-		res, err := b.WaitSnapshot(t.Context(), ticket, sv.save)
+		res, err := b.WaitSnapshot(waitCtx(t), ticket, sv.save)
 		if err != nil || res.Outcome != backend.SnapshotSucceeded || res.TaskID != "6" {
 			t.Errorf("result = %+v, %v", res, err)
 		}
@@ -846,7 +864,7 @@ func TestWaitSnapshotKnownTask(t *testing.T) {
 			f.addSource(si, nil)
 			f.set(func(f *fakeKopia) { f.tasks = []kopiaclient.TaskInfo{other} })
 
-			res, err := b.WaitSnapshot(t.Context(), ticket, nil)
+			res, err := b.WaitSnapshot(waitCtx(t), ticket, nil)
 			if err != nil || res.Outcome != backend.SnapshotUnknown || res.TaskID != "6" || !strings.Contains(res.Error, "no longer knows task 6") {
 				t.Errorf("%s: result = %+v, %v", other.Description, res, err)
 			}
@@ -861,7 +879,7 @@ func TestWaitSnapshotKnownTask(t *testing.T) {
 
 		f.addSource(si, nil)
 
-		res, err := b.WaitSnapshot(t.Context(), ticket, nil)
+		res, err := b.WaitSnapshot(waitCtx(t), ticket, nil)
 		if err != nil || res.Outcome != backend.SnapshotUnknown || res.TaskID != "6" {
 			t.Errorf("result = %+v, %v", res, err)
 		}
@@ -884,7 +902,7 @@ func TestWaitSnapshotKnownTask(t *testing.T) {
 		noTask := ticket
 		noTask.TaskID, noTask.TaskDescription = "", ""
 
-		res, err := b.WaitSnapshot(t.Context(), noTask, nil)
+		res, err := b.WaitSnapshot(waitCtx(t), noTask, nil)
 		if err != nil || res.Outcome != backend.SnapshotUnknown || res.TaskID != "" {
 			t.Errorf("result = %+v, %v", res, err)
 		}
@@ -915,8 +933,8 @@ func TestWaitSnapshotRestart(t *testing.T) {
 		{"a new run of kopia server, few tasks yet", []kopiaclient.TaskInfo{
 			snapTask("2", "/data/app", t0.Add(10*time.Minute), kopiaclient.TaskSuccess),
 			maint("1", t0.Add(5*time.Minute)),
-		}, "it lists no task as new as task 3e7"},
-		{"no tasks at all", nil, "it lists no task as new as task 3e7"},
+		}, "it lists no task numbered 3e7 or above"},
+		{"no tasks at all", nil, "it lists no task numbered 3e7 or above"},
 		{"another task under the ID", []kopiaclient.TaskInfo{
 			maint("3e8", t0.Add(time.Hour)),
 			maint("3e7", t0.Add(time.Hour)),
@@ -924,9 +942,12 @@ func TestWaitSnapshotRestart(t *testing.T) {
 		// The newer tasks of the new run of kopia server finished and
 		// pushed the anchor's ID out; the source's long upload still runs.
 		{"the run's task numbered below the trigger's", []kopiaclient.TaskInfo{
-			maint("3f0", t0.Add(time.Hour)),
+			maint("3e8", t0.Add(time.Hour)),
 			snapTask("300", "/data/app", t0.Add(time.Minute), kopiaclient.TaskRunning),
-		}, "the task 300 of the source is numbered below the trigger's 3e7"},
+		}, "the task 300 of the source is numbered at or below 3e7"},
+		{"another task under the ID, started earlier", []kopiaclient.TaskInfo{
+			maint("3e7", anchorStart.Add(-time.Nanosecond)),
+		}, "task 3e7 is another task now"},
 		{"the same run of kopia server", []kopiaclient.TaskInfo{
 			snapTask("3e8", "/data/app", t0.Add(time.Second), kopiaclient.TaskFailed),
 			maint("3e7", anchorStart),
@@ -951,7 +972,7 @@ func TestWaitSnapshotRestart(t *testing.T) {
 
 			var sv saves
 
-			res, err := b.WaitSnapshot(t.Context(), ticket, sv.save)
+			res, err := b.WaitSnapshot(waitCtx(t), ticket, sv.save)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -987,7 +1008,7 @@ func TestWaitSnapshotRestart(t *testing.T) {
 			f.tasks = []kopiaclient.TaskInfo{snapTask("run-1", "/data/app", t0.Add(time.Second), kopiaclient.TaskFailed), maint("3e7", anchorStart)}
 		})
 
-		res, err := b.WaitSnapshot(t.Context(), ticket, nil)
+		res, err := b.WaitSnapshot(waitCtx(t), ticket, nil)
 		if err != nil || res.Outcome != backend.SnapshotFailed || res.TaskID != "run-1" {
 			t.Errorf("result = %+v, %v", res, err)
 		}
@@ -1008,90 +1029,111 @@ func TestWaitSnapshotRestart(t *testing.T) {
 		tk := ticket
 		tk.LastTaskID, tk.LastTaskStart = last, time.Time{}
 
-		res, err := b.WaitSnapshot(t.Context(), tk, nil)
+		res, err := b.WaitSnapshot(waitCtx(t), tk, nil)
 		if err != nil || res.Outcome != backend.SnapshotFailed || res.TaskID != "2" {
 			t.Errorf("LastTaskID %q: result = %+v, %v", last, res, err)
 		}
 	}
 }
 
-// kopia server keeps the 50 latest finished tasks. When tasks newer than
-// the trigger's are missing, the run's own task may be one of them: a
-// snapshot of the source that started after the trigger, before the task
-// found, shows that it is, and the task found is a later run's.
+// kopia server keeps the 50 finished tasks numbered highest. Each poll
+// that does not find the run moves LastTaskID to the newest task listed
+// and saves the ticket, so a long backlog of other sources' runs never
+// hides the run's task; tasks dropped between two looks might have.
 func TestWaitSnapshotEvicted(t *testing.T) {
 	si := info("/data/app")
-	ticket := backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0, LastTaskID: "10", LastTaskStart: t0.Add(-time.Second)}
-	later := snapTask("40", "/data/app", t0.Add(2*time.Hour), kopiaclient.TaskFailed)
+	ticket := backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0, TasksBefore: []string{"10"},
+		LastTaskID: "10", LastTaskStart: t0.Add(-30 * time.Second)}
 
-	// Tasks 11 to 3f, all of them listed or 3f alone.
-	every := []kopiaclient.TaskInfo{later}
-	for id := 0x3f; id > 0x10; id-- {
-		every = append(every, snapTask(strconv.FormatInt(int64(id), 16), "/data/other", t0.Add(time.Minute), kopiaclient.TaskSuccess))
+	// others returns finished snapshot tasks of other sources numbered
+	// from to to, newest first, as kopia server lists them.
+	others := func(from, to int) []kopiaclient.TaskInfo {
+		var out []kopiaclient.TaskInfo
+
+		for id := to; id >= from; id-- {
+			out = append(out, snapTask(strconv.FormatInt(int64(id), 16), "/data/other", t0.Add(time.Duration(id)*time.Second), kopiaclient.TaskSuccess))
+		}
+
+		return out
 	}
 
-	pushedOut := []kopiaclient.TaskInfo{later, every[1]}
+	t.Run("a backlog seen poll by poll", func(t *testing.T) {
+		f := newFakeKopia()
+		b, _ := newWaitBackend(t, f)
 
-	tests := []struct {
-		name   string
-		tasks  []kopiaclient.TaskInfo
-		snaps  []kopiaclient.Snapshot
-		inj    *injection
-		lost   bool
-		routes []string
+		f.addSource(si, nil)
+		f.set(func(f *fakeKopia) {
+			f.setStatus(si, kopiaclient.SourceStatusPending, "")
+			// The source's previous run, which saved a snapshot right
+			// before the trigger, and the first runs of the backlog.
+			f.tasks = append(others(0x11, 0x2f), snapTask("10", "/data/app", t0.Add(-30*time.Second), kopiaclient.TaskSuccess))
+			f.snapshots[si] = []kopiaclient.Snapshot{snapshot("prev", t0.Add(-29*time.Second), t0.Add(-time.Second), "")}
+		})
+		// The tasks up to 2f are dropped by the next look, which finds the
+		// run's task.
+		f.script("GET sources", nil, func(f *fakeKopia) {
+			f.tasks = append([]kopiaclient.TaskInfo{snapTask("61", "/data/app", t0.Add(time.Hour), kopiaclient.TaskFailed)}, others(0x30, 0x60)...)
+		})
+
+		var sv saves
+
+		res, err := b.WaitSnapshot(waitCtx(t), ticket, sv.save)
+		if err != nil || res.Outcome != backend.SnapshotFailed || res.TaskID != "61" {
+			t.Fatalf("result = %+v, %v", res, err)
+		}
+
+		got := sv.all()
+		if len(got) != 2 || got[0].TaskID != "" || got[0].LastTaskID != "2f" || !got[0].LastTaskStart.Equal(t0.Add(0x2f*time.Second)) ||
+			got[1].TaskID != "61" || got[1].LastTaskID != "2f" {
+			t.Errorf("saved %+v", got)
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		tasks []kopiaclient.TaskInfo
+		lost  bool
 	}{
-		{"every task listed", every, []kopiaclient.Snapshot{snapshot("a", t0.Add(time.Second), t0.Add(time.Second), "")}, nil, false,
-			[]string{"GET sources", "GET tasks", "GET tasks/40/logs"}},
-		{"an earlier run saved a snapshot", pushedOut, []kopiaclient.Snapshot{
-			snapshot("old", t0.Add(-time.Hour), t0.Add(-time.Hour), ""),
-			snapshot("cp", t0.Add(time.Second), t0.Add(time.Second), incompleteCheckpoint),
-			snapshot("a", t0.Add(time.Second), t0.Add(2*time.Second), ""),
-		}, nil, true, []string{"GET sources", "GET tasks", "GET snapshots"}},
-		// Many other sources ran before the run, which waited for its
-		// upload slot: the task found is the run's.
-		{"no earlier snapshot", pushedOut, []kopiaclient.Snapshot{
-			snapshot("old", t0.Add(-time.Hour), t0.Add(-time.Hour), ""),
-			snapshot("cp", t0.Add(time.Second), t0.Add(time.Second), incompleteCheckpoint),
-			snapshot("own", t0.Add(2*time.Hour), t0.Add(3*time.Hour), ""),
-		}, nil, false, []string{"GET sources", "GET tasks", "GET snapshots", "GET tasks/40/logs"}},
-		{"the snapshots cannot be read", pushedOut, nil,
-			&injection{status: http.StatusBadRequest, body: `{"code":"NOT_CONNECTED","error":"not connected"}`}, false,
-			[]string{"GET sources", "GET tasks", "GET snapshots"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		{"every task since listed", append(append([]kopiaclient.TaskInfo{snapTask("40", "/data/app", t0.Add(time.Hour), kopiaclient.TaskFailed)},
+			others(0x11, 0x3f)...), snapTask("10", "/data/app", t0.Add(-30*time.Second), kopiaclient.TaskSuccess)), false},
+		// The anchor itself was dropped: nothing above it is missing.
+		{"the anchor dropped", append([]kopiaclient.TaskInfo{snapTask("40", "/data/app", t0.Add(time.Hour), kopiaclient.TaskFailed)},
+			others(0x11, 0x3f)...), false},
+		{"a task above the anchor dropped", append([]kopiaclient.TaskInfo{snapTask("40", "/data/app", t0.Add(time.Hour), kopiaclient.TaskFailed)},
+			others(0x12, 0x3f)...), true},
+		{"the newest above the anchor dropped", others(0x11, 0x3e), false},
+		// The watcher was down while more than 50 tasks finished.
+		{"a resumed wait", append([]kopiaclient.TaskInfo{snapTask("90", "/data/app", t0.Add(time.Hour), kopiaclient.TaskFailed)},
+			others(0x40, 0x8f)...), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeKopia()
 			b, _ := newWaitBackend(t, f)
 
 			f.addSource(si, nil)
-			f.set(func(f *fakeKopia) {
-				f.tasks = tt.tasks
-				f.snapshots[si] = tt.snaps
-			})
+			f.set(func(f *fakeKopia) { f.tasks = tc.tasks })
 
-			if tt.inj != nil {
-				f.inject("GET snapshots", *tt.inj)
-			}
-
-			res, err := b.WaitSnapshot(t.Context(), ticket, nil)
+			res, err := b.WaitSnapshot(waitCtx(t), ticket, nil)
 
 			switch {
-			case tt.inj != nil:
-				assertError(t, err, opWaitSnapshot, src("/data/app"), backend.ErrUnavailable)
 			case err != nil:
 				t.Fatal(err)
-			case tt.lost:
-				if res.Outcome != backend.SnapshotUnknown || res.TaskID != "" || !strings.Contains(res.Error, "no longer lists the run's task") {
+			case tc.lost:
+				if res.Outcome != backend.SnapshotUnknown || res.TaskID != "" || !strings.Contains(res.Error, "no longer lists every task since task 10") {
+					t.Errorf("result = %+v", res)
+				}
+
+				assertRoutes(t, f, "GET sources", "GET tasks")
+			case tc.name == "the newest above the anchor dropped":
+				// No task of the run, the source idle: dropped.
+				if res.Outcome != backend.SnapshotUnknown || !strings.Contains(res.Error, "dropped the run") {
 					t.Errorf("result = %+v", res)
 				}
 			default:
-				if res.Outcome != backend.SnapshotFailed || res.TaskID != "40" {
+				if res.Outcome != backend.SnapshotFailed {
 					t.Errorf("result = %+v", res)
 				}
 			}
-
-			assertRoutes(t, f, tt.routes...)
 		})
 	}
 }
@@ -1112,7 +1154,7 @@ func TestWaitSnapshotNotUploaded(t *testing.T) {
 		f.snapshots[si] = []kopiaclient.Snapshot{snapshot("old", t0.Add(-time.Hour), t0.Add(-time.Hour), "")}
 	})
 
-	res, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
+	res, err := b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
 	if err != nil || res.Outcome != backend.SnapshotUnknown || res.TaskID != "1" || res.Snapshot != nil ||
 		res.Error != "the task ended without uploading: kopia server stopped the source before the run" {
 		t.Errorf("result = %+v, %v", res, err)
@@ -1133,6 +1175,10 @@ func TestWaitSnapshotCanceledTask(t *testing.T) {
 	}{
 		{[]kopiaclient.Snapshot{saved}, &backend.SnapshotInfo{StartTime: saved.StartTime, EndTime: saved.EndTime, Incomplete: "canceled"}},
 		{nil, nil},
+		// Canceled at the very end, the upload saved a complete snapshot:
+		// still canceled, with it.
+		{[]kopiaclient.Snapshot{snapshot("b", start.Add(time.Second), start.Add(2*time.Second), "")},
+			&backend.SnapshotInfo{StartTime: start.Add(time.Second), EndTime: start.Add(2 * time.Second)}},
 	} {
 		f := newFakeKopia()
 		b, _ := newWaitBackend(t, f)
@@ -1144,7 +1190,7 @@ func TestWaitSnapshotCanceledTask(t *testing.T) {
 		})
 		f.script("GET tasks/1", nil, func(f *fakeKopia) { f.finish("1", kopiaclient.TaskCanceled, "") })
 
-		res, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
+		res, err := b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1168,8 +1214,174 @@ func TestWaitSnapshotCanceledTask(t *testing.T) {
 	})
 	f.inject("GET snapshots", injection{status: http.StatusInternalServerError, body: `{"code":"INTERNAL","error":"boom"}`})
 
-	_, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
+	_, err := b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
 	assertError(t, err, opWaitSnapshot, src("/data/app"), backend.ErrTemporary)
+}
+
+// The log of a task that succeeded without a snapshot tells an identical
+// snapshot kopia server skipped from one the retention of a later run
+// deleted; without it, an earlier complete snapshot decides.
+func TestWaitSnapshotUnsavedLog(t *testing.T) {
+	si := info("/data/app")
+	start := t0.Add(time.Second)
+	earlier := snapshot("old", t0.Add(-time.Hour), t0.Add(-time.Hour), "")
+
+	for _, tc := range []struct {
+		name  string
+		log   []string
+		inj   *injection
+		snaps []kopiaclient.Snapshot
+		want  backend.SnapshotOutcome
+	}{
+		{"skipped as identical", []string{"0|uploading", "0|Not saving snapshot because no files have been changed since previous snapshot"}, nil,
+			nil, backend.SnapshotIdentical},
+		{"saved, then deleted", []string{"0|created snapshot k1234"}, nil, []kopiaclient.Snapshot{earlier}, backend.SnapshotUnknown},
+		{"a log that tells neither", []string{"1|uploading"}, nil, []kopiaclient.Snapshot{earlier}, backend.SnapshotIdentical},
+		{"a log that cannot be read", nil, &injection{status: http.StatusBadGateway, body: "bad gateway"}, []kopiaclient.Snapshot{earlier},
+			backend.SnapshotIdentical},
+		{"a log that cannot be read, no complete snapshot before", nil, &injection{status: http.StatusBadGateway, body: "bad gateway"},
+			nil, backend.SnapshotUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeKopia()
+			b, _ := newWaitBackend(t, f)
+
+			f.addSource(si, nil)
+			f.set(func(f *fakeKopia) {
+				f.tasks = []kopiaclient.TaskInfo{snapTask("1", "/data/app", start, kopiaclient.TaskSuccess)}
+				f.snapshots[si] = tc.snaps
+				f.taskLogs["1"] = tc.log
+			})
+
+			if tc.inj != nil {
+				f.inject("GET tasks/1/logs", *tc.inj)
+			}
+
+			res, err := b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
+			if err != nil || res.Outcome != tc.want || res.TaskID != "1" || res.Snapshot != nil || (res.Error == "") != (tc.want == backend.SnapshotIdentical) {
+				t.Errorf("result = %+v, %v; want %s", res, err, tc.want)
+			}
+
+			assertRoutes(t, f, "GET sources", "GET tasks", "GET snapshots", "GET tasks/1/logs")
+		})
+	}
+}
+
+// After a run, kopia server refreshes the source's status, which can take
+// up to 30 seconds, before it starts the run queued after it. A FAILED
+// status left by an earlier refresh shows no sign of the queued run then,
+// but the end of the source's last task does.
+func TestWaitSnapshotRefreshAfterRun(t *testing.T) {
+	si := info("/data/app")
+	ticket := backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0.Add(-time.Minute), TasksBefore: []string{"5"}}
+
+	for _, tc := range []struct {
+		ended time.Duration // how long before now the source's last task ended
+		polls int
+	}{
+		{20 * time.Second, 5},
+		{refreshTime - time.Second, 5},
+		{refreshTime, 2},
+		{2 * time.Minute, 2},
+	} {
+		f := newFakeKopia()
+		b, _ := newWaitBackend(t, f)
+
+		task := snapTask("5", "/data/app", t0.Add(-tc.ended-time.Minute), kopiaclient.TaskSuccess)
+
+		f.addSource(si, nil)
+		f.set(func(f *fakeKopia) {
+			f.setStatus(si, kopiaclient.SourceStatusFailed, "")
+			f.tasks = []kopiaclient.TaskInfo{task}
+		})
+		f.script("GET sources", nil, nil, nil, func(f *fakeKopia) { f.setStatus(si, kopiaclient.SourceStatusIdle, "") })
+
+		res, err := b.WaitSnapshot(waitCtx(t), ticket, nil)
+		if err != nil || res.Outcome != backend.SnapshotUnknown {
+			t.Errorf("ended %v ago: result = %+v, %v", tc.ended, res, err)
+		}
+
+		if n := len(f.requestsTo("GET sources")); n != tc.polls {
+			t.Errorf("ended %v ago: %d polls, want %d", tc.ended, n, tc.polls)
+		}
+	}
+}
+
+// A run is queued behind an upload of any source, but not behind a task of
+// another kind, and never for a source idle, paused, stopped or read-only.
+func TestWaitSnapshotQueuedStates(t *testing.T) {
+	si := info("/data/app")
+	ticket := backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}
+
+	for _, tc := range []struct {
+		status string
+		task   kopiaclient.TaskInfo
+		queued bool
+	}{
+		{kopiaclient.SourceStatusFailed, snapTask("9", "/data/other", t0, kopiaclient.TaskCanceling), true},
+		{kopiaclient.SourceStatusFailed, snapTask("9", "/data/other", t0, kopiaclient.TaskRunning), true},
+		{kopiaclient.SourceStatusFailed, snapTask("9", "/data/other", t0.Add(-time.Hour), kopiaclient.TaskSuccess), false},
+		// Another source's run that ended a moment ago tells nothing.
+		{kopiaclient.SourceStatusFailed, snapTask("9", "/data/other", t0.Add(-time.Minute), kopiaclient.TaskSuccess), false},
+		{kopiaclient.SourceStatusFailed, kopiaclient.TaskInfo{ID: "9", Kind: "Maintenance", Status: kopiaclient.TaskCanceling}, false},
+		{kopiaclient.SourceStatusIdle, snapTask("9", "/data/other", t0, kopiaclient.TaskRunning), false},
+		{kopiaclient.SourceStatusPaused, snapTask("9", "/data/other", t0, kopiaclient.TaskRunning), false},
+		{kopiaclient.SourceStatusStopped, snapTask("9", "/data/other", t0, kopiaclient.TaskRunning), false},
+		{kopiaclient.SourceStatusRemote, snapTask("9", "/data/other", t0, kopiaclient.TaskRunning), false},
+	} {
+		f := newFakeKopia()
+		b, _ := newWaitBackend(t, f)
+
+		f.addSource(si, nil)
+		f.set(func(f *fakeKopia) {
+			f.setStatus(si, tc.status, "")
+			f.tasks = []kopiaclient.TaskInfo{tc.task}
+		})
+		f.script("GET sources", nil, nil, nil, func(f *fakeKopia) { f.setStatus(si, kopiaclient.SourceStatusIdle, "") })
+
+		res, err := b.WaitSnapshot(waitCtx(t), ticket, nil)
+
+		polls := 2
+		if tc.queued {
+			polls = 5
+		}
+
+		if n := len(f.requestsTo("GET sources")); err != nil || res.Outcome != backend.SnapshotUnknown || n != polls {
+			t.Errorf("%s with %s %s: %+v, %v, %d polls; want %d", tc.status, tc.task.Kind, tc.task.Status, res, err, n, polls)
+		}
+	}
+}
+
+// TriggerSnapshot marks the newest task by its number: kopia server prints
+// its counter in hexadecimal and lists the newest task first.
+func TestTriggerSnapshotAnchor(t *testing.T) {
+	for _, tc := range []struct {
+		ids   []string
+		want  string
+		start time.Time
+	}{
+		{nil, "0", time.Time{}},
+		{[]string{"10", "a", "9"}, "10", t0.Add(0x10 * time.Second)},
+		{[]string{"a", "9", "10"}, "10", t0.Add(0x10 * time.Second)},
+		{[]string{"ff", "100"}, "100", t0.Add(0x100 * time.Second)},
+		{[]string{"x", "3"}, "3", t0.Add(3 * time.Second)},
+	} {
+		f := newFakeKopia()
+		b := newBackend(t, f)
+
+		f.addSource(info("/data/app"), nil)
+		f.set(func(f *fakeKopia) {
+			for _, id := range tc.ids {
+				n, _ := strconv.ParseUint(id, 16, 64)
+				f.tasks = append(f.tasks, kopiaclient.TaskInfo{ID: id, Kind: "Maintenance", StartTime: t0.Add(time.Duration(n) * time.Second)})
+			}
+		})
+
+		ticket, err := b.TriggerSnapshot(t.Context(), src("/data/app"))
+		if err != nil || ticket.LastTaskID != tc.want || !ticket.LastTaskStart.Equal(tc.start) {
+			t.Errorf("%v: ticket = %+v, %v; want LastTaskID %s started %v", tc.ids, ticket, err, tc.want, tc.start)
+		}
+	}
 }
 
 // The clock skew allowed between the watcher and kopia server is a minute.
@@ -1193,7 +1405,7 @@ func TestWaitSnapshotClockSkew(t *testing.T) {
 			f.tasks = []kopiaclient.TaskInfo{snapTask("2", "/data/app", tc.start, kopiaclient.TaskFailed)}
 		})
 
-		res, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
+		res, err := b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
 		if err != nil || (res.Outcome == backend.SnapshotFailed) != tc.found {
 			t.Errorf("task started %v before the trigger: result = %+v, %v", t0.Sub(tc.start), res, err)
 		}
@@ -1276,7 +1488,7 @@ func TestWaitSnapshotErrors(t *testing.T) {
 				f.inject(tt.route, tt.inj)
 			}
 
-			res, err := b.WaitSnapshot(t.Context(), tk, nil)
+			res, err := b.WaitSnapshot(waitCtx(t), tk, nil)
 			if err == nil {
 				t.Fatalf("result = %+v, no error", res)
 			}
@@ -1305,7 +1517,7 @@ func TestWaitSnapshotPollFails(t *testing.T) {
 			body: `{"code":"NOT_CONNECTED","error":"not connected"}`})
 	})
 
-	_, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
+	_, err := b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: src("/data/app"), TriggeredAt: t0}, nil)
 	assertError(t, err, opWaitSnapshot, src("/data/app"), backend.ErrUnavailable)
 	assertRoutes(t, f, "GET sources", "GET tasks", "GET sources")
 }
@@ -1350,7 +1562,7 @@ func TestWaitSnapshotSourceChecks(t *testing.T) {
 	b, _ := newWaitBackend(t, f)
 
 	for _, s := range []backend.Source{{Host: fakeHost, UserName: fakeUser}, src("data/app")} {
-		_, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: s, TaskID: "1"}, nil)
+		_, err := b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: s, TaskID: "1"}, nil)
 		assertError(t, err, opWaitSnapshot, s, nil)
 	}
 
@@ -1358,7 +1570,7 @@ func TestWaitSnapshotSourceChecks(t *testing.T) {
 
 	other := backend.Source{Host: "laptop", UserName: fakeUser, Path: "/data/app"}
 
-	_, err := b.WaitSnapshot(t.Context(), backend.SnapshotTicket{Source: other, TaskID: "1"}, nil)
+	_, err := b.WaitSnapshot(waitCtx(t), backend.SnapshotTicket{Source: other, TaskID: "1"}, nil)
 	if !errors.Is(err, backend.ErrWrongIdentity) {
 		t.Errorf("err = %v, want ErrWrongIdentity", err)
 	}

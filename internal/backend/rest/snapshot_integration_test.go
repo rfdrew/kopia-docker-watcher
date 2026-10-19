@@ -84,8 +84,7 @@ func TestIntegrationSnapshots(t *testing.T) {
 		return ticket, res, sv.all(), err
 	}
 
-	// run is snapshot for the test's goroutine. WaitSnapshot saves the
-	// run's task once.
+	// run is snapshot for the test's goroutine.
 	run := func(t *testing.T, src backend.Source) (backend.SnapshotTicket, backend.SnapshotResult, []backend.SnapshotTicket) {
 		t.Helper()
 
@@ -94,7 +93,11 @@ func TestIntegrationSnapshots(t *testing.T) {
 			t.Fatalf("snapshot of %s: %v", src, err)
 		}
 
-		if len(saved) != 1 || saved[0].TaskID != res.TaskID || !strings.HasPrefix(saved[0].TaskDescription, src.String()+" at ") {
+		// Polls before the run's task shows save the newest task they saw,
+		// e.g. one of kopia server's maintenance; the last save has the
+		// run's task.
+		if len(saved) == 0 || saved[len(saved)-1].TaskID != res.TaskID ||
+			!strings.HasPrefix(saved[len(saved)-1].TaskDescription, src.String()+" at ") {
 			t.Errorf("%s: saved %+v for task %q", src, saved, res.TaskID)
 		}
 
@@ -159,7 +162,7 @@ func TestIntegrationSnapshots(t *testing.T) {
 			t.Fatalf("result = %+v", res)
 		}
 
-		known = saved[0]
+		known = saved[len(saved)-1]
 
 		if !ticket.LastSnapshotStart.IsZero() {
 			t.Errorf("LastSnapshotStart = %v before the first snapshot", ticket.LastSnapshotStart)
