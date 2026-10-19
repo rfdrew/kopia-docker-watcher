@@ -36,8 +36,9 @@ const (
 	// the next full reconcile.
 	maxAnnotations = 20
 
-	// clockSkew is how much earlier than the watcher's trigger a snapshot
-	// may start by kopia server's clock and still count as that trigger's.
+	// clockSkew is how far kopia server's clock may be behind the
+	// watcher's. The sweep keeps that far away from the snapshots of the
+	// watcher's own waits.
 	clockSkew = time.Minute
 
 	// maxWaitAge is how long a snapshot wait is kept at most. A wait that
@@ -159,7 +160,7 @@ func (ps *pass) snapshots() error {
 	for _, w := range rec.SnapshotWaits {
 		switch {
 		case !ps.usable(w, true):
-		case ps.started.Sub(w.Ticket.TriggeredAt) > maxWaitAge:
+		case ps.started.Sub(w.Ticket.TriggeredAt) > maxWaitAge && !ps.followed(w):
 			ps.log.Warn("dropping a snapshot wait that could not be finished for a week", "source", ps.src.String(),
 				"reason", w.Reason, "triggered_at", w.Ticket.TriggeredAt.Format(timeFormat))
 
@@ -265,7 +266,7 @@ func (ps *pass) handleFinished(finished []state.SnapshotWait, status *backend.So
 			}
 		}
 
-		if res.Outcome == backend.SnapshotUnknown && !w.Retried && !completeSince(status, w.Ticket.TriggeredAt) {
+		if res.Outcome == backend.SnapshotUnknown && !w.Retried && !savedAfter(status, later(w.Ticket.TriggeredAt, w.StopAt), w.Ticket.LastSnapshotStart) {
 			// The first trigger passed the minimum interval, and no
 			// snapshot came of it.
 			reqs = append(reqs, snapRequest{stop: w.Stop, reason: "again: " + w.Reason, retry: true, replaces: w.ID,
@@ -330,18 +331,45 @@ func (ps *pass) logResult(w state.SnapshotWait) {
 	}
 }
 
-// completeSince reports whether the source's last snapshot is complete
-// and started at t or later, by the watcher's clock give or take
-// clockSkew. A checkpoint or a canceled snapshot does not count: kopia
-// server saves one when an upload is cut short.
-func completeSince(status *backend.SourceStatus, t time.Time) bool {
-	return status != nil && status.LastSnapshot != nil && status.LastSnapshot.Incomplete == "" &&
-		!status.LastSnapshot.StartTime.Before(t.Add(-clockSkew))
+// savedAfter reports whether the source's last snapshot is complete,
+// started at t or later by the watcher's clock, and started after prev by
+// kopia server's, prev being the start of the last snapshot kopia server
+// reported at t (zero if it reported none). A checkpoint or a canceled
+// snapshot does not count: kopia server saves one when an upload is cut
+// short. Neither does an upload that was running at t, whose start is
+// prev when it saved a checkpoint and before t otherwise. If kopia
+// server's clock is behind, a snapshot may be taken once more than needed.
+func savedAfter(status *backend.SourceStatus, t, prev time.Time) bool {
+	if status == nil || status.LastSnapshot == nil || status.LastSnapshot.Incomplete != "" {
+		return false
+	}
+
+	start := status.LastSnapshot.StartTime
+
+	return !start.Before(t) && (prev.IsZero() || start.After(prev))
+}
+
+// later returns the later of a and b.
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+
+	return a
+}
+
+// followed reports whether this process follows the snapshot of w.
+func (ps *pass) followed(w state.SnapshotWait) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	return ps.waiting[waitKey{src: w.Ticket.Source, id: w.ID}]
 }
 
 // absorbedRetry asks for the stop snapshot once more when the pending
 // snapshot that absorbed a stop is over but no complete snapshot started
-// after the stop: kopia server lost the run, as when it restarts.
+// after the stop: kopia server lost the run, as when it restarts. While a
+// snapshot is pending or uploading, the run has not ended.
 //
 // When the pending snapshot saved one, it gets the description worked out
 // at the stop: the containers may be gone by now.
@@ -351,22 +379,63 @@ func (ps *pass) absorbedRetry(rec state.Record, status *backend.SourceStatus, ma
 	switch {
 	case at.IsZero():
 		return nil
-	case completeSince(status, at):
-		last := status.LastSnapshot
-		if desc := rec.StopAbsorbedDescription; desc != "" && last.Description == "" && (mark == nil || last.StartTime.After(*mark)) &&
-			!slices.ContainsFunc(ps.described, last.StartTime.Equal) {
-			_ = ps.annotate(ps.src, last.StartTime, desc)
+	case status != nil && (status.Status == backend.StatusPending || status.Status == backend.StatusUploading):
+		return nil
+	case savedAfter(status, at, rec.StopAbsorbedLastStart):
+		if ps.describeAbsorbed(rec, mark) {
+			ps.clearAbsorbed(at)
 		}
 
-		ps.clearAbsorbed(at)
-
-		return nil
-	case status != nil && (status.Status == backend.StatusPending || status.Status == backend.StatusUploading):
 		return nil
 	}
 
 	return []snapRequest{{stop: true, reason: "again: the stop at " + at.Format(timeFormat) + ", whose pending snapshot saved nothing",
 		retry: true, absorbed: true, description: rec.StopAbsorbedDescription}}
+}
+
+// describeAbsorbed gives the first complete snapshot after an absorbed
+// stop, the one the pending run saved, the description worked out at the
+// stop. It reports whether the stop is done with; after a passing failure
+// it is kept for a later pass.
+func (ps *pass) describeAbsorbed(rec state.Record, mark *time.Time) bool {
+	desc := rec.StopAbsorbedDescription
+	if desc == "" || ps.cannotDescribe() {
+		return true
+	}
+
+	snaps, err := ps.backend.ListSnapshots(ps.ctx, ps.src)
+
+	switch {
+	case errors.Is(err, backend.ErrNotImplemented):
+		ps.warnNotDescribing()
+
+		return true
+	case err != nil:
+		ps.log.Warn("cannot list the snapshots of the source to describe the stop snapshot; trying again at the next pass",
+			"source", ps.src.String(), "error", err.Error())
+
+		return false
+	}
+
+	slices.SortStableFunc(snaps, func(a, b backend.SnapshotInfo) int { return a.StartTime.Compare(b.StartTime) })
+
+	for _, s := range snaps {
+		if s.Incomplete != "" || s.StartTime.Before(rec.StopAbsorbedAt) ||
+			!rec.StopAbsorbedLastStart.IsZero() && !s.StartTime.After(rec.StopAbsorbedLastStart) {
+			continue
+		}
+
+		if s.Description != "" || mark != nil && !s.StartTime.After(*mark) || slices.ContainsFunc(ps.described, s.StartTime.Equal) {
+			return true
+		}
+
+		err := ps.annotate(ps.src, s.StartTime, desc)
+
+		return err == nil || errors.Is(err, backend.ErrSnapshotNotFound) || errors.Is(err, backend.ErrNotImplemented) ||
+			backend.IsConfig(err)
+	}
+
+	return true
 }
 
 // clearAbsorbed clears the stop absorbed at at.
@@ -376,11 +445,17 @@ func (ps *pass) clearAbsorbed(at time.Time) {
 			return false
 		}
 
-		r.StopAbsorbedAt = time.Time{}
-		r.StopAbsorbedDescription = ""
+		clearAbsorbedFields(r)
 
 		return true
 	})
+}
+
+// clearAbsorbedFields clears the absorbed stop of r.
+func clearAbsorbedFields(r *state.Record) {
+	r.StopAbsorbedAt = time.Time{}
+	r.StopAbsorbedDescription = ""
+	r.StopAbsorbedLastStart = time.Time{}
 }
 
 // removeWaits removes the waits with the given IDs from the record.
@@ -603,13 +678,13 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 		return nil
 	case stop && st == backend.StatusPending:
 		ps.log.Info("not queuing a snapshot: the pending one starts after the stop and counts as the stop snapshot", attrs...)
-		ps.absorbStop(reqs, "")
+		ps.absorbStop(reqs, "", status)
 
 		return nil
 	case stop && st == backend.StatusUploading && ps.queuedWait(status.CurrentTask) != "":
 		ps.log.Info("not queuing a snapshot: one the watcher queued runs after the current upload and counts as the stop snapshot",
 			attrs...)
-		ps.absorbStop(reqs, ps.queuedWait(status.CurrentTask))
+		ps.absorbStop(reqs, ps.queuedWait(status.CurrentTask), status)
 
 		return nil
 	case stop:
@@ -728,7 +803,7 @@ func (ps *pass) settle(reqs []snapRequest, w *state.SnapshotWait) {
 		r.SnapshotWaits = slices.DeleteFunc(r.SnapshotWaits, func(x state.SnapshotWait) bool { return replaced[x.ID] })
 
 		if clearAbsorbed {
-			r.StopAbsorbedAt = time.Time{}
+			clearAbsorbedFields(r)
 		}
 
 		if w != nil {
@@ -771,7 +846,7 @@ func (ps *pass) queuedWait(current string) string {
 // The stop counts from the start of the pass, before its policy write: a
 // run that was pending then reads the files after the stop, even if it
 // got its upload slot during the write.
-func (ps *pass) absorbStop(reqs []snapRequest, id string) {
+func (ps *pass) absorbStop(reqs []snapRequest, id string, status *backend.SourceStatus) {
 	var reasons []string
 
 	replaced := map[string]bool{}
@@ -803,6 +878,7 @@ func (ps *pass) absorbStop(reqs []snapRequest, id string) {
 		if i >= 0 {
 			w := &r.SnapshotWaits[i]
 			w.Stop = true
+			w.StopAt = ps.started
 			w.Retried = false
 			w.Reason += ", " + strings.Join(reasons, ", ")
 
@@ -814,6 +890,11 @@ func (ps *pass) absorbStop(reqs []snapRequest, id string) {
 		if id == "" && r.StopAbsorbedAt.IsZero() {
 			r.StopAbsorbedAt = ps.started
 			r.StopAbsorbedDescription = desc
+			r.StopAbsorbedLastStart = time.Time{}
+
+			if status != nil && status.LastSnapshot != nil {
+				r.StopAbsorbedLastStart = status.LastSnapshot.StartTime
+			}
 		}
 
 		return true

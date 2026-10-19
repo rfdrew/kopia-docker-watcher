@@ -28,6 +28,8 @@ type passResult struct {
 	// recheck asks for another pass after EventDelay, which decides on the
 	// start snapshot this pass put off.
 	recheck bool
+	// sweep reports a pass of a full reconcile.
+	sweep bool
 	// problems were reported on the way; the pass went on without them.
 	problems []error
 }
@@ -91,7 +93,8 @@ func (r *Reconciler) reconcile(ctx context.Context, p string) passResult {
 	ps.log.Debug("reconciling the path", "events", eventNames(ps.events))
 
 	err := ps.run()
-	res := passResult{restarting: anyRestarting(ps.owners), problems: ps.problems, recheck: err == nil && ps.deferStart}
+	res := passResult{restarting: anyRestarting(ps.owners), problems: ps.problems, recheck: err == nil && ps.deferStart,
+		sweep: ps.sweepDue}
 
 	switch {
 	case err == nil:

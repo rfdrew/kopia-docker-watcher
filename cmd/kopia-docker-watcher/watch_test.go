@@ -21,6 +21,7 @@ import (
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
 	"github.com/rfdrew/kopia-docker-watcher/internal/kopiaclient"
+	"github.com/rfdrew/kopia-docker-watcher/internal/reconcile"
 )
 
 // Identity of runKopia.
@@ -906,7 +907,8 @@ func TestRunSnapshotOnWatcherStart(t *testing.T) {
 				waitFor(t, "the snapshot", func() bool { return uploads() == tt.want })
 			}
 
-			time.Sleep(3 * time.Second)
+			// Well past the pass that decides.
+			time.Sleep(2*reconcile.DefaultEventDelay + time.Second)
 
 			if n := uploads(); n != tt.want {
 				t.Errorf("%d uploads, want %d; log:\n%s", n, tt.want, wr.td.stderr)

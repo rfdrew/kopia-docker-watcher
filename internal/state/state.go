@@ -175,9 +175,12 @@ type Record struct {
 	// source was pending, which then counts as the stop snapshot; zero if
 	// none. If kopia server loses that run, the stop snapshot is taken
 	// once more. StopAbsorbedDescription is the description worked out at
-	// the stop, for that snapshot.
+	// the stop, for that snapshot. StopAbsorbedLastStart is the start of
+	// the source's last snapshot at the stop by kopia server's clock: only
+	// a snapshot that started later can be the pending one.
 	StopAbsorbedAt          time.Time `json:"stopAbsorbedAt,omitzero"`
 	StopAbsorbedDescription string    `json:"stopAbsorbedDescription,omitempty"`
+	StopAbsorbedLastStart   time.Time `json:"stopAbsorbedLastStart,omitzero"`
 }
 
 // SnapshotWait is a snapshot the watcher queued and has not finished with.
@@ -193,6 +196,10 @@ type SnapshotWait struct {
 	Ticket backend.SnapshotTicket `json:"ticket"`
 	// Stop marks a snapshot taken because a container stopped.
 	Stop bool `json:"stop,omitempty"`
+	// StopAt is when the last stop that this queued snapshot also counts
+	// for happened; zero if none. Only a snapshot that started after it
+	// counts for that stop.
+	StopAt time.Time `json:"stopAt,omitzero"`
 	// Reason says for the log why it was taken, e.g. "start of app".
 	Reason string `json:"reason,omitempty"`
 	// Description is what the snapshot is described as once it is saved,
@@ -784,14 +791,25 @@ func decodeEntry(raw json.RawMessage) (src backend.Source, e entry, note string,
 		return backend.Source{}, entry{}, "", err
 	}
 
-	var notes []string
+	var (
+		notes []string
+		r     Record
+	)
 
-	if n := dropBadWaits(fields); n > 0 {
-		notes = append(notes, fmt.Sprintf("%d snapshot waits cannot be decoded", n))
+	// An entry is decoded as it is, unless a snapshot wait or another
+	// snapshot field keeps it from decoding: then that part is dropped.
+	dropped := dropBadWaits(fields)
+	if dropped > 0 {
+		notes = append(notes, fmt.Sprintf("%d snapshot waits cannot be decoded", dropped))
 	}
 
-	var r Record
-	if err := unmarshalFields(fields, &r); err != nil {
+	err = json.Unmarshal(raw, &r)
+	if dropped > 0 {
+		r = Record{}
+		err = unmarshalFields(fields, &r)
+	}
+
+	if err != nil {
 		for k := range fields {
 			if isSnapshotKey(k) {
 				delete(fields, k)
@@ -799,8 +817,8 @@ func decodeEntry(raw json.RawMessage) (src backend.Source, e entry, note string,
 		}
 
 		r = Record{}
-		if unmarshalFields(fields, &r) != nil {
-			return src, entry{}, "", fmt.Errorf("%s: %w", src, err)
+		if err2 := unmarshalFields(fields, &r); err2 != nil {
+			return src, entry{}, "", fmt.Errorf("%s: %w", src, err2)
 		}
 
 		notes = append(notes, "the snapshot state cannot be decoded: "+err.Error())
@@ -840,9 +858,12 @@ func decodeEntry(raw json.RawMessage) (src backend.Source, e entry, note string,
 	return src, e, strings.Join(notes, "; "), nil
 }
 
-// dropBadWaits removes from the snapshotWaits of fields the waits that do
-// not decode, all of them if the value is no list, and returns how many.
+// dropBadWaits removes from the snapshot waits of fields, under any key
+// encoding/json reads them from, the waits that do not decode, all of them
+// if the value is no list, and returns how many.
 func dropBadWaits(fields map[string]json.RawMessage) int {
+	dropped := 0
+
 	for k, raw := range fields {
 		if !strings.EqualFold(k, "snapshotWaits") {
 			continue
@@ -851,42 +872,40 @@ func dropBadWaits(fields map[string]json.RawMessage) int {
 		var list []json.RawMessage
 		if err := json.Unmarshal(raw, &list); err != nil {
 			delete(fields, k)
-			return 1
+			dropped++
+
+			continue
 		}
 
 		var (
-			keep    []json.RawMessage
-			dropped int
+			keep []json.RawMessage
+			bad  int
 		)
 
 		for _, item := range list {
 			var w SnapshotWait
 			if json.Unmarshal(item, &w) != nil {
-				dropped++
+				bad++
 				continue
 			}
 
 			keep = append(keep, item)
 		}
 
-		if dropped > 0 {
+		if bad > 0 {
 			fields[k] = mustEncode(keep)
+			dropped += bad
 		}
-
-		return dropped
 	}
 
-	return 0
+	return dropped
 }
 
-// unmarshalFields decodes the fields of an entry into r.
+// unmarshalFields decodes the fields of an entry into r. The fields are
+// encoded again without escaping <, > and &, so raw values decode as
+// they were.
 func unmarshalFields(fields map[string]json.RawMessage, r *Record) error {
-	data, err := json.Marshal(fields)
-	if err != nil {
-		return err
-	}
-
-	return json.Unmarshal(data, r)
+	return json.Unmarshal(mustEncode(fields), r)
 }
 
 // isSnapshotKey reports whether encoding/json decodes key into a snapshot

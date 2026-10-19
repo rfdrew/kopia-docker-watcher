@@ -924,6 +924,7 @@ func TestKnownEntryKeys(t *testing.T) {
 		AnnotateAfter:           &mark,
 		StopAbsorbedAt:          mark,
 		StopAbsorbedDescription: "d",
+		StopAbsorbedLastStart:   mark,
 	}
 
 	data, err := json.Marshal(entryForTest{Source: srcA, Record: r})
@@ -1441,5 +1442,56 @@ func TestRecordKeysDoNotCollide(t *testing.T) {
 
 	if len(knownEntryKeys) != len(applied)+len(own) {
 		t.Errorf("knownEntryKeys = %v, want the keys of Applied, Record and source", knownEntryKeys)
+	}
+}
+
+// An entry is read as it is: <, > and & in raw values stay as they are.
+func TestRawValuesReadAsTheyAre(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	content := `{"version":1,"sources":[{"source":{"host":"kopia","userName":"root","path":"/data/a"},` +
+		`"savedScheduling":{"x":"a && b 2>&1 <c>"}}]}`
+
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := open(t, path, Options{})
+
+	if got, _ := s.Get(srcA); string(got.SavedScheduling) != `{"x":"a && b 2>&1 <c>"}` {
+		t.Errorf("saved scheduling = %s", got.SavedScheduling)
+	}
+
+	if !strings.Contains(readFile(t, path), `"a && b 2>&1 <c>"`) {
+		t.Errorf("file:\n%s", readFile(t, path))
+	}
+}
+
+// Every list of snapshot waits is cleaned, under any key encoding/json
+// reads it from, and the entry decodes the same way every time.
+func TestBadWaitsUnderEveryKey(t *testing.T) {
+	raw := json.RawMessage(`{"source":{"host":"kopia","userName":"root","path":"/data/a"},"lastTriggered":"2026-10-18T12:00:00Z",` +
+		`"SnapshotWaits":[{"id":5}],"snapshotWaits":[{"id":"ok","ticket":{"triggeredAt":"2026-10-18T12:00:00Z"}},{"id":6}]}`)
+
+	for range 50 {
+		_, e, note, err := decodeEntry(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		r := mustDecode(e.record)
+		if len(r.SnapshotWaits) != 1 || r.SnapshotWaits[0].ID != "ok" || r.LastTriggered.IsZero() || !strings.Contains(note, "2 snapshot waits") {
+			t.Fatalf("record = %+v, note %q", r, note)
+		}
+	}
+}
+
+// An entry that cannot be read even without its snapshot fields is
+// reported by the field that keeps it from decoding.
+func TestUnreadableEntryNamesItsField(t *testing.T) {
+	raw := json.RawMessage(`{"source":{"host":"kopia","userName":"root","path":"/data/a"},"patch":"x","lastTriggered":5}`)
+
+	_, _, _, err := decodeEntry(raw)
+	if err == nil || !strings.Contains(err.Error(), "Record.patch") {
+		t.Errorf("error = %v", err)
 	}
 }
