@@ -63,6 +63,7 @@ const (
 	TriggerSnapshot  Method = "TriggerSnapshot"
 	WaitSnapshot     Method = "WaitSnapshot"
 	AnnotateSnapshot Method = "AnnotateSnapshot"
+	ListSnapshots    Method = "ListSnapshots"
 )
 
 // Call is one recorded call. Only the fields of the method's arguments are
@@ -1095,4 +1096,35 @@ func (f *Fake) AnnotateSnapshot(ctx context.Context, src backend.Source, startTi
 	f.annotations[src] = append(f.annotations[src], Annotation{StartTime: startTime, Description: description, AddPins: slices.Clone(addPins)})
 
 	return after
+}
+
+// ListSnapshots implements backend.Backend: the snapshots of src sorted by
+// start time, those that started at the same time in the order they were
+// added; none for a source kopia server does not know.
+func (f *Fake) ListSnapshots(ctx context.Context, src backend.Source) ([]backend.SnapshotInfo, error) {
+	after, err := f.enter(ctx, Call{Method: ListSnapshots, Source: src})
+	if err != nil {
+		return nil, err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if err := f.own(ListSnapshots, src); err != nil {
+		return nil, err
+	}
+
+	if after != nil {
+		return nil, after
+	}
+
+	s, ok := f.sources[src]
+	if !ok {
+		return nil, nil
+	}
+
+	out := slices.Clone(s.snapshots)
+	slices.SortStableFunc(out, func(a, b backend.SnapshotInfo) int { return a.StartTime.Compare(b.StartTime) })
+
+	return out, nil
 }

@@ -206,6 +206,12 @@ type Backend interface {
 	// first. Snapshots are found by start time because an edit gives a
 	// snapshot a new ID. No such snapshot is ErrSnapshotNotFound.
 	AnnotateSnapshot(ctx context.Context, src Source, startTime time.Time, description string, addPins []string) error
+
+	// ListSnapshots returns the snapshots of src, checkpoints and
+	// incomplete ones included, sorted by start time (GET
+	// /api/v1/snapshots with all=1, so that snapshots of identical
+	// content are listed one by one).
+	ListSnapshots(ctx context.Context, src Source) ([]SnapshotInfo, error)
 }
 
 // SchedulePreview is the answer of PreviewSchedule.
@@ -229,7 +235,10 @@ const (
 	// task yet.
 	StatusPending   Status = "PENDING"
 	StatusUploading Status = "UPLOADING"
-	// StatusPaused: paused through the control API, not by the policy.
+	// StatusPaused: kopia server dropped a run because the source is
+	// paused through the control API, not by the policy. It stays until
+	// the next run, also after the source is resumed; a paused source
+	// that has dropped no run yet shows IDLE.
 	StatusPaused  Status = "PAUSED"
 	StatusFailed  Status = "FAILED"
 	StatusStopped Status = "STOPPED"
@@ -292,6 +301,17 @@ type SnapshotTicket struct {
 	// found it.
 	TaskID          string `json:"taskID,omitempty"`
 	TaskDescription string `json:"taskDescription,omitempty"`
+	// LastTaskID is the newest task kopia server listed before the
+	// trigger, of any kind, and LastTaskStart its start; "0" and zero if
+	// it listed none. WaitSnapshot moves them to the newest task it sees
+	// while the run's task does not show. kopia server numbers its tasks
+	// up from 1, and anew when it restarts and loses queued runs: a list
+	// without a task numbered at or above LastTaskID, another task under
+	// that ID, or a run's task numbered at or below it tells WaitSnapshot
+	// that kopia server restarted. Empty in a ticket made before the
+	// field.
+	LastTaskID    string    `json:"lastTaskID,omitempty"`
+	LastTaskStart time.Time `json:"lastTaskStart,omitzero"`
 }
 
 // SnapshotOutcome is how a snapshot ended.
@@ -309,9 +329,13 @@ const (
 	// errors.
 	SnapshotIncomplete SnapshotOutcome = "incomplete"
 	SnapshotFailed     SnapshotOutcome = "failed"
-	SnapshotCanceled   SnapshotOutcome = "canceled"
-	// SnapshotUnknown: the task is gone, for example kopia server
-	// restarted; the reconciler finds out on its next pass.
+	// SnapshotCanceled: the upload was canceled; what it had read may
+	// have been saved as an incomplete snapshot.
+	SnapshotCanceled SnapshotOutcome = "canceled"
+	// SnapshotUnknown: how the run ended cannot be told, for example
+	// because kopia server restarted and lost it, its task is gone, or
+	// the snapshot it saved has been deleted; the reconciler finds out on
+	// its next pass.
 	SnapshotUnknown SnapshotOutcome = "unknown"
 )
 
@@ -319,8 +343,12 @@ const (
 type SnapshotResult struct {
 	Outcome SnapshotOutcome
 	TaskID  string
-	// Snapshot is the snapshot the task saved; nil if it saved none.
+	// Snapshot is the snapshot the task saved, for SnapshotSucceeded and
+	// SnapshotIncomplete, and for SnapshotCanceled if the canceled upload
+	// saved one; nil otherwise.
 	Snapshot *SnapshotInfo
-	// Error is the task's error message for a failed snapshot.
+	// Error tells why the outcome is not SnapshotSucceeded or
+	// SnapshotIdentical, such as the task's error message for a failed
+	// snapshot; empty for those two.
 	Error string
 }

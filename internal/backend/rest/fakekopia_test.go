@@ -43,6 +43,13 @@ import (
 //     set with upcoming unless the effective scheduling is manual.
 //   - POST /api/v1/paths/resolve expands ~, resolves a relative path
 //     against home and cleans it.
+//   - GET /api/v1/tasks lists tasks, GET /api/v1/tasks/{id} returns one
+//     or a 404 NOT_FOUND, GET /api/v1/tasks/{id}/logs its log (null for an
+//     unknown task).
+//   - GET /api/v1/snapshots lists the source's snapshots, oldest first,
+//     and without all=1 keeps the oldest of those with the same root.
+//   - POST /api/v1/snapshots/edit changes the description and adds pins;
+//     a changed snapshot gets a new ID, an unknown ID is a 500.
 //
 // Requests are recorded. inject queues a response for the next request of
 // a route, sent instead of the real one (before) or after the request took
@@ -64,7 +71,13 @@ type fakeKopia struct {
 	// the path's own in policy/resolve.
 	inherited map[string]json.RawMessage
 	upcoming  []time.Time
-	tasks     []kopiaclient.TaskInfo
+	// tasks are listed as given: kopia server lists the newest first.
+	tasks    []kopiaclient.TaskInfo
+	taskLogs map[string][]string
+	// snapshots are the manifests of each source; nextID numbers the
+	// manifests an edit saves.
+	snapshots map[kopiaclient.SourceInfo][]kopiaclient.Snapshot
+	nextID    int
 	// refreshFails makes a refresh fail; kopia server only logs that, and
 	// the policy write still succeeds.
 	refreshFails bool
@@ -123,6 +136,8 @@ func newFakeKopia() *fakeKopia {
 		badCrons:   map[string]bool{},
 		inherited:  map[string]json.RawMessage{},
 		injections: map[string][]injection{},
+		taskLogs:   map[string][]string{},
+		snapshots:  map[kopiaclient.SourceInfo][]kopiaclient.Snapshot{},
 	}
 }
 
@@ -382,9 +397,143 @@ func (f *fakeKopia) serve(r fakeRequest) (int, string) {
 		return f.upload(r.Query)
 	case "GET tasks":
 		return ok(map[string]any{"tasks": f.tasks})
-	default:
-		return http.StatusNotFound, "404 page not found"
+	case "GET snapshots":
+		return f.listSnapshots(r.Query)
+	case "POST snapshots/edit":
+		return f.editSnapshots(r.Body)
 	}
+
+	if id, found := strings.CutPrefix(r.Route, "GET tasks/"); found {
+		if id, found := strings.CutSuffix(id, "/logs"); found {
+			return f.taskLog(id)
+		}
+
+		return f.task(id)
+	}
+
+	return http.StatusNotFound, "404 page not found"
+}
+
+func (f *fakeKopia) task(id string) (int, string) {
+	for _, t := range f.tasks {
+		if t.ID == id {
+			return ok(t)
+		}
+	}
+
+	return apiError(http.StatusNotFound, kopiaclient.CodeNotFound, "task not found")
+}
+
+// taskLog returns the log of a task, every line at the level the test set
+// in front of it: "3|message" is an error.
+func (f *fakeKopia) taskLog(id string) (int, string) {
+	lines, found := f.taskLogs[id]
+	if !found {
+		return ok(map[string]any{"logs": nil})
+	}
+
+	logs := []map[string]any{}
+
+	for i, l := range lines {
+		level, msg, _ := strings.Cut(l, "|")
+		logs = append(logs, map[string]any{"level": json.Number(level), "ts": 1760778000 + i, "mod": "uploader", "msg": msg})
+	}
+
+	return ok(map[string]any{"logs": logs})
+}
+
+// listSnapshots is GET /api/v1/snapshots: the snapshots of exactly the
+// source, sorted by start and end time like snapshot.SortByTime.
+func (f *fakeKopia) listSnapshots(q url.Values) (int, string) {
+	snaps := slices.Clone(f.snapshots[target(q)])
+	slices.SortStableFunc(snaps, func(a, b kopiaclient.Snapshot) int {
+		if c := a.StartTime.Compare(b.StartTime); c != 0 {
+			return c
+		}
+
+		return a.EndTime.Compare(b.EndTime)
+	})
+
+	resp := map[string]any{"unfilteredCount": len(snaps)}
+
+	if q.Get("all") == "" {
+		var unique []kopiaclient.Snapshot
+
+		for _, s := range snaps {
+			if !slices.ContainsFunc(unique, func(u kopiaclient.Snapshot) bool { return u.RootID == s.RootID }) {
+				unique = append(unique, s)
+			}
+		}
+
+		snaps = unique
+	}
+
+	if snaps == nil {
+		snaps = []kopiaclient.Snapshot{}
+	}
+
+	resp["snapshots"] = snaps
+
+	return ok(resp)
+}
+
+// editSnapshots is POST /api/v1/snapshots/edit: a snapshot whose
+// description or pins change is saved under a new ID.
+func (f *fakeKopia) editSnapshots(body json.RawMessage) (int, string) {
+	var req struct {
+		Snapshots   []string `json:"snapshots"`
+		Description *string  `json:"description"`
+		AddPins     []string `json:"addPins"`
+		RemovePins  []string `json:"removePins"`
+	}
+
+	if err := json.Unmarshal(body, &req); err != nil {
+		return apiError(http.StatusBadRequest, kopiaclient.CodeMalformedRequest, "malformed request")
+	}
+
+	var out []kopiaclient.Snapshot
+
+	for _, id := range req.Snapshots {
+		snap := f.snapshotByID(id)
+		if snap == nil {
+			return apiError(http.StatusInternalServerError, kopiaclient.CodeInternal,
+				"internal server error: unable to load snapshot: manifest not found")
+		}
+
+		changed := req.Description != nil
+
+		for _, p := range req.AddPins {
+			if !slices.Contains(snap.Pins, p) {
+				snap.Pins = append(snap.Pins, p)
+				changed = true
+			}
+		}
+
+		if req.Description != nil {
+			snap.Description = *req.Description
+		}
+
+		if changed {
+			f.nextID++
+			snap.ID = fmt.Sprintf("edited-%d", f.nextID)
+		}
+
+		out = append(out, *snap)
+	}
+
+	return ok(out)
+}
+
+func (f *fakeKopia) snapshotByID(id string) *kopiaclient.Snapshot {
+	for _, snaps := range f.snapshots {
+		for i := range snaps {
+			if snaps[i].ID == id {
+				return &snaps[i]
+			}
+		}
+	}
+
+	return nil
 }
 
 func (f *fakeKopia) listSources(q url.Values) (int, string) {

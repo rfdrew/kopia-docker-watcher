@@ -18,9 +18,12 @@
 // Errors are *backend.Error with the kinds package backend documents for
 // the errors of internal/kopiaclient.
 //
-// The snapshot lifecycle is not implemented yet: TriggerSnapshot queues a
-// snapshot, WaitSnapshot and AnnotateSnapshot return
-// backend.ErrNotImplemented.
+// kopia server returns no task ID for a snapshot it queues, numbers its
+// tasks anew when it restarts, and gives a snapshot a new ID when its
+// description or pins change. So a run is followed by the snapshot tasks of
+// the source that appear after the trigger, and a snapshot is found by its
+// start time; see TriggerSnapshot, WaitSnapshot, AnnotateSnapshot and
+// ListSnapshots.
 package rest
 
 import (
@@ -46,6 +49,11 @@ type Backend struct {
 	log    *slog.Logger
 	now    func() time.Time
 
+	// pollMin and pollMax bound the interval between two polls of
+	// WaitSnapshot, which waits for after.
+	pollMin, pollMax time.Duration
+	after            func(time.Duration) <-chan time.Time
+
 	// ident is kopia server's identity from its last answer to GET
 	// /api/v1/sources; nil before the first. It is only a hint for the
 	// filter of ListSources, which checks it against the answer.
@@ -60,13 +68,14 @@ var _ backend.Backend = (*Backend)(nil)
 
 // New returns a Backend that talks to kopia server through client. log
 // receives the failures the Backend handles itself, such as a policy it
-// could not read back after writing it; nil discards them.
+// could not read back after writing it or the log of a failed snapshot
+// task it could not read; nil discards them.
 func New(client *kopiaclient.Client, log *slog.Logger) *Backend {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
 
-	return &Backend{client: client, log: log, now: time.Now}
+	return &Backend{client: client, log: log, now: time.Now, pollMin: defaultPollMin, pollMax: defaultPollMax, after: time.After}
 }
 
 // Backend method names, the Op of errors.
@@ -81,6 +90,7 @@ const (
 	opTriggerSnapshot  = "TriggerSnapshot"
 	opWaitSnapshot     = "WaitSnapshot"
 	opAnnotateSnapshot = "AnnotateSnapshot"
+	opListSnapshots    = "ListSnapshots"
 )
 
 // ServerIdentity implements backend.Backend with GET /api/v1/sources.
@@ -367,64 +377,6 @@ func (b *Backend) DeletePolicy(ctx context.Context, src backend.Source) error {
 	}
 
 	return nil
-}
-
-// TriggerSnapshot implements backend.Backend with sources/upload. The
-// ticket records the start of the source's last snapshot and the IDs of
-// the source's snapshot tasks kopia server lists before the trigger. A
-// source kopia server has not picked up yet is ErrTemporary, as after a
-// policy write whose refresh failed. A source kopia server runs read-only
-// (status REMOTE: the repository is connected read-only) is an error of
-// neither kind.
-//
-// It is provisional, like the method in backend.Backend: the snapshot
-// lifecycle may change it.
-func (b *Backend) TriggerSnapshot(ctx context.Context, src backend.Source) (backend.SnapshotTicket, error) {
-	status, err := b.lookup(ctx, opTriggerSnapshot, src)
-	if err != nil {
-		return backend.SnapshotTicket{}, err
-	}
-
-	if status != nil && status.Status == kopiaclient.SourceStatusRemote {
-		return backend.SnapshotTicket{}, &backend.Error{Op: opTriggerSnapshot, Source: src,
-			Err: errors.New("kopia server does not snapshot the source: its repository is connected read-only")}
-	}
-
-	tasks, err := b.client.ListTasks(ctx)
-	if err != nil {
-		return backend.SnapshotTicket{}, fail(ctx, opTriggerSnapshot, src, reqRead, err)
-	}
-
-	ticket := backend.SnapshotTicket{Source: src, TriggeredAt: b.now()}
-
-	if status != nil && status.LastSnapshot != nil {
-		ticket.LastSnapshotStart = status.LastSnapshot.StartTime
-	}
-
-	// kopia server describes a snapshot task as "user@host:path at <time>".
-	prefix := src.String() + " at "
-
-	for _, t := range tasks {
-		if t.Kind == kopiaclient.TaskKindSnapshot && strings.HasPrefix(t.Description, prefix) {
-			ticket.TasksBefore = append(ticket.TasksBefore, t.ID)
-		}
-	}
-
-	if err := b.client.StartSnapshot(ctx, toInfo(src)); err != nil {
-		return backend.SnapshotTicket{}, fail(ctx, opTriggerSnapshot, src, reqUpload, err)
-	}
-
-	return ticket, nil
-}
-
-// WaitSnapshot implements backend.Backend. It is not implemented yet.
-func (b *Backend) WaitSnapshot(_ context.Context, ticket backend.SnapshotTicket, _ func(backend.SnapshotTicket)) (backend.SnapshotResult, error) {
-	return backend.SnapshotResult{}, &backend.Error{Op: opWaitSnapshot, Source: ticket.Source, Err: backend.ErrNotImplemented}
-}
-
-// AnnotateSnapshot implements backend.Backend. It is not implemented yet.
-func (b *Backend) AnnotateSnapshot(_ context.Context, src backend.Source, _ time.Time, _ string, _ []string) error {
-	return &backend.Error{Op: opAnnotateSnapshot, Source: src, Err: backend.ErrNotImplemented}
 }
 
 // lookup checks that src is a complete source of kopia server's identity

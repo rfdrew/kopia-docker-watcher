@@ -17,7 +17,8 @@ type request int
 
 const (
 	// reqRead: GET /api/v1/sources, GET /api/v1/policy, paths/resolve,
-	// GET /api/v1/tasks.
+	// GET /api/v1/snapshots, GET /api/v1/tasks and the task and log of
+	// one.
 	reqRead request = iota
 	// reqWritePolicy: PUT /api/v1/policy.
 	reqWritePolicy
@@ -35,6 +36,8 @@ const (
 	reqResolvePolicy
 	// reqUpload: POST /api/v1/sources/upload.
 	reqUpload
+	// reqEditSnapshots: POST /api/v1/snapshots/edit.
+	reqEditSnapshots
 )
 
 // Texts of kopia server's 500 answers (internal/server/api_error.go,
