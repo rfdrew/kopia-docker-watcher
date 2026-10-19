@@ -53,8 +53,10 @@ type pass struct {
 	// containers is the listing of the pass.
 	containers []docker.Container
 
-	// described are the start times of the snapshots the pass described.
-	described []time.Time
+	// described are the start times of the snapshots the pass described;
+	// annotateAfter is the description mark of its source.
+	described     []time.Time
+	annotateAfter *time.Time
 
 	// wrote reports that the pass wrote the policy. deferred reports that
 	// an earlier pass put the start snapshot off already, deferStart that

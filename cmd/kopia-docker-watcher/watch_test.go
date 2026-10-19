@@ -917,7 +917,7 @@ func TestRunSnapshotOnStart(t *testing.T) {
 	k := newRunKopia(t)
 	e := newWatchEngine(appContainer())
 
-	wr := startWatcher(t, k, e, watcherOptions{})
+	wr := startWatcher(t, k, e, watcherOptions{env: []string{"LOG_LEVEL", "debug"}})
 
 	waitFor(t, "the policy", func() bool { return cronOf(t, k, "/srv/app") != nil })
 
@@ -936,10 +936,12 @@ func TestRunSnapshotOnStart(t *testing.T) {
 	wr.waitLog(t, "snapshot finished")
 	waitFor(t, "the description", func() bool { return slices.Equal(k.descriptions("/srv/app"), []string{"app"}) })
 
-	// Another start within the minimum interval queues none.
+	// Another start within the minimum interval queues none. It is another
+	// event: the watcher drops one it has delivered already.
+	start.Time = time.Now()
 	e.events <- start
 
-	time.Sleep(3 * time.Second)
+	wr.waitLog(t, "not queuing a snapshot: the minimum interval since the last one has not passed")
 
 	if got := uploads(); !slices.Equal(got, []string{"/srv/app"}) {
 		t.Errorf("uploads = %q", got)

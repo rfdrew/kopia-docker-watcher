@@ -256,7 +256,7 @@ func TestIntegrationRun(t *testing.T) {
 	waitIdle(t, c, src)
 
 	before := snapshotTasks(t, c, src)
-	restart := time.Now()
+	earlier := snapshotStarts(t, c, src)
 
 	if err := ctr.Start(ctx); err != nil {
 		t.Fatalf("start busybox again: %v", err)
@@ -273,10 +273,6 @@ func TestIntegrationRun(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	if !strings.Contains(td.stderr.String(), `"msg":"snapshot queued"`) {
-		t.Errorf("the watcher did not queue the snapshot; log:\n%s", td.stderr)
-	}
-
 	// The watcher follows the snapshot to its end and describes it with the
 	// container's name.
 	info, err := ctr.Inspect(ctx)
@@ -286,7 +282,7 @@ func TestIntegrationRun(t *testing.T) {
 
 	name := strings.TrimPrefix(info.Name, "/")
 
-	for deadline := time.Now().Add(2 * time.Minute); !described(t, c, src, restart, name); {
+	for deadline := time.Now().Add(2 * time.Minute); !described(t, c, src, earlier, name); {
 		if time.Now().After(deadline) {
 			t.Fatalf("the snapshot after the start is not described %q; log:\n%s", name, td.stderr)
 		}
@@ -294,8 +290,11 @@ func TestIntegrationRun(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	if !strings.Contains(td.stderr.String(), `"msg":"snapshot finished"`) {
-		t.Errorf("the watcher did not log the snapshot's end; log:\n%s", td.stderr)
+	// The description comes after both log lines.
+	for _, msg := range []string{"snapshot queued", "snapshot finished"} {
+		if !strings.Contains(td.stderr.String(), `"msg":"`+msg+`"`) {
+			t.Errorf("no log line %q; log:\n%s", msg, td.stderr)
+		}
 	}
 
 	stop()
@@ -319,9 +318,26 @@ func TestIntegrationRun(t *testing.T) {
 	}
 }
 
+// snapshotStarts returns the start times of the snapshots of src.
+func snapshotStarts(t *testing.T, c *kopiaclient.Client, src kopiaclient.SourceInfo) []time.Time {
+	t.Helper()
+
+	resp, err := c.ListSnapshots(t.Context(), src, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := make([]time.Time, 0, len(resp.Snapshots))
+	for _, s := range resp.Snapshots {
+		out = append(out, s.StartTime)
+	}
+
+	return out
+}
+
 // described reports whether a complete snapshot of src that started after
-// since has the description desc.
-func described(t *testing.T, c *kopiaclient.Client, src kopiaclient.SourceInfo, since time.Time, desc string) bool {
+// all of earlier has the description desc.
+func described(t *testing.T, c *kopiaclient.Client, src kopiaclient.SourceInfo, earlier []time.Time, desc string) bool {
 	t.Helper()
 
 	resp, err := c.ListSnapshots(t.Context(), src, true)
@@ -330,7 +346,8 @@ func described(t *testing.T, c *kopiaclient.Client, src kopiaclient.SourceInfo, 
 	}
 
 	return slices.ContainsFunc(resp.Snapshots, func(s kopiaclient.Snapshot) bool {
-		return s.IncompleteReason == "" && s.StartTime.After(since.Add(-time.Minute)) && s.Description == desc
+		return s.IncompleteReason == "" && s.Description == desc &&
+			!slices.ContainsFunc(earlier, func(e time.Time) bool { return !s.StartTime.After(e) })
 	})
 }
 

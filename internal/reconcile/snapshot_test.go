@@ -2168,3 +2168,122 @@ func TestFollowedWaitKept(t *testing.T) {
 		t.Errorf("waits = %+v", ws)
 	}
 }
+
+// When kopia server lost track of a run that saved its snapshot, the
+// snapshot is found among the source's snapshots and described with the
+// wait's description; it is not taken again.
+func TestLostRunFoundByListing(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		saved backend.SnapshotInfo
+		want  int
+	}{
+		{"saved", backend.SnapshotInfo{EndTime: t0.Add(2 * time.Hour)}, 1},
+		{"canceled", backend.SnapshotInfo{EndTime: t0.Add(2 * time.Hour), Incomplete: "canceled"}, 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			c := withClock(h)
+			src := h.src(app)
+			id := h.engine.run("app", enable, pathLabel(app), onStop, "kopia.description=Main DB")
+			h.mustPass(app)
+
+			c.add(time.Hour)
+			h.engine.setState(id, docker.StateExited)
+			h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+			h.r.HandleEvent(h.engine.remove(id))
+			h.mustPass(app)
+
+			snap := tt.saved
+			snap.StartTime = c.now().Add(time.Second)
+			h.fake.AddSnapshot(src, snap)
+			// A checkpoint of a later upload is the last snapshot now.
+			h.fake.AddSnapshot(src, backend.SnapshotInfo{StartTime: c.now().Add(time.Hour), Incomplete: "checkpoint"})
+
+			h.finish(app, state.SnapshotResult{Outcome: backend.SnapshotUnknown, Error: "task gone"})
+			h.mustPass(app)
+
+			if n := h.triggers(app); n != tt.want {
+				t.Errorf("%d triggers, want %d", n, tt.want)
+			}
+
+			got := h.fake.Annotations(src)
+			if tt.want == 1 && (len(got) != 1 || got[0].Description != "Main DB" || !got[0].StartTime.Equal(snap.StartTime)) {
+				t.Errorf("annotations = %+v", got)
+			}
+
+			if tt.want == 2 && len(got) != 0 {
+				t.Errorf("a canceled snapshot was described: %+v", got)
+			}
+		})
+	}
+}
+
+// A second stop while a run is pending takes the place of an earlier
+// stop whose absorbing run has saved its snapshot: if the run pending now
+// is lost, the second stop's snapshot is taken.
+func TestSecondAbsorbedStop(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	src := h.src(app)
+	a := h.engine.run("a", enable, pathLabel(app), onStop, "kopia.description=A")
+	b := h.engine.run("b", enable, pathLabel(app), onStop, "kopia.description=B")
+	h.mustPass(app)
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusPending})
+
+	c.add(time.Minute)
+	h.engine.setState(a, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, a))
+	h.mustPass(app)
+
+	first := c.now().Add(time.Second)
+	h.fake.AddSnapshot(src, backend.SnapshotInfo{StartTime: first, EndTime: first.Add(time.Second)})
+
+	c.add(time.Minute)
+	h.engine.setState(b, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, b))
+	h.mustPass(app)
+
+	if got := h.record(app).StopAbsorbedAt; !got.Equal(c.now()) {
+		t.Fatalf("absorbed at %v, want the second stop at %v", got, c.now())
+	}
+
+	// kopia server loses the run pending at the second stop.
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusIdle})
+	h.mustPass(app)
+
+	if n := h.triggers(app); n != 1 {
+		t.Errorf("%d triggers, want the second stop's snapshot", n)
+	}
+
+	if got := h.fake.Annotations(src); len(got) != 1 || !got[0].StartTime.Equal(first) || got[0].Description != "A, B" {
+		t.Errorf("annotations = %+v", got)
+	}
+}
+
+// A run the watcher followed that absorbed a stop and saved nothing new,
+// as nothing had changed, counts as the stop snapshot.
+func TestAbsorbingRunIdentical(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	src := h.src(app)
+	id := h.engine.run("app", enable, pathLabel(app), onStop)
+	h.mustPass(app)
+
+	h.r.HandleEvent(h.engine.event(docker.KindStarted, id))
+	h.mustPass(app)
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusPending})
+
+	c.add(time.Minute)
+	h.engine.setState(id, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+	h.mustPass(app)
+
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusIdle})
+	h.finish(app, state.SnapshotResult{Outcome: backend.SnapshotIdentical})
+	h.mustPass(app)
+
+	if n := h.triggers(app); n != 1 || !h.record(app).StopAbsorbedAt.IsZero() {
+		t.Errorf("%d triggers, absorbed at %v", n, h.record(app).StopAbsorbedAt)
+	}
+}

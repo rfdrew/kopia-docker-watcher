@@ -151,6 +151,7 @@ func (ps *pass) snapshots() error {
 
 	rec, _ := ps.store.Get(ps.src)
 	mark := ps.mark(rec, status)
+	ps.annotateAfter = mark
 
 	var (
 		finished []state.SnapshotWait
@@ -174,8 +175,8 @@ func (ps *pass) snapshots() error {
 
 	ps.removeWaits(expired)
 
-	reqs := ps.handleFinished(finished, status, mark)
-	reqs = append(reqs, ps.absorbedRetry(rec, status, mark)...)
+	reqs, identical := ps.handleFinished(finished, rec.SnapshotWaits, status, mark)
+	reqs = append(reqs, ps.absorbedRetry(rec, status, mark, identical)...)
 	reqs = append(reqs, ps.requests()...)
 
 	if err := ps.trigger(reqs, status); err != nil {
@@ -240,40 +241,83 @@ func (ps *pass) mark(rec state.Record, status *backend.SourceStatus) *time.Time 
 // those they saved and removes the waits. A wait whose snapshot could not
 // be described for a passing reason stays, with its result logged, so that
 // a later pass describes it with the description worked out when it was
-// queued. A snapshot whose result is unknown, and after which no complete
-// snapshot was saved, is asked for once more; its wait goes once that
-// request is settled.
-func (ps *pass) handleFinished(finished []state.SnapshotWait, status *backend.SourceStatus, mark *time.Time) []snapRequest {
+// queued.
+//
+// When kopia server lost track of a run, its snapshot is looked for among
+// the source's snapshots: one that is complete and started after the run
+// was queued, and before the next run the watcher queued. If there is none,
+// the snapshot is asked for once more; its wait goes once that request is
+// settled.
+//
+// It also returns when the stops happened that waits which ended without
+// a new snapshot, as nothing had changed, counted for: those runs read
+// the files after the stop.
+func (ps *pass) handleFinished(finished, waits []state.SnapshotWait, status *backend.SourceStatus, mark *time.Time) ([]snapRequest, []time.Time) {
 	var (
-		reqs   []snapRequest
-		done   = map[string]bool{}
-		logged = map[string]bool{}
+		reqs      []snapRequest
+		identical []time.Time
+		done      = map[string]bool{}
+		logged    = map[string]bool{}
 	)
 
 	for _, w := range finished {
 		res := w.Result
+		start := res.SnapshotStart
 
-		if !w.Logged {
+		if res.Outcome == backend.SnapshotUnknown {
+			found, saved, decided := ps.lostRun(w, waits, status)
+			if !decided {
+				if !w.Logged {
+					ps.logResult(w)
+				}
+
+				logged[w.ID] = true
+
+				continue
+			}
+
+			if !saved {
+				if !w.Logged {
+					ps.logResult(w)
+				}
+
+				if !w.Retried {
+					// The first trigger passed the minimum interval, and no
+					// snapshot came of it.
+					reqs = append(reqs, snapRequest{stop: w.Stop, reason: "again: " + w.Reason, retry: true, replaces: w.ID,
+						description: w.Description})
+					logged[w.ID] = true
+
+					continue
+				}
+
+				done[w.ID] = true
+
+				continue
+			}
+
+			if !w.Logged {
+				ps.log.Info("snapshot finished: kopia server lost track of the run, but its snapshot is listed",
+					"source", ps.src.String(), "reason", w.Reason, "error", res.Error, "start_time", found.Format(timeFormat))
+			}
+
+			start = found
+		} else if !w.Logged {
 			ps.logResult(w)
 		}
 
-		if !res.SnapshotStart.IsZero() && w.Description != "" && (mark == nil || res.SnapshotStart.After(*mark)) {
-			err := ps.annotate(ps.src, res.SnapshotStart, w.Description)
+		if res.Outcome == backend.SnapshotIdentical && w.Stop && !w.StopAt.IsZero() {
+			identical = append(identical, w.StopAt)
+		}
+
+		if !start.IsZero() && w.Description != "" && (mark == nil || start.After(*mark)) &&
+			!slices.ContainsFunc(ps.described, start.Equal) {
+			err := ps.annotate(ps.src, start, w.Description)
 			if err != nil && !errors.Is(err, backend.ErrSnapshotNotFound) && !errors.Is(err, backend.ErrNotImplemented) &&
 				!backend.IsConfig(err) {
 				logged[w.ID] = true
 				continue
 			}
-		}
-
-		if res.Outcome == backend.SnapshotUnknown && !w.Retried && !savedAfter(status, later(w.Ticket.TriggeredAt, w.StopAt), w.Ticket.LastSnapshotStart) {
-			// The first trigger passed the minimum interval, and no
-			// snapshot came of it.
-			reqs = append(reqs, snapRequest{stop: w.Stop, reason: "again: " + w.Reason, retry: true, replaces: w.ID,
-				description: w.Description})
-			logged[w.ID] = true
-
-			continue
 		}
 
 		done[w.ID] = true
@@ -295,7 +339,70 @@ func (ps *pass) handleFinished(finished []state.SnapshotWait, status *backend.So
 		})
 	}
 
-	return reqs
+	return reqs, identical
+}
+
+// lostRun looks for the snapshot of a run kopia server lost track of: the
+// first complete snapshot that started after the run was queued (and after
+// the last stop it counts for) by the watcher's clock, after the last
+// snapshot kopia server reported then by its own clock, and before the
+// next run the watcher queued. found is its start; saved reports whether
+// there is one. A backend that cannot list snapshots leaves the source's
+// last snapshot to tell. decided is false when listing failed for a
+// passing reason.
+func (ps *pass) lostRun(w state.SnapshotWait, waits []state.SnapshotWait, status *backend.SourceStatus) (found time.Time, saved, decided bool) {
+	since := later(w.Ticket.TriggeredAt, w.StopAt)
+
+	byLast := func() (time.Time, bool, bool) {
+		if savedAfter(status, since, w.Ticket.LastSnapshotStart) {
+			return status.LastSnapshot.StartTime, true, true
+		}
+
+		return time.Time{}, false, true
+	}
+
+	if ps.cannotDescribe() {
+		return byLast()
+	}
+
+	snaps, err := ps.backend.ListSnapshots(ps.ctx, ps.src)
+
+	switch {
+	case errors.Is(err, backend.ErrNotImplemented):
+		ps.warnNotDescribing()
+
+		return byLast()
+	case err != nil:
+		ps.log.Warn("cannot list the snapshots of the source to find the one of a lost run; trying again at the next pass",
+			"source", ps.src.String(), "error", err.Error())
+
+		return time.Time{}, false, false
+	}
+
+	var until time.Time
+
+	for _, x := range waits {
+		if x.ID != w.ID && ps.usable(x, false) && x.Ticket.TriggeredAt.After(w.Ticket.TriggeredAt) &&
+			(until.IsZero() || x.Ticket.TriggeredAt.Before(until)) {
+			until = x.Ticket.TriggeredAt
+		}
+	}
+
+	slices.SortStableFunc(snaps, func(a, b backend.SnapshotInfo) int { return a.StartTime.Compare(b.StartTime) })
+
+	for _, sn := range snaps {
+		switch {
+		case sn.Incomplete != "", sn.StartTime.Before(since),
+			!w.Ticket.LastSnapshotStart.IsZero() && !sn.StartTime.After(w.Ticket.LastSnapshotStart):
+			continue
+		case !until.IsZero() && !sn.StartTime.Before(until):
+			return time.Time{}, false, true
+		}
+
+		return sn.StartTime, true, true
+	}
+
+	return time.Time{}, false, true
 }
 
 // logResult logs how the snapshot of the finished wait w ended.
@@ -373,11 +480,18 @@ func (ps *pass) followed(w state.SnapshotWait) bool {
 //
 // When the pending snapshot saved one, it gets the description worked out
 // at the stop: the containers may be gone by now.
-func (ps *pass) absorbedRetry(rec state.Record, status *backend.SourceStatus, mark *time.Time) []snapRequest {
+//
+// A run the watcher followed that absorbed the stop and ended without a
+// new snapshot, as nothing had changed, was the stop snapshot too.
+func (ps *pass) absorbedRetry(rec state.Record, status *backend.SourceStatus, mark *time.Time, identical []time.Time) []snapRequest {
 	at := rec.StopAbsorbedAt
 
 	switch {
 	case at.IsZero():
+		return nil
+	case slices.ContainsFunc(identical, at.Equal):
+		ps.clearAbsorbed(at)
+
 		return nil
 	case status != nil && (status.Status == backend.StatusPending || status.Status == backend.StatusUploading):
 		return nil
@@ -870,6 +984,20 @@ func (ps *pass) absorbStop(reqs []snapRequest, id string, status *backend.Source
 	desc, tags := ps.description(reqs)
 	ps.warnTags(tags)
 
+	// An earlier stop that a pending run absorbed, and which that run has
+	// saved its snapshot for, gives way to this one: the run pending now
+	// is another.
+	rec, _ := ps.store.Get(ps.src)
+	earlier := rec.StopAbsorbedAt
+
+	if id != "" || earlier.IsZero() || !savedAfter(status, earlier, rec.StopAbsorbedLastStart) {
+		earlier = time.Time{}
+	} else if !ps.describeAbsorbed(rec, ps.annotateAfter) {
+		// Kept for a later pass, which describes it and then sees the
+		// source idle or this stop's run pending.
+		earlier = time.Time{}
+	}
+
 	ps.updateRecord(ps.src, func(r *state.Record) bool {
 		r.SnapshotWaits = slices.DeleteFunc(r.SnapshotWaits, func(x state.SnapshotWait) bool { return replaced[x.ID] })
 
@@ -893,7 +1021,7 @@ func (ps *pass) absorbStop(reqs []snapRequest, id string, status *backend.Source
 			}
 		}
 
-		if id == "" && r.StopAbsorbedAt.IsZero() {
+		if id == "" && (r.StopAbsorbedAt.IsZero() || !earlier.IsZero() && r.StopAbsorbedAt.Equal(earlier)) {
 			r.StopAbsorbedAt = ps.started
 			r.StopAbsorbedDescription = desc
 			r.StopAbsorbedLastStart = time.Time{}
