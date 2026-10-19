@@ -1899,23 +1899,35 @@ func TestRunWaitsForWaiters(t *testing.T) {
 	}
 }
 
-// While kopia server does not run snapshots of the source (paused through
-// its control API), none is queued.
-func TestNoSnapshotWhilePaused(t *testing.T) {
-	h := newHarness(t)
-	withClock(h)
-	id := h.engine.run("app", enable, pathLabel(app), onStop)
-	h.mustPass(app)
-	h.fake.SetStatus(h.src(app), backend.SourceStatus{Status: backend.StatusPaused})
+// While kopia server reports the source STOPPED, no snapshot is queued.
+// PAUSED may be left from a pause through its control API that has ended,
+// so a snapshot is queued all the same.
+func TestSnapshotWhileStoppedOrPaused(t *testing.T) {
+	for _, tt := range []struct {
+		status backend.Status
+		want   int
+	}{{backend.StatusStopped, 0}, {backend.StatusPaused, 2}} {
+		t.Run(string(tt.status), func(t *testing.T) {
+			h := newHarness(t)
+			withClock(h)
+			id := h.engine.run("app", enable, pathLabel(app), onStop, noInterval)
+			h.mustPass(app)
+			h.fake.SetStatus(h.src(app), backend.SourceStatus{Status: tt.status})
 
-	h.r.HandleEvent(h.engine.event(docker.KindStarted, id))
-	h.mustPass(app)
-	h.engine.setState(id, docker.StateExited)
-	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
-	h.mustPass(app)
+			h.r.HandleEvent(h.engine.event(docker.KindStarted, id))
+			h.mustPass(app)
+			h.engine.setState(id, docker.StateExited)
+			h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+			h.mustPass(app)
 
-	if n := h.triggers(app); n != 0 || !h.logged("not queuing a snapshot: kopia server does not run snapshots") {
-		t.Errorf("%d triggers\nlog:\n%s", n, h.logs)
+			if n := h.triggers(app); n != tt.want {
+				t.Errorf("%d triggers\nlog:\n%s", n, h.logs)
+			}
+
+			if stopped := h.logged("not queuing a snapshot: kopia server does not run snapshots"); stopped != (tt.want == 0) {
+				t.Errorf("warned %v", stopped)
+			}
+		})
 	}
 }
 

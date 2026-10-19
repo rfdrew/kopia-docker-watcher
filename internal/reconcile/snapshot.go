@@ -650,6 +650,12 @@ func (ps *pass) container(id string) (docker.Container, bool) {
 // snapshot itself (a missed scheduled one), so a pass that wrote the
 // policy keeps the start events and leaves the decision to a pass shortly
 // after, which sees the status after the write.
+//
+// No snapshot is queued while kopia server reports the source STOPPED.
+// PAUSED does not tell: kopia server shows it once it has dropped a run of
+// a source paused through its control API, and still after the source is
+// resumed. A run it drops comes back as SnapshotUnknown and is taken once
+// more at most.
 func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error {
 	if len(reqs) == 0 {
 		return nil
@@ -670,7 +676,7 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 	}
 
 	switch {
-	case st == backend.StatusPaused || st == backend.StatusStopped:
+	case st == backend.StatusStopped:
 		ps.log.Warn("not queuing a snapshot: kopia server does not run snapshots of the source now",
 			append(attrs, "status", string(st))...)
 		ps.settle(reqs, nil)
