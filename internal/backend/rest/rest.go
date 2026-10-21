@@ -23,7 +23,8 @@
 // description or pins change. So a run is followed by the snapshot tasks of
 // the source that appear after the trigger, and a snapshot is found by its
 // start time; see TriggerSnapshot, WaitSnapshot, AnnotateSnapshot and
-// ListSnapshots.
+// ListSnapshots. For the same reason DeleteSnapshots reads the IDs of the
+// snapshots it deletes right before the delete and keeps none.
 package rest
 
 import (
@@ -91,6 +92,7 @@ const (
 	opWaitSnapshot     = "WaitSnapshot"
 	opAnnotateSnapshot = "AnnotateSnapshot"
 	opListSnapshots    = "ListSnapshots"
+	opDeleteSnapshots  = "DeleteSnapshots"
 )
 
 // ServerIdentity implements backend.Backend with GET /api/v1/sources.
@@ -449,6 +451,7 @@ func fromStatus(s kopiaclient.SourceStatus) backend.SourceStatus {
 			EndTime:     m.EndTime,
 			Description: m.Description,
 			Incomplete:  m.IncompleteReason,
+			Pins:        slices.Clone(m.Pins),
 		}
 	}
 

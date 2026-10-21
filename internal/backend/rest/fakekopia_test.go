@@ -47,9 +47,20 @@ import (
 //     or a 404 NOT_FOUND, GET /api/v1/tasks/{id}/logs its log (null for an
 //     unknown task).
 //   - GET /api/v1/snapshots lists the source's snapshots, oldest first,
-//     and without all=1 keeps the oldest of those with the same root.
+//     and without all=1 keeps the oldest of those with the same root. With
+//     all=1 too, the oldest of those with the same root carries the pins
+//     of all of them, as kopia server merges them into it while it counts
+//     the unique snapshots.
 //   - POST /api/v1/snapshots/edit changes the description and adds pins;
 //     a changed snapshot gets a new ID, an unknown ID is a 500.
+//   - POST /api/v1/snapshots/delete is a 404 NOT_FOUND for a source kopia
+//     server does not know. With deleteSourceAndPolicy it deletes every
+//     snapshot and the policy and forgets the source; otherwise the listed
+//     manifests, an unknown ID being no error and one of another source a
+//     500. It does not refresh.
+//
+// A request body over maxFakeBody bytes is a plain-text 413, as kopia
+// server reads no more.
 //
 // Requests are recorded. inject queues a response for the next request of
 // a route, sent instead of the real one (before) or after the request took
@@ -116,6 +127,9 @@ type injection struct {
 	status int
 	body   string
 }
+
+// maxFakeBody is how much of a request body kopia server reads.
+const maxFakeBody = 100_000
 
 const (
 	fakeUser = "root"
@@ -303,6 +317,10 @@ func (f *fakeKopia) RoundTrip(req *http.Request) (*http.Response, error) {
 		hook(r)
 	}
 
+	if len(body) > maxFakeBody {
+		return reply(req, http.StatusRequestEntityTooLarge, "error reading request body"), nil
+	}
+
 	if inj != nil && !inj.after {
 		return inj.reply(req)
 	}
@@ -401,6 +419,8 @@ func (f *fakeKopia) serve(r fakeRequest) (int, string) {
 		return f.listSnapshots(r.Query)
 	case "POST snapshots/edit":
 		return f.editSnapshots(r.Body)
+	case "POST snapshots/delete":
+		return f.deleteSnapshots(r.Body)
 	}
 
 	if id, found := strings.CutPrefix(r.Route, "GET tasks/"); found {
@@ -455,6 +475,19 @@ func (f *fakeKopia) listSnapshots(q url.Values) (int, string) {
 	})
 
 	resp := map[string]any{"unfilteredCount": len(snaps)}
+
+	// kopia server's uniqueSnapshots, which runs for all=1 as well, adds
+	// the pins of later snapshots with the same root to the first one.
+	for i := range snaps {
+		first := slices.IndexFunc(snaps, func(x kopiaclient.Snapshot) bool { return x.RootID == snaps[i].RootID })
+		if first == i || len(snaps[i].Pins) == 0 {
+			continue
+		}
+
+		pins := slices.Concat(snaps[first].Pins, snaps[i].Pins)
+		slices.Sort(pins)
+		snaps[first].Pins = slices.Compact(pins)
+	}
 
 	if q.Get("all") == "" {
 		var unique []kopiaclient.Snapshot
@@ -522,6 +555,47 @@ func (f *fakeKopia) editSnapshots(body json.RawMessage) (int, string) {
 	}
 
 	return ok(out)
+}
+
+// deleteSnapshots is POST /api/v1/snapshots/delete.
+func (f *fakeKopia) deleteSnapshots(body json.RawMessage) (int, string) {
+	var req struct {
+		Source                kopiaclient.SourceInfo `json:"source"`
+		IDs                   []string               `json:"snapshotManifestIds"`
+		DeleteSourceAndPolicy bool                   `json:"deleteSourceAndPolicy"`
+	}
+
+	if err := json.Unmarshal(body, &req); err != nil {
+		return apiError(http.StatusBadRequest, kopiaclient.CodeMalformedRequest, "malformed request")
+	}
+
+	s, found := f.sources[req.Source]
+	if !found {
+		return apiError(http.StatusNotFound, kopiaclient.CodeNotFound, "unknown source")
+	}
+
+	if req.DeleteSourceAndPolicy {
+		delete(f.sources, req.Source)
+		delete(f.snapshots, req.Source)
+		delete(f.policies, req.Source)
+
+		return ok(struct{}{})
+	}
+
+	for _, id := range req.IDs {
+		if snap := f.snapshotByID(id); snap != nil &&
+			!slices.ContainsFunc(f.snapshots[req.Source], func(x kopiaclient.Snapshot) bool { return x.ID == id }) {
+			return apiError(http.StatusInternalServerError, kopiaclient.CodeInternal,
+				"internal server error: source info does not match snapshot source")
+		}
+	}
+
+	f.snapshots[req.Source] = slices.DeleteFunc(f.snapshots[req.Source], func(x kopiaclient.Snapshot) bool {
+		return slices.Contains(req.IDs, x.ID)
+	})
+	s.snapshots = len(f.snapshots[req.Source]) > 0
+
+	return ok(struct{}{})
 }
 
 func (f *fakeKopia) snapshotByID(id string) *kopiaclient.Snapshot {

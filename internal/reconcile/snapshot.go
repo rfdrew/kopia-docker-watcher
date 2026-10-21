@@ -98,11 +98,7 @@ type snapLabels struct {
 
 // snapshotLabels reads what the labels of pc say about its snapshots.
 func (r *Reconciler) snapshotLabels(pc parsed) snapLabels {
-	ok := func(key string) bool {
-		name := labels.Name(r.labelPrefix, key)
-
-		return !slices.ContainsFunc(pc.issues, func(is labels.Issue) bool { return is.Label == name && is.Severity == labels.Error })
-	}
+	ok := func(key string) bool { return r.labelOK(pc, key) }
 
 	sl := snapLabels{
 		onStart:     pc.spec.SnapshotOnStart && ok(labels.KeySnapshotOnStart),
@@ -1287,14 +1283,20 @@ func (r *Reconciler) updateRecord(src backend.Source, fn func(rec *state.Record)
 
 // warnOnce logs a warning the first time key comes up in this process.
 func (r *Reconciler) warnOnce(key, msg string, attrs ...any) {
-	r.mu.Lock()
-	seen := r.warned[key]
-	r.warned[key] = true
-	r.mu.Unlock()
-
-	if !seen {
+	if r.once(key) {
 		r.log.Warn(msg, attrs...)
 	}
+}
+
+// once reports whether key comes up for the first time in this process.
+func (r *Reconciler) once(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	seen := r.warned[key]
+	r.warned[key] = true
+
+	return !seen
 }
 
 // watcherStart makes up a start event of every running container that

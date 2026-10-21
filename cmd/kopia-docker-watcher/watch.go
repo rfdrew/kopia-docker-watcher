@@ -29,9 +29,10 @@ on SIGTERM or SIGINT, giving the policy writes in progress a few seconds to
 finish.
 
 With --dry-run it reconciles every path once and exits: it prints what it
-would do, writes nothing to kopia server or to STATE_FILE and serves no
-HTTP. kopia server must be ready, it is not waited for. It may run next to
-a running watcher.
+would do, the cleanup of abandoned sources included, deletes nothing,
+writes nothing to kopia server or to STATE_FILE and serves no HTTP. kopia
+server must be ready, it is not waited for. It may run next to a running
+watcher.
 
 Options:
   --dry-run  print the plans instead of applying them, then exit
@@ -355,7 +356,9 @@ func (w *watcher) reconciler(kopia *kopiaclient.Client, store *state.Store, engi
 		Output:        w.d.stdout,
 		ShutdownGrace: w.shutdownGrace(),
 
+		WatcherPathPrefix:      w.cfg.WatcherPathPrefix,
 		SnapshotOnWatcherStart: w.cfg.SnapshotOnWatcherStart,
+		CleanupGrace:           w.cfg.CleanupGrace,
 	})
 }
 

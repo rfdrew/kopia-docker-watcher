@@ -47,6 +47,10 @@ func TestLoadDefaults(t *testing.T) {
 		t.Errorf("ReconcileInterval = %v", cfg.ReconcileInterval)
 	}
 
+	if cfg.CleanupGrace != 24*time.Hour {
+		t.Errorf("CleanupGrace = %v", cfg.CleanupGrace)
+	}
+
 	if cfg.SnapshotOnWatcherStart {
 		t.Error("SnapshotOnWatcherStart = true")
 	}
@@ -81,6 +85,7 @@ func TestLoadAllSet(t *testing.T) {
 		EnvReconcileInterval, "90s",
 		EnvSnapshotOnWatcherStart, "TRUE",
 		EnvWatcherPathPrefix, "/host/var/lib/docker/volumes/",
+		EnvCleanupGrace, "168h",
 		EnvStateFile, "/data/state.json",
 		EnvListenAddr, "127.0.0.1:9090",
 		EnvNotifyWebhookURL, "https://ntfy.sh/topic?auth=token",
@@ -102,6 +107,7 @@ func TestLoadAllSet(t *testing.T) {
 		ReconcileInterval:      90 * time.Second,
 		SnapshotOnWatcherStart: true,
 		WatcherPathPrefix:      "/host/var/lib/docker/volumes",
+		CleanupGrace:           168 * time.Hour,
 		StateFile:              "/data/state.json",
 		ListenAddr:             "127.0.0.1:9090",
 		NotifyWebhookURL:       "https://ntfy.sh/topic?auth=token",
@@ -125,6 +131,8 @@ func TestEmptyIsUnset(t *testing.T) {
 		EnvLogLevel, "",
 		EnvReconcileInterval, "",
 		EnvSnapshotOnWatcherStart, "",
+		EnvWatcherPathPrefix, " ",
+		EnvCleanupGrace, "",
 		EnvStateFile, "",
 		EnvListenAddr, "",
 		EnvLabelPrefix, "",
@@ -136,7 +144,8 @@ func TestEmptyIsUnset(t *testing.T) {
 	}
 
 	if cfg.StateFile != DefaultStateFile || cfg.ListenAddr != DefaultListenAddr || cfg.LabelPrefix != DefaultLabelPrefix ||
-		cfg.ReconcileInterval != DefaultReconcileInterval || cfg.LogLevel != DefaultLogLevel {
+		cfg.ReconcileInterval != DefaultReconcileInterval || cfg.LogLevel != DefaultLogLevel ||
+		cfg.CleanupGrace != DefaultCleanupGrace || cfg.WatcherPathPrefix != "" {
 		t.Errorf("defaults not applied: %+v", cfg)
 	}
 
@@ -230,6 +239,9 @@ func TestLoadErrors(t *testing.T) {
 		{"reconcile too short", base(EnvReconcileInterval, "1s"), []string{"shorter than the minimum"}},
 		{"snapshot bool", base(EnvSnapshotOnWatcherStart, "maybe"), []string{"SNAPSHOT_ON_WATCHER_START"}},
 		{"relative path prefix", base(EnvWatcherPathPrefix, "data"), []string{"WATCHER_PATH_PREFIX"}},
+		{"cleanup grace in days", base(EnvCleanupGrace, "7d"), []string{"CLEANUP_GRACE", "invalid duration", "d is not a unit"}},
+		{"cleanup grace too short", base(EnvCleanupGrace, "10s"), []string{"CLEANUP_GRACE", "shorter than the minimum 10m0s"}},
+		{"negative cleanup grace", base(EnvCleanupGrace, "-24h"), []string{"CLEANUP_GRACE", "shorter than the minimum"}},
 		{"listen addr", base(EnvListenAddr, "8080"), []string{"LISTEN_ADDR", "host:port"}},
 		{"listen port", base(EnvListenAddr, ":0"), []string{"LISTEN_ADDR", "invalid port"}},
 		{"webhook scheme", base(EnvNotifyWebhookURL, "ftp://x/secret-token"), []string{"NOTIFY_WEBHOOK_URL", "http:// or https://"}},
@@ -280,6 +292,26 @@ func TestParseCertFingerprint(t *testing.T) {
 		if _, err := ParseCertFingerprint(in); err == nil {
 			t.Errorf("ParseCertFingerprint(%q): expected error", in)
 		}
+	}
+}
+
+func TestParseWatcherPathPrefix(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                  "",
+		" ":                 "",
+		"/":                 "",
+		"//":                "",
+		"/data":             "/data",
+		" /data/ ":          "/data",
+		"/data//app/./../x": "/data/x",
+	} {
+		if got, err := ParseWatcherPathPrefix(in); err != nil || got != want {
+			t.Errorf("ParseWatcherPathPrefix(%q) = %q, %v, want %q", in, got, err, want)
+		}
+	}
+
+	if _, err := ParseWatcherPathPrefix("data"); err == nil || !strings.Contains(err.Error(), "not an absolute path") {
+		t.Errorf("relative prefix: %v", err)
 	}
 }
 

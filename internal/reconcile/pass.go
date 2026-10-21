@@ -9,6 +9,7 @@ import (
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
+	"github.com/rfdrew/kopia-docker-watcher/internal/labels"
 	"github.com/rfdrew/kopia-docker-watcher/internal/state"
 )
 
@@ -26,7 +27,8 @@ type passResult struct {
 	// restarting reports an owner that was restarting.
 	restarting bool
 	// recheck asks for another pass after EventDelay, which decides on the
-	// start snapshot this pass put off.
+	// start snapshot this pass put off, or sees what became of a source
+	// whose policy the cleanup deleted.
 	recheck bool
 	// sweep reports a pass of a full reconcile.
 	sweep bool
@@ -61,8 +63,22 @@ type pass struct {
 	// wrote reports that the pass wrote the policy. deferred reports that
 	// an earlier pass put the start snapshot off already, deferStart that
 	// this one does. sweepDue reports a pass of a full reconcile, which
-	// describes the snapshots that have no description.
-	wrote, deferred, deferStart, sweepDue bool
+	// describes the snapshots that have no description. recheckSoon asks
+	// for a pass soon after, as after the cleanup deleted a policy.
+	wrote, deferred, deferStart, sweepDue, recheckSoon bool
+
+	// outside reports a path outside WATCHER_PATH_PREFIX, which the pass
+	// leaves alone.
+	outside bool
+	// owned is what the record said about the owners when the pass began;
+	// ownersTaken reports that the pass has recorded its owners. Only
+	// passes change the owners of a record, so a pass that would not
+	// change them need not touch the store.
+	owned       ownership
+	ownersTaken bool
+	// cleanupNote says for a dry run what the cleanup of a source without
+	// owners would do.
+	cleanupNote string
 
 	src backend.Source
 	// last is what the state says was applied to the source; had reports
@@ -95,8 +111,8 @@ func (r *Reconciler) reconcile(ctx context.Context, p string) passResult {
 	ps.log.Debug("reconciling the path", "events", eventNames(ps.events))
 
 	err := ps.run()
-	res := passResult{restarting: anyRestarting(ps.owners), problems: ps.problems, recheck: err == nil && ps.deferStart,
-		sweep: ps.sweepDue}
+	res := passResult{restarting: anyRestarting(ps.owners), problems: ps.problems,
+		recheck: err == nil && (ps.deferStart || ps.recheckSoon), sweep: ps.sweepDue}
 
 	switch {
 	case err == nil:
@@ -216,6 +232,17 @@ func (ps *pass) reportError(reason Reason, msg string, attrs ...any) {
 }
 
 func (ps *pass) run() error {
+	if !labels.WithinPrefix(ps.watcherPrefix, ps.path) {
+		// Only the state names such a path: no label path makes one.
+		ps.outside = true
+		ps.outcome = "left alone: outside WATCHER_PATH_PREFIX " + ps.watcherPrefix
+		ps.warnOnce("outside "+ps.path, "the state has a source outside WATCHER_PATH_PREFIX; the watcher neither pauses nor "+
+			"cleans it up", "path", ps.path, "prefix", ps.watcherPrefix)
+		ps.forgetOwners()
+
+		return nil
+	}
+
 	src, err := ps.source(ps.ctx, ps.path)
 	if err != nil {
 		return err
@@ -233,6 +260,16 @@ func (ps *pass) run() error {
 
 	rec, had := ps.store.Get(src)
 	ps.last, ps.had = rec.Applied, had
+	ps.owned = ownership{owners: rec.Owners, orphaned: rec.OrphanedSince}
+
+	// The owners go into the state with the changes of the record the pass
+	// makes anyway; a pass that fails before it makes one still records
+	// them, as the pass saw them at its start, so that it is known when an
+	// owner left or came back. A source new to the state gets them with its
+	// first record.
+	if had {
+		defer ps.trackOwners()
+	}
 
 	if !ps.desire() {
 		ps.outcome = "not managed: no container backs the path up"
@@ -253,7 +290,7 @@ func (ps *pass) run() error {
 			ps.log.Info("not registering the source: no container backs it up with labels that can be applied",
 				"source", src.String(), "owners", ownerNames(ps.owners))
 
-			return nil
+			return ps.forgetAbandoned()
 		case ps.want.Paused:
 			// A container that was only created may not have its bind
 			// mounts on the host yet; register when one runs.
@@ -272,6 +309,8 @@ func (ps *pass) run() error {
 	ps.plan = &plan
 
 	if ps.dryRun {
+		ps.noteCleanup()
+
 		return nil
 	}
 
@@ -279,7 +318,14 @@ func (ps *pass) run() error {
 		return err
 	}
 
-	return ps.snapshots()
+	// A record the policy step made has them already.
+	ps.trackOwners()
+
+	if err := ps.snapshots(); err != nil {
+		return err
+	}
+
+	return ps.cleanup()
 }
 
 // desire works out the desired state of the source from its owners. It
@@ -453,15 +499,31 @@ func (ps *pass) apply(plan backend.Plan) error {
 	return nil
 }
 
-// storeApplied sets the Applied of the source's record. A change kept in
-// memory only is enough: the store writes it with the next change.
+// storeApplied sets the Applied of the source's record, and records the
+// owners of the pass with it. A change kept in memory only is enough: the
+// store writes it with the next change.
 func (ps *pass) storeApplied(a backend.Applied) error {
+	var (
+		before  ownership
+		changed bool
+	)
+
 	err := ps.store.Update(ps.src, func(r *state.Record) error {
 		r.Applied = a.Clone()
+		before, changed = ps.takeOwners(r)
+
 		return nil
 	})
 
-	return storeErr(err)
+	if err = storeErr(err); err == nil {
+		ps.ownersTaken = true
+
+		if changed {
+			ps.logOwners(before)
+		}
+	}
+
+	return err
 }
 
 // restoreRecord puts the source's record back as the pass found it, after

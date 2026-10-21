@@ -5,8 +5,10 @@
 //
 // The unit of work is a source path: a path of a container's path label,
 // joined to HOST_PREFIX and cleaned (labels.SourcePath). A path that is not
-// absolute after that, or leads out of HOST_PREFIX, is a label error and
-// makes no source. The owners of a path are all containers whose enable
+// absolute after that, leads out of HOST_PREFIX, or lies outside
+// WATCHER_PATH_PREFIX, is a label error and makes no source; a source of
+// the state outside WATCHER_PATH_PREFIX is left alone, neither paused nor
+// cleaned up. The owners of a path are all containers whose enable
 // label is true and whose path label names it, stopped ones included. From
 // them the reconciler works out the desired state of the path's source:
 //
@@ -103,6 +105,46 @@
 //
 // A backend that cannot do one of these yet (backend.ErrNotImplemented) is
 // reported once, and the rest goes on without it.
+//
+// # Cleanup
+//
+// The state remembers the owners of each source the watcher manages, with
+// what their labels ask of the cleanup: Docker forgets the labels of a
+// container it removes. Once a source has no owner left, also after a
+// downtime of the watcher in which its containers were removed, the state
+// records since when, and the source is paused. cleanup-on-remove decides
+// what else becomes of it, the most cautious mode of its last owners, and
+// of those that left within ownerLinger before the last pass that saw one
+// of them, so that the order in which docker compose down removes them
+// does not matter:
+//
+//   - pause, the default: nothing else;
+//   - policy: the policy of a source without snapshots is deleted, and the
+//     state forgets the source once kopia server does. A source with
+//     snapshots stays paused: without its policy it would inherit the
+//     schedule of the host or global policy;
+//   - all: the source is deleted with its snapshots and its policy. A
+//     pinned snapshot stays unless every owner allowed with
+//     cleanup-delete-pinned that it goes: then only the snapshots without
+//     a pin are deleted, and the source stays with its paused policy.
+//
+// Nothing is deleted before CLEANUP_GRACE has passed since the source lost
+// its last owner, nor while a snapshot the watcher queued, such as the one
+// at the stop, has not finished, nor while a snapshot is pending or
+// uploading. A container that backs the source up again before calls the
+// cleanup off. Nor does CLEANUP_GRACE run while a container the state
+// remembers as an owner still exists, by its ID or its name: Docker labels
+// never change, so it lost the path only because the watcher's
+// configuration did, and its source is not abandoned; a container
+// recreated under its name is the same service. A source kopia server had
+// before a container first named it is managed like any other, so all
+// deletes the snapshots it had before too. A source outside
+// WATCHER_PATH_PREFIX loses its owners on record, so that they cannot
+// decide its cleanup should the prefix be widened again. Every deletion is
+// logged with the source, the mode and how many snapshots went, and a
+// failed one with what it was about to delete, as kopia server may have
+// carried it out all the same. A dry run prints what the cleanup would
+// delete, and when.
 //
 // # Errors
 //
@@ -227,6 +269,12 @@ type Options struct {
 
 	// HostPrefix is HOST_PREFIX: empty or a clean absolute path.
 	HostPrefix string
+	// WatcherPathPrefix is WATCHER_PATH_PREFIX: empty or a clean absolute
+	// path. Only sources under it are registered, paused and cleaned up: a
+	// label path whose source path lies outside it is a label error, and a
+	// source of the state outside it is left alone. It applies to source
+	// paths, after HostPrefix.
+	WatcherPathPrefix string
 	// LabelPrefix is LABEL_PREFIX; empty means config.DefaultLabelPrefix.
 	LabelPrefix string
 	// Strict makes every label warning an error.
@@ -261,6 +309,11 @@ type Options struct {
 	// container that asks for one at its start, as far as the minimum
 	// interval allows.
 	SnapshotOnWatcherStart bool
+
+	// CleanupGrace is CLEANUP_GRACE: how long a source must have been
+	// without an owner before cleanup-on-remove deletes anything of it;
+	// zero means config.DefaultCleanupGrace.
+	CleanupGrace time.Duration
 }
 
 // Reconciler reconciles source paths. Create it with New, start it with
@@ -272,12 +325,13 @@ type Reconciler struct {
 	log     *slog.Logger
 	metrics Metrics
 
-	hostPrefix  string
-	labelPrefix string
-	strict      bool
-	dryRun      bool
-	output      io.Writer
-	printMu     sync.Mutex
+	hostPrefix    string
+	watcherPrefix string
+	labelPrefix   string
+	strict        bool
+	dryRun        bool
+	output        io.Writer
+	printMu       sync.Mutex
 
 	workers                int
 	minBackoff, maxBackoff time.Duration
@@ -285,6 +339,7 @@ type Reconciler struct {
 	restartRecheck         time.Duration
 	shutdownGrace          time.Duration
 	snapshotOnWatcherStart bool
+	cleanupGrace           time.Duration
 
 	// now is the clock of the snapshot steps; tests replace it.
 	now func() time.Time
@@ -367,9 +422,18 @@ func New(opts Options) (*Reconciler, error) {
 		return nil, fmt.Errorf("reconcile: host prefix %q is not a clean absolute path", opts.HostPrefix)
 	}
 
-	// A prefix of / is no prefix, as config.ParseHostPrefix has it.
+	if p := opts.WatcherPathPrefix; p != "" && (!path.IsAbs(p) || path.Clean(p) != p) {
+		return nil, fmt.Errorf("reconcile: watcher path prefix %q is not a clean absolute path", p)
+	}
+
+	// A prefix of / is no prefix, as config.ParseHostPrefix and
+	// config.ParseWatcherPathPrefix have it.
 	if opts.HostPrefix == "/" {
 		opts.HostPrefix = ""
+	}
+
+	if opts.WatcherPathPrefix == "/" {
+		opts.WatcherPathPrefix = ""
 	}
 
 	r := &Reconciler{
@@ -379,6 +443,7 @@ func New(opts Options) (*Reconciler, error) {
 		log:            opts.Logger,
 		metrics:        opts.Metrics,
 		hostPrefix:     opts.HostPrefix,
+		watcherPrefix:  opts.WatcherPathPrefix,
 		labelPrefix:    opts.LabelPrefix,
 		strict:         opts.Strict,
 		dryRun:         opts.DryRun,
@@ -403,6 +468,7 @@ func New(opts Options) (*Reconciler, error) {
 		sweepDue:       map[string]bool{},
 
 		snapshotOnWatcherStart: opts.SnapshotOnWatcherStart,
+		cleanupGrace:           orDefault(opts.CleanupGrace, config.DefaultCleanupGrace),
 	}
 
 	if r.labelPrefix == "" {

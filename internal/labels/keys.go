@@ -16,6 +16,9 @@ const (
 	KeyDescription     = "description"
 	KeyTags            = "tags"
 	KeyMinInterval     = "min-interval"
+
+	KeyCleanupOnRemove     = "cleanup-on-remove"
+	KeyCleanupDeletePinned = "cleanup-delete-pinned"
 )
 
 // key is one supported label: its name relative to the prefix and how its
@@ -38,6 +41,8 @@ var keys = []key{
 	{KeyDescription, func(p *parser, v string) { p.spec.Description = strings.TrimSpace(v) }},
 	{KeyTags, (*parser).tags},
 	{KeyMinInterval, (*parser).minInterval},
+	{KeyCleanupOnRemove, (*parser).cleanup},
+	{KeyCleanupDeletePinned, func(p *parser, v string) { p.spec.CleanupDeletePinned = p.bool(v) }},
 }
 
 // plannedKeys are labels of later releases. They are ignored with a "not
@@ -45,9 +50,6 @@ var keys = []key{
 // the schema tests check them together with keys, so that a key added now
 // cannot clash with one of them later.
 var plannedKeys = []string{
-	// Cleanup of abandoned sources.
-	"cleanup-on-remove",
-
 	// Policy of the path.
 	"interval",
 	"time-of-day",

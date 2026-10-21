@@ -47,6 +47,7 @@ func TestDefault(t *testing.T) {
 		SnapshotOnStart: true,
 		MinInterval:     10 * time.Minute,
 		Policy:          Policy{Scheduling: Scheduling{Cron: []string{"0 * * * *"}}},
+		CleanupOnRemove: CleanupPause,
 	}
 
 	if got := Default(); !reflect.DeepEqual(got, want) {
@@ -112,6 +113,7 @@ func TestParse(t *testing.T) {
 				Description:     "my app",
 				Tags:            []Tag{{"env", "prod"}, {"app", "myapp"}},
 				Policy:          Policy{Scheduling: Scheduling{Cron: []string{"30 2 * * *"}}},
+				CleanupOnRemove: CleanupPause,
 			},
 		},
 		{
@@ -375,6 +377,78 @@ func TestParseMinInterval(t *testing.T) {
 	t.Run("strict", func(t *testing.T) {
 		checkParse(t, map[string]string{"kopia.min-interval": "1d"}, Options{Strict: true}, Default(),
 			[]string{`error kopia.min-interval: invalid duration "1d"; ` + minIntervalHint})
+	})
+}
+
+func TestParseCleanup(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels map[string]string
+		mode   CleanupMode
+		pinned bool
+		issues []string
+	}{
+		{name: "default", mode: CleanupPause},
+		{name: "pause", labels: map[string]string{"kopia.cleanup-on-remove": "pause"}, mode: CleanupPause},
+		{name: "policy", labels: map[string]string{"kopia.cleanup-on-remove": "policy"}, mode: CleanupPolicy},
+		{name: "all", labels: map[string]string{"kopia.cleanup-on-remove": "all"}, mode: CleanupAll},
+		{name: "any case and spaces", labels: map[string]string{"kopia.cleanup-on-remove": " ALL "}, mode: CleanupAll},
+		{
+			name:   "all with pinned snapshots",
+			labels: map[string]string{"kopia.cleanup-on-remove": "all", "kopia.cleanup-delete-pinned": "true"},
+			mode:   CleanupAll,
+			pinned: true,
+		},
+		{
+			name:   "pinned set to false",
+			labels: map[string]string{"kopia.cleanup-on-remove": "all", "kopia.cleanup-delete-pinned": "false"},
+			mode:   CleanupAll,
+		},
+		{
+			// A typo must not delete anything: the most cautious mode.
+			name:   "unknown mode",
+			labels: map[string]string{"kopia.cleanup-on-remove": "everything"},
+			mode:   CleanupPause,
+			issues: []string{`warning kopia.cleanup-on-remove: unknown cleanup mode "everything", the source is only paused; use pause, policy or all`},
+		},
+		{
+			name:   "empty mode",
+			labels: map[string]string{"kopia.cleanup-on-remove": " "},
+			mode:   CleanupPause,
+			issues: []string{"warning kopia.cleanup-on-remove: empty value, the source is only paused; use pause, policy or all"},
+		},
+		{
+			name:   "pinned without all",
+			labels: map[string]string{"kopia.cleanup-on-remove": "policy", "kopia.cleanup-delete-pinned": "true"},
+			mode:   CleanupPolicy,
+			pinned: true,
+			issues: []string{"warning kopia.cleanup-delete-pinned: has no effect unless kopia.cleanup-on-remove is all"},
+		},
+		{
+			// Only "true" is true, as for every boolean.
+			name:   "pinned not a boolean",
+			labels: map[string]string{"kopia.cleanup-on-remove": "all", "kopia.cleanup-delete-pinned": "yes"},
+			mode:   CleanupAll,
+			issues: []string{`warning kopia.cleanup-delete-pinned: "yes" is not a boolean, treated as false; use true or false`},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := spec(func(s *ContainerSpec) {
+				s.CleanupOnRemove = tt.mode
+				s.CleanupDeletePinned = tt.pinned
+			})
+
+			checkParse(t, tt.labels, Options{}, want, tt.issues)
+		})
+	}
+
+	t.Run("strict", func(t *testing.T) {
+		_, issues := Parse(map[string]string{"kopia.cleanup-on-remove": "everything"}, Options{Strict: true})
+		if got := issueStrings(issues); !slices.Equal(got, []string{`error kopia.cleanup-on-remove: unknown cleanup mode "everything"; use pause, policy or all`}) {
+			t.Errorf("issues = %q", got)
+		}
 	})
 }
 

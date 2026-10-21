@@ -170,17 +170,18 @@ func runValidate(ctx context.Context, args []string, d deps) int {
 // validator checks sets of labels. Nothing it does changes Docker or kopia
 // server.
 type validator struct {
-	prefix     string
-	hostPrefix string
-	strict     bool
+	prefix        string
+	hostPrefix    string
+	watcherPrefix string
+	strict        bool
 	// kopia is nil without KOPIA_SERVER_URL: only the labels are checked.
 	kopia *kopiaclient.Client
 	// checked counts the label sets checked, for the footer.
 	checked int
 }
 
-// newValidator reads the configuration validate needs. Only LABEL_PREFIX
-// and HOST_PREFIX matter without KOPIA_SERVER_URL; with it, the whole
+// newValidator reads the configuration validate needs. Only LABEL_PREFIX,
+// HOST_PREFIX and WATCHER_PATH_PREFIX matter without KOPIA_SERVER_URL; with it, the whole
 // configuration is loaded and must be valid, as for the watcher. A non-zero
 // code means validate has to exit with it.
 func newValidator(d deps, strict bool) (*validator, int) {
@@ -195,6 +196,11 @@ func newValidator(d deps, strict bool) (*validator, int) {
 
 		if v.hostPrefix, err = config.ParseHostPrefix(d.getenv(config.EnvHostPrefix)); err != nil {
 			_, _ = fmt.Fprintf(d.stderr, "validate: %s: %v\n", config.EnvHostPrefix, err)
+			return nil, 2
+		}
+
+		if v.watcherPrefix, err = config.ParseWatcherPathPrefix(d.getenv(config.EnvWatcherPathPrefix)); err != nil {
+			_, _ = fmt.Fprintf(d.stderr, "validate: %s: %v\n", config.EnvWatcherPathPrefix, err)
 			return nil, 2
 		}
 
@@ -221,6 +227,7 @@ func newValidator(d deps, strict bool) (*validator, int) {
 
 	v.prefix = cfg.LabelPrefix
 	v.hostPrefix = cfg.HostPrefix
+	v.watcherPrefix = cfg.WatcherPathPrefix
 
 	v.kopia, err = kopiaclient.New(kopiaclient.Options{
 		URL:                cfg.Kopia.URL,
@@ -404,7 +411,7 @@ func (v *validator) check(ctx context.Context, input map[string]string) report {
 	pathLabel := labels.Name(v.prefix, labels.KeyPath)
 
 	for _, p := range spec.Paths {
-		sp, err := labels.SourcePath(v.hostPrefix, p)
+		sp, err := labels.SourcePathWithin(v.hostPrefix, v.watcherPrefix, p)
 		if err != nil {
 			r.addError(pathLabel, err.Error())
 			continue
@@ -704,6 +711,8 @@ func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 	}
 
 	row(labels.KeyTags, orNone(strings.Join(tags, ", "), "(none)"))
+	row(labels.KeyCleanupOnRemove, string(spec.CleanupOnRemove))
+	row(labels.KeyCleanupDeletePinned, strconv.FormatBool(spec.CleanupDeletePinned))
 
 	_ = tw.Flush()
 }

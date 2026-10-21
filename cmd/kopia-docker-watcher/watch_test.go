@@ -1043,6 +1043,71 @@ func TestRunDryRun(t *testing.T) {
 	}
 }
 
+// WATCHER_PATH_PREFIX reaches the reconciler: a container whose path is
+// outside it is a label error, and its source is not registered.
+func TestRunWatcherPathPrefix(t *testing.T) {
+	k := newRunKopia(t)
+	wr := startWatcher(t, k, newWatchEngine(appContainer()), watcherOptions{args: []string{"--dry-run"},
+		env: []string{"WATCHER_PATH_PREFIX", "/data"}})
+
+	if code := wr.wait(t, 10*time.Second); code != 0 {
+		t.Fatalf("exit code = %d; log:\n%s", code, wr.td.stderr)
+	}
+
+	if out := wr.td.stdout.String(); strings.Contains(out, "/srv/app") {
+		t.Errorf("stdout has a plan for /srv/app:\n%s", out)
+	}
+
+	if l := findLog(wr.td.stderr.String(), "container labels have errors"); l == nil ||
+		!strings.Contains(fmt.Sprint(l["problems"]), "outside WATCHER_PATH_PREFIX /data") {
+		t.Errorf("log:\n%s", wr.td.stderr)
+	}
+
+	if n := k.count("GET /api/v1/policy"); n != 0 {
+		t.Errorf("the policy of a path outside the prefix was read %d times", n)
+	}
+}
+
+// CLEANUP_GRACE reaches the reconciler: a dry run tells when the cleanup of
+// an abandoned source is due.
+func TestRunCleanupGrace(t *testing.T) {
+	for _, tt := range []struct {
+		env  []string
+		want string
+	}{
+		{nil, "after CLEANUP_GRACE (24h0m0s) without a container"},
+		{[]string{"CLEANUP_GRACE", "168h"}, "after CLEANUP_GRACE (168h0m0s) without a container"},
+	} {
+		t.Run(tt.want, func(t *testing.T) {
+			k := newRunKopia(t)
+			k.setPolicy("/srv/gone", `{"scheduling":{"manual":true}}`)
+			k.known["/srv/gone"] = true
+
+			// A source whose container asked for all was removed a minute ago.
+			orphaned := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+			stateFile := filepath.Join(t.TempDir(), "state.json")
+			content := `{"version":1,"sources":[{"source":{"host":"` + fakeHost + `","userName":"` + fakeUser + `","path":"/srv/gone"},` +
+				`"patch":{"scheduling":{"cron":["0 * * * *"]}},"savedScheduling":{"cron":["0 * * * *"]},` +
+				`"owners":[{"id":"old","name":"gone","cleanup":"all","gone":"` + orphaned + `"}],"orphanedSince":"` + orphaned + `"}]}`
+
+			if err := os.WriteFile(stateFile, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			wr := startWatcher(t, k, newWatchEngine(), watcherOptions{args: []string{"--dry-run"},
+				env: append([]string{"STATE_FILE", stateFile}, tt.env...)})
+
+			if code := wr.wait(t, 10*time.Second); code != 0 {
+				t.Fatalf("exit code = %d; log:\n%s", code, wr.td.stderr)
+			}
+
+			if out := wr.td.stdout.String(); !strings.Contains(out, "cleanup: kopia.cleanup-on-remove=all at ") || !strings.Contains(out, tt.want) {
+				t.Errorf("stdout:\n%s", out)
+			}
+		})
+	}
+}
+
 func TestRunDryRunFailures(t *testing.T) {
 	t.Run("owners disagree", func(t *testing.T) {
 		a, b := appContainer(), appContainer()

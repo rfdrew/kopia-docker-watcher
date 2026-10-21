@@ -63,15 +63,22 @@ func (ps *pass) print(err error) {
 		attrs = append(attrs, "action", ps.plan.Action.String(), "changes", changes(*ps.plan))
 	}
 
-	if ps.plan == nil && err == nil && len(ps.owners) == 0 && !ps.had {
+	if ps.plan == nil && err == nil && len(ps.owners) == 0 && !ps.had && !ps.outside {
 		// A path nobody backs up: nothing to say.
 		return
 	}
 
-	ps.writeOwners(&b)
+	if !ps.outside {
+		ps.writeOwners(&b)
+	}
 
 	if ps.plan != nil {
 		ps.writePlan(&b)
+	}
+
+	if ps.cleanupNote != "" {
+		fmt.Fprintf(&b, "  cleanup: %s\n", ps.cleanupNote)
+		attrs = append(attrs, "cleanup", ps.cleanupNote)
 	}
 
 	for _, p := range ps.problems {

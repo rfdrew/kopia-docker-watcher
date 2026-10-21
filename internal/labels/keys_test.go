@@ -50,7 +50,8 @@ func TestSchema(t *testing.T) {
 	}
 
 	// Every exported key constant is supported.
-	for _, k := range []string{KeyEnable, KeyPath, KeySchedule, KeySnapshotOnStart, KeySnapshotOnStop, KeyDescription, KeyTags, KeyMinInterval} {
+	for _, k := range []string{KeyEnable, KeyPath, KeySchedule, KeySnapshotOnStart, KeySnapshotOnStop, KeyDescription, KeyTags, KeyMinInterval,
+		KeyCleanupOnRemove, KeyCleanupDeletePinned} {
 		if _, ok := keyByName[k]; !ok {
 			t.Errorf("Key constant %q has no parser", k)
 		}

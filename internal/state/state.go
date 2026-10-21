@@ -9,7 +9,10 @@
 // the fingerprint of the stored policy. It also holds what the snapshot
 // lifecycle needs across restarts: the snapshots the watcher queued and
 // still waits for, when it last queued one, and the mark after which
-// snapshots get a description. A record stays until it is deleted, also
+// snapshots get a description. And it holds who owns the source: the
+// containers that back it up, with what their labels ask for once they are
+// gone (Docker forgets the labels of a container it removes), and since
+// when the source has had none. A record stays until it is deleted, also
 // when it holds nothing else, so the store lists every source the watcher
 // manages.
 //
@@ -45,7 +48,11 @@
 //	      "snapshotWaits": [{"ticket": {…}, "stop": true, "reason": "stop of app", "description": "app"}],
 //	      "lastTriggered": "2026-10-18T12:00:00Z",
 //	      "annotateAfter": "2026-10-18T11:00:00Z",
-//	      "stopAbsorbedAt": "2026-10-18T12:30:00Z"
+//	      "stopAbsorbedAt": "2026-10-18T12:30:00Z",
+//	      "owners": [{"id": "4f2c…", "name": "app", "composeProject": "shop", "labelsHash": "sha256:…",
+//	        "cleanup": "all", "gone": "2026-10-19T08:00:00Z"}],
+//	      "ownersUpdated": "2026-10-19T08:00:00Z",
+//	      "orphanedSince": "2026-10-19T08:00:00Z"
 //	    }
 //	  ]
 //	}
@@ -82,9 +89,9 @@
 // goes into a new top-level field of the file. Fields are never renamed or
 // given a new meaning in place; Version is raised, with a migration in
 // load, only for a change an older watcher would misread. Planned
-// additions: owners and the cleanup mode per source, and containers the
-// watcher stopped itself. Records of another kopia server identity than
-// the current one must never be cleaned up automatically.
+// addition: containers the watcher stopped itself. Records of another
+// kopia server identity than the current one must never be cleaned up
+// automatically.
 package state
 
 import (
@@ -181,6 +188,61 @@ type Record struct {
 	StopAbsorbedAt          time.Time `json:"stopAbsorbedAt,omitzero"`
 	StopAbsorbedDescription string    `json:"stopAbsorbedDescription,omitempty"`
 	StopAbsorbedLastStart   time.Time `json:"stopAbsorbedLastStart,omitzero"`
+
+	// Owners are the containers that back the source up, and those that
+	// stopped doing so shortly before the last time the watcher saw one of
+	// them, sorted by name and ID. The cleanup of a source without owners
+	// acts on what their labels asked for, the most cautious of it. A record
+	// written before owners existed has none, which asks for nothing but
+	// the pause.
+	//
+	// The owner fields came with the first release, so no released watcher
+	// keeps them without keeping them up to date. A build from before them,
+	// run for a while, leaves them stale; the cleanup then acts on owners
+	// that may have been replaced meanwhile.
+	Owners []Owner `json:"owners,omitempty"`
+
+	// OwnersUpdated is when Owners or OrphanedSince last changed.
+	OwnersUpdated time.Time `json:"ownersUpdated,omitzero"`
+
+	// OrphanedSince is when the watcher first found the source without an
+	// owner, also after a downtime in which its containers were removed;
+	// zero while it has one, and while a container on record still exists.
+	// CLEANUP_GRACE counts from it.
+	OrphanedSince time.Time `json:"orphanedSince,omitzero"`
+}
+
+// Owner is a container that backs a source up, as the state remembers it.
+//
+// Its fields are closed, like those of a wait: new data about an owner goes
+// into a new field of the entry, keyed by the owner's ID.
+type Owner struct {
+	// ID and Name identify the container.
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// ComposeProject is the docker compose project of the container; empty
+	// for one docker compose did not create.
+	ComposeProject string `json:"composeProject,omitempty"`
+	// LabelsHash is the fingerprint of the container's labels under
+	// LABEL_PREFIX.
+	LabelsHash string `json:"labelsHash,omitempty"`
+	// Cleanup is what the container's cleanup-on-remove label asks for:
+	// pause, policy or all; empty or anything else means pause.
+	Cleanup string `json:"cleanup,omitempty"`
+	// DeletePinned is set when the container's labels let the cleanup
+	// delete pinned snapshots.
+	DeletePinned bool `json:"deletePinned,omitempty"`
+	// Gone is when the container stopped backing the source up: it was
+	// removed, or its labels no longer name the path; zero while it backs
+	// it up.
+	Gone time.Time `json:"gone,omitzero"`
+}
+
+// Equal reports whether o and p hold the same, times compared as
+// instants.
+func (o Owner) Equal(p Owner) bool {
+	return o.ID == p.ID && o.Name == p.Name && o.ComposeProject == p.ComposeProject && o.LabelsHash == p.LabelsHash &&
+		o.Cleanup == p.Cleanup && o.DeletePinned == p.DeletePinned && o.Gone.Equal(p.Gone)
 }
 
 // SnapshotWait is a snapshot the watcher queued and has not finished with.
@@ -759,8 +821,9 @@ func cmpRaw(raw json.RawMessage) json.RawMessage {
 }
 
 // snapshotKeys are the keys of an entry that hold the snapshot lifecycle
-// rather than the policy. An entry whose snapshot fields cannot be decoded
-// keeps its policy fields.
+// and the owners rather than the policy. An entry whose snapshot or owner
+// fields cannot be decoded keeps its policy fields; the owners are then
+// unknown, which asks for nothing but the pause.
 var snapshotKeys = func() map[string]bool {
 	keys := jsonKeys(reflect.TypeFor[Record]())
 	for k := range jsonKeys(reflect.TypeFor[backend.Applied]()) {
@@ -821,7 +884,7 @@ func decodeEntry(raw json.RawMessage) (src backend.Source, e entry, note string,
 			return src, entry{}, "", fmt.Errorf("%s: %w", src, err2)
 		}
 
-		notes = append(notes, "the snapshot state cannot be decoded: "+err.Error())
+		notes = append(notes, "the snapshot and owner state cannot be decoded: "+err.Error())
 	}
 
 	// A null value means the same as a missing one.

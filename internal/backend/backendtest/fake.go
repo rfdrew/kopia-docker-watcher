@@ -11,7 +11,9 @@
 // on registration, a cron expression
 // marked invalid, a policy a check set with SetPolicyCheck refuses. It can also rewrite stored policies the way kopia
 // server does (SetNormalizer). A source without snapshots is forgotten when
-// its policy is deleted, as kopia server forgets it.
+// its policy is deleted, as kopia server forgets it. DeleteSnapshots
+// deletes the snapshots without a pin, or the source as a whole, as the
+// REST backend does.
 //
 // Every call is recorded, as a deep copy. Any call can fail before it takes
 // effect (FailNext) or after (FailNextAfter, as when kopia server stored a
@@ -64,6 +66,7 @@ const (
 	WaitSnapshot     Method = "WaitSnapshot"
 	AnnotateSnapshot Method = "AnnotateSnapshot"
 	ListSnapshots    Method = "ListSnapshots"
+	DeleteSnapshots  Method = "DeleteSnapshots"
 )
 
 // Call is one recorded call. Only the fields of the method's arguments are
@@ -84,6 +87,7 @@ type Call struct {
 	StartTime   time.Time              // AnnotateSnapshot
 	Description string                 // AnnotateSnapshot
 	AddPins     []string               // AnnotateSnapshot
+	Pinned      bool                   // DeleteSnapshots
 }
 
 func (c Call) clone() Call {
@@ -308,10 +312,12 @@ func (f *Fake) AddSnapshot(src backend.Source, snap backend.SnapshotInfo) {
 }
 
 func addSnapshot(s *sourceState, snap backend.SnapshotInfo) {
+	snap = snap.Clone()
 	s.snapshots = append(s.snapshots, snap)
 
 	if last := s.status.LastSnapshot; last == nil || !snap.StartTime.Before(last.StartTime) {
-		s.status.LastSnapshot = &snap
+		last := snap.Clone()
+		s.status.LastSnapshot = &last
 	}
 }
 
@@ -325,7 +331,16 @@ func (f *Fake) Snapshots(src backend.Source) []backend.SnapshotInfo {
 		return nil
 	}
 
-	return slices.Clone(s.snapshots)
+	return cloneSnapshots(s.snapshots)
+}
+
+func cloneSnapshots(snaps []backend.SnapshotInfo) []backend.SnapshotInfo {
+	out := make([]backend.SnapshotInfo, len(snaps))
+	for i, s := range snaps {
+		out[i] = s.Clone()
+	}
+
+	return out
 }
 
 // SetPathMissing makes registering a source with path p fail with
@@ -1150,7 +1165,15 @@ func (f *Fake) AnnotateSnapshot(ctx context.Context, src backend.Source, startTi
 		return &backend.Error{Op: string(AnnotateSnapshot), Source: src, Err: backend.ErrSnapshotNotFound}
 	}
 
-	s.snapshots[found].Description = description
+	snap := &s.snapshots[found]
+	snap.Description = description
+
+	for _, p := range addPins {
+		if !slices.Contains(snap.Pins, p) {
+			snap.Pins = append(snap.Pins, p)
+		}
+	}
+
 	f.annotations[src] = append(f.annotations[src], Annotation{StartTime: startTime, Description: description, AddPins: slices.Clone(addPins)})
 
 	return after
@@ -1181,8 +1204,60 @@ func (f *Fake) ListSnapshots(ctx context.Context, src backend.Source) ([]backend
 		return nil, nil
 	}
 
-	out := slices.Clone(s.snapshots)
+	out := cloneSnapshots(s.snapshots)
 	slices.SortStableFunc(out, func(a, b backend.SnapshotInfo) int { return a.StartTime.Compare(b.StartTime) })
 
 	return out, nil
+}
+
+// DeleteSnapshots implements backend.Backend like the REST backend: with
+// pinned false and a pinned snapshot, the snapshots without a pin go and
+// the source stays with its policy and its last snapshot, as kopia server
+// does not refresh it; otherwise the source goes as a whole, with its
+// snapshots and policy. A source kopia server does not know has nothing to
+// delete. A failure after the call took effect, as with FailNextAfter,
+// returns the zero result.
+func (f *Fake) DeleteSnapshots(ctx context.Context, src backend.Source, pinned bool) (backend.DeleteResult, error) {
+	after, err := f.enter(ctx, Call{Method: DeleteSnapshots, Source: src, Pinned: pinned})
+	if err != nil {
+		return backend.DeleteResult{}, err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if err := f.own(DeleteSnapshots, src); err != nil {
+		return backend.DeleteResult{}, err
+	}
+
+	s, ok := f.sources[src]
+	if !ok {
+		return backend.DeleteResult{}, after
+	}
+
+	var res backend.DeleteResult
+
+	if !pinned {
+		for _, snap := range s.snapshots {
+			if snap.Pinned() {
+				res.Kept++
+			}
+		}
+	}
+
+	if res.Kept == 0 {
+		res.Deleted, res.Source = len(s.snapshots), true
+		delete(f.sources, src)
+	} else {
+		// kopia server does not refresh the source after the delete: its
+		// last snapshot stays as it was.
+		res.Deleted = len(s.snapshots) - res.Kept
+		s.snapshots = slices.DeleteFunc(s.snapshots, func(snap backend.SnapshotInfo) bool { return !snap.Pinned() })
+	}
+
+	if after != nil {
+		return backend.DeleteResult{}, after
+	}
+
+	return res, nil
 }
