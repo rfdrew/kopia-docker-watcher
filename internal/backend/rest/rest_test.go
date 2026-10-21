@@ -1194,6 +1194,10 @@ func TestEveryRequestNamesTheSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if _, err := b.DeleteSnapshots(t.Context(), s, true); err != nil {
+		t.Fatal(err)
+	}
+
 	f.mu.Lock()
 	requests := slices.Clone(f.requests)
 	f.mu.Unlock()
@@ -1205,6 +1209,10 @@ func TestEveryRequestNamesTheSource(t *testing.T) {
 		case r.Route == "POST snapshots/edit":
 			// The snapshot's ID, read for exactly this source.
 			if len(r.Query) != 0 || !bytes.Contains(r.Body, []byte(`"snapshots":["a"]`)) {
+				t.Errorf("%s %v %s", r.Route, r.Query, r.Body)
+			}
+		case r.Route == "POST snapshots/delete":
+			if len(r.Query) != 0 || !bytes.Contains(r.Body, []byte(`"source":{"host":"kopia","userName":"root","path":"/data/app"}`)) {
 				t.Errorf("%s %v %s", r.Route, r.Query, r.Body)
 			}
 		case r.Route == "POST sources":
@@ -1261,6 +1269,9 @@ func TestContextDone(t *testing.T) {
 
 		err = b.DeletePolicy(ctx, s)
 		assertError(t, err, opDeletePolicy, s, nil)
+
+		_, err = b.DeleteSnapshots(ctx, s, false)
+		assertError(t, err, opDeleteSnapshots, s, nil)
 
 		_, err = b.ListSources(ctx)
 		assertError(t, err, opListSources, backend.Source{}, nil)

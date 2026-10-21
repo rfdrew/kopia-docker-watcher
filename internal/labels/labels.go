@@ -62,7 +62,44 @@ type ContainerSpec struct {
 
 	// Policy holds the fields written to the Kopia policy of every path.
 	Policy Policy
+
+	// CleanupOnRemove is what becomes of the source of each path once no
+	// container backs it up any more.
+	CleanupOnRemove CleanupMode
+
+	// CleanupDeletePinned lets CleanupAll delete pinned snapshots too.
+	// Without it, a source with a pinned snapshot keeps that snapshot and
+	// its paused policy.
+	CleanupDeletePinned bool
 }
+
+// CleanupMode is what becomes of a source once no container backs it up
+// any more, the value of the cleanup-on-remove label. Docker forgets the
+// labels of a container it removes, so the watcher remembers the mode of
+// every container that backs a source up. A mode other than CleanupPause
+// acts only after CLEANUP_GRACE without a container, and never on a source
+// of kopia server's that the watcher did not register.
+type CleanupMode string
+
+// Cleanup modes, from the most cautious.
+const (
+	// CleanupPause pauses the source and keeps its policy and snapshots;
+	// the default.
+	CleanupPause CleanupMode = "pause"
+	// CleanupPolicy deletes the policy of a source that has no snapshots,
+	// which makes kopia server forget the source. A source with snapshots
+	// stays paused: without its policy it would inherit the schedule of
+	// the host or global policy.
+	CleanupPolicy CleanupMode = "policy"
+	// CleanupAll deletes the source with its snapshots and its policy. A
+	// pinned snapshot stays unless CleanupDeletePinned allows it to go;
+	// the source then keeps it and its paused policy, and only the
+	// snapshots without a pin are deleted.
+	CleanupAll CleanupMode = "all"
+)
+
+// cleanupHint names the values of the cleanup-on-remove label.
+const cleanupHint = "use pause, policy or all"
 
 // Tag is one key:value pair of the tags label.
 type Tag struct {
@@ -93,6 +130,7 @@ func Default() ContainerSpec {
 		Policy: Policy{
 			Scheduling: Scheduling{Cron: []string{DefaultSchedule}},
 		},
+		CleanupOnRemove: CleanupPause,
 	}
 }
 
@@ -185,6 +223,11 @@ func Parse(labels map[string]string, opts Options) (ContainerSpec, Issues) {
 	if p.spec.Enable && len(p.spec.Paths) == 0 {
 		p.label = Name(p.prefix, KeyPath)
 		p.errorf("required when %s is true", Name(p.prefix, KeyEnable))
+	}
+
+	if p.spec.CleanupDeletePinned && p.spec.CleanupOnRemove != CleanupAll {
+		p.label = Name(p.prefix, KeyCleanupDeletePinned)
+		p.warn("has no effect unless "+Name(p.prefix, KeyCleanupOnRemove)+" is all", "", "")
 	}
 
 	slices.SortStableFunc(p.issues, func(a, b Issue) int { return strings.Compare(a.Label, b.Label) })
@@ -315,6 +358,23 @@ func (p *parser) minInterval(v string) {
 		p.warn(fmt.Sprintf("negative duration %q", v), workaround, minIntervalHint)
 	default:
 		p.spec.MinInterval = d
+	}
+}
+
+// cleanup parses the cleanup mode, in any case. A value that is empty or
+// not a mode keeps the source paused, the most cautious mode, with a
+// warning: the label decides whether snapshots are deleted, so a typo must
+// not delete them.
+func (p *parser) cleanup(v string) {
+	workaround := "the source is only paused"
+
+	switch s := CleanupMode(strings.ToLower(strings.TrimSpace(v))); s {
+	case CleanupPause, CleanupPolicy, CleanupAll:
+		p.spec.CleanupOnRemove = s
+	case "":
+		p.warn("empty value", workaround, cleanupHint)
+	default:
+		p.warn(fmt.Sprintf("unknown cleanup mode %q", v), workaround, cleanupHint)
 	}
 }
 

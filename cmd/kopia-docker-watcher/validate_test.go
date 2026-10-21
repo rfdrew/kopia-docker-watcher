@@ -31,14 +31,16 @@ func TestValidateOutput(t *testing.T) {
 		t.Fatalf("exit code = %d, stderr: %s", code, stderr)
 	}
 
-	want := `kopia.enable             true
-kopia.path               /data/, /logs
-kopia.schedule           0 2 * * *; 30 3 * * 0
-kopia.snapshot-on-start  true
-kopia.snapshot-on-stop   false
-kopia.min-interval       10m0s
-kopia.description        (container name)
-kopia.tags               env:prod, app:web
+	want := `kopia.enable                 true
+kopia.path                   /data/, /logs
+kopia.schedule               0 2 * * *; 30 3 * * 0
+kopia.snapshot-on-start      true
+kopia.snapshot-on-stop       false
+kopia.min-interval           10m0s
+kopia.description            (container name)
+kopia.tags                   env:prod, app:web
+kopia.cleanup-on-remove      pause
+kopia.cleanup-delete-pinned  false
 
 sources:
   /data/ -> /data
@@ -217,6 +219,31 @@ func TestValidate(t *testing.T) {
 			args:   []string{"kopia.enable=true", "kopia.path=/data"},
 			code:   2,
 			stderr: []string{"HOST_PREFIX", "not an absolute path"},
+		},
+		{
+			name:   "path outside the watcher path prefix",
+			env:    env("HOST_PREFIX", "/host", "WATCHER_PATH_PREFIX", "/host/volumes/"),
+			args:   []string{"kopia.enable=true", "kopia.path=volumes/app,/etc"},
+			code:   1,
+			stdout: []string{"volumes/app -> /host/volumes/app", `error: kopia.path: "/etc" makes the source path /host/etc, which is outside WATCHER_PATH_PREFIX /host/volumes`},
+		},
+		{
+			name:   "invalid watcher path prefix",
+			env:    env("WATCHER_PATH_PREFIX", "volumes"),
+			args:   []string{"kopia.enable=true", "kopia.path=/data"},
+			code:   2,
+			stderr: []string{"WATCHER_PATH_PREFIX", "not an absolute path"},
+		},
+		{
+			name:   "cleanup labels",
+			args:   []string{"kopia.enable=true", "kopia.path=/data", "kopia.cleanup-on-remove=all", "kopia.cleanup-delete-pinned=true"},
+			stdout: []string{"kopia.cleanup-on-remove all", "kopia.cleanup-delete-pinned true"},
+		},
+		{
+			name: "unknown cleanup mode",
+			args: []string{"kopia.enable=true", "kopia.path=/data", "kopia.cleanup-on-remove=everything"},
+			stdout: []string{"kopia.cleanup-on-remove pause",
+				`warning: kopia.cleanup-on-remove: unknown cleanup mode "everything", the source is only paused; use pause, policy or all`},
 		},
 		{
 			name:   "server checks skipped",

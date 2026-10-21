@@ -569,6 +569,13 @@ func TestWrongIdentityEverywhere(t *testing.T) {
 	_, err = f.ListSnapshots(ctx, src)
 	check("ListSnapshots", err)
 
+	_, err = f.DeleteSnapshots(ctx, src, true)
+	check("DeleteSnapshots", err)
+
+	if !f.Known(src) || len(f.Snapshots(src)) != 1 {
+		t.Error("DeleteSnapshots deleted a source of another identity")
+	}
+
 	if got, err := f.ListSources(ctx); err != nil || len(got) != 0 {
 		t.Errorf("ListSources of the new identity = %v, %v", got, err)
 	}
@@ -999,4 +1006,132 @@ func TestFailNextAfterRejectsConfigErrors(t *testing.T) {
 	}()
 
 	New().FailNextAfter(ApplyPlan, &backend.Error{Op: "ApplyPlan", Kind: backend.ErrConfig, Err: errors.New("refused")})
+}
+
+// DeleteSnapshots keeps pinned snapshots unless told otherwise, and then
+// the source keeps its policy; otherwise the source goes as a whole.
+func TestDeleteSnapshots(t *testing.T) {
+	t0 := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+
+	setup := func(pin bool) (*Fake, backend.Source) {
+		f := New()
+		src := f.Source("/data/app")
+		f.SetPolicy(src, `{"scheduling":{"manual":true}}`)
+		f.AddSnapshot(src, backend.SnapshotInfo{StartTime: t0})
+		f.AddSnapshot(src, backend.SnapshotInfo{StartTime: t0.Add(time.Hour), Incomplete: "checkpoint"})
+
+		var pins []string
+		if pin {
+			pins = []string{"keep"}
+		}
+
+		f.AddSnapshot(src, backend.SnapshotInfo{StartTime: t0.Add(-time.Hour), Pins: pins})
+
+		return f, src
+	}
+
+	t.Run("without pins", func(t *testing.T) {
+		f, src := setup(false)
+
+		res, err := f.DeleteSnapshots(ctx, src, false)
+		if err != nil || res != (backend.DeleteResult{Deleted: 3, Source: true}) {
+			t.Errorf("result = %+v, %v", res, err)
+		}
+
+		if f.Known(src) {
+			t.Error("the source is left")
+		}
+
+		if c := f.CallsTo(DeleteSnapshots); len(c) != 1 || c[0].Source != src || c[0].Pinned {
+			t.Errorf("calls = %+v", c)
+		}
+	})
+
+	t.Run("pinned kept", func(t *testing.T) {
+		f, src := setup(true)
+
+		res, err := f.DeleteSnapshots(ctx, src, false)
+		if err != nil || res != (backend.DeleteResult{Deleted: 2, Kept: 1}) {
+			t.Errorf("result = %+v, %v", res, err)
+		}
+
+		if snaps := f.Snapshots(src); len(snaps) != 1 || !snaps[0].Pinned() {
+			t.Errorf("snapshots = %+v", snaps)
+		}
+
+		if _, ok := f.Policy(src); !ok {
+			t.Error("the policy is gone")
+		}
+
+		// The last snapshot is the pinned one now.
+		sources, _ := f.ListSources(ctx)
+		if len(sources) != 1 || sources[0].LastSnapshot == nil || !sources[0].LastSnapshot.StartTime.Equal(t0.Add(-time.Hour)) {
+			t.Errorf("sources = %+v", sources)
+		}
+
+		// Nothing left to delete.
+		if res, err := f.DeleteSnapshots(ctx, src, false); err != nil || res != (backend.DeleteResult{Kept: 1}) {
+			t.Errorf("second delete = %+v, %v", res, err)
+		}
+	})
+
+	t.Run("pinned allowed", func(t *testing.T) {
+		f, src := setup(true)
+
+		res, err := f.DeleteSnapshots(ctx, src, true)
+		if err != nil || res != (backend.DeleteResult{Deleted: 3, Source: true}) || f.Known(src) {
+			t.Errorf("result = %+v, %v", res, err)
+		}
+	})
+
+	t.Run("unknown source", func(t *testing.T) {
+		f := New()
+
+		res, err := f.DeleteSnapshots(ctx, f.Source("/data/none"), true)
+		if err != nil || res != (backend.DeleteResult{}) {
+			t.Errorf("result = %+v, %v", res, err)
+		}
+	})
+
+	t.Run("failures", func(t *testing.T) {
+		f, src := setup(false)
+		boom := &backend.Error{Op: "DeleteSnapshots", Kind: backend.ErrTemporary, Err: errors.New("boom")}
+
+		f.FailNext(DeleteSnapshots, boom)
+
+		if _, err := f.DeleteSnapshots(ctx, src, false); !errors.Is(err, boom) || !f.Known(src) {
+			t.Errorf("failure before: %v, known %t", err, f.Known(src))
+		}
+
+		f.FailNextAfter(DeleteSnapshots, boom)
+
+		if res, err := f.DeleteSnapshots(ctx, src, false); !errors.Is(err, boom) || res != (backend.DeleteResult{}) || f.Known(src) {
+			t.Errorf("failure after: %+v, %v, known %t", res, err, f.Known(src))
+		}
+	})
+}
+
+// AnnotateSnapshot adds the pins to the snapshot, each once.
+func TestAnnotateAddsPins(t *testing.T) {
+	f := New()
+	src := f.Source("/data/app")
+	start := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+
+	f.AddSnapshot(src, backend.SnapshotInfo{StartTime: start, Pins: []string{"a"}})
+
+	if err := f.AnnotateSnapshot(ctx, src, start, "app", []string{"a", "b"}); err != nil {
+		t.Fatal(err)
+	}
+
+	snaps, err := f.ListSnapshots(ctx, src)
+	if err != nil || len(snaps) != 1 || !reflect.DeepEqual(snaps[0].Pins, []string{"a", "b"}) {
+		t.Fatalf("snapshots = %+v, %v", snaps, err)
+	}
+
+	// The listing is a copy, pins included.
+	snaps[0].Pins[0] = "changed"
+
+	if f.Snapshots(src)[0].Pins[0] != "a" {
+		t.Error("ListSnapshots shares the pins with the fake")
+	}
 }

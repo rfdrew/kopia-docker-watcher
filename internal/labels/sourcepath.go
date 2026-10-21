@@ -33,3 +33,28 @@ func SourcePath(hostPrefix, p string) (string, error) {
 
 	return clean, nil
 }
+
+// SourcePathWithin is SourcePath for a watcher limited to watcherPrefix
+// (WATCHER_PATH_PREFIX: empty, or a clean absolute path): a source path
+// outside the prefix is an error too, so the watcher never registers,
+// pauses or deletes a source there. The prefix applies to the source path,
+// after HOST_PREFIX.
+func SourcePathWithin(hostPrefix, watcherPrefix, p string) (string, error) {
+	sp, err := SourcePath(hostPrefix, p)
+	if err != nil {
+		return "", err
+	}
+
+	if !WithinPrefix(watcherPrefix, sp) {
+		return "", fmt.Errorf("%q makes the source path %s, which is outside WATCHER_PATH_PREFIX %s", p, sp, watcherPrefix)
+	}
+
+	return sp, nil
+}
+
+// WithinPrefix reports whether the clean absolute source path p lies under
+// prefix, WATCHER_PATH_PREFIX: empty or / is no limit, any other prefix is
+// a clean absolute path that p must equal or lie below.
+func WithinPrefix(prefix, p string) bool {
+	return prefix == "" || prefix == "/" || p == prefix || strings.HasPrefix(p, prefix+"/")
+}

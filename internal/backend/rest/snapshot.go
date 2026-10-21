@@ -785,5 +785,6 @@ func fromSnapshot(s kopiaclient.Snapshot) *backend.SnapshotInfo {
 		EndTime:     s.EndTime,
 		Description: s.Description,
 		Incomplete:  s.IncompleteReason,
+		Pins:        slices.Clone(s.Pins),
 	}
 }

@@ -32,6 +32,7 @@ const (
 	EnvReconcileInterval             = "RECONCILE_INTERVAL"
 	EnvSnapshotOnWatcherStart        = "SNAPSHOT_ON_WATCHER_START"
 	EnvWatcherPathPrefix             = "WATCHER_PATH_PREFIX"
+	EnvCleanupGrace                  = "CLEANUP_GRACE"
 	EnvStateFile                     = "STATE_FILE"
 	EnvListenAddr                    = "LISTEN_ADDR"
 	EnvNotifyWebhookURL              = "NOTIFY_WEBHOOK_URL"
@@ -50,11 +51,17 @@ const (
 	DefaultStateFile           = "/var/lib/kopia-docker-watcher/state.json"
 	DefaultListenAddr          = ":8080"
 	DefaultLabelPrefix         = "kopia"
+	DefaultCleanupGrace        = 24 * time.Hour
 
 	// MinReconcileInterval keeps a typo such as "5s" from turning every full
 	// reconcile into a burst of policy writes, each of which makes kopia
 	// server refresh the whole repository.
 	MinReconcileInterval = 10 * time.Second
+
+	// MinCleanupGrace keeps a typo such as "10s" from deleting the snapshots
+	// of a source moments after docker compose down, the stop snapshot
+	// included, when the containers may well come back.
+	MinCleanupGrace = 10 * time.Minute
 )
 
 // MigrationGuideURL points to the guide for users of the Python version.
@@ -73,8 +80,13 @@ type Config struct {
 	SnapshotOnWatcherStart bool
 
 	// WatcherPathPrefix limits the sources the watcher may touch. Empty or a
-	// clean absolute path.
+	// clean absolute path, never "/", which limits nothing. It applies to
+	// source paths, after HOST_PREFIX.
 	WatcherPathPrefix string
+
+	// CleanupGrace is how long a source must have been without a container
+	// before the cleanup-on-remove label deletes anything of it.
+	CleanupGrace time.Duration
 
 	StateFile        string
 	ListenAddr       string
@@ -115,6 +127,7 @@ func Load(getenv func(string) string) (*Config, error) {
 	cfg := &Config{
 		LogLevel:          DefaultLogLevel,
 		ReconcileInterval: DefaultReconcileInterval,
+		CleanupGrace:      DefaultCleanupGrace,
 		StateFile:         DefaultStateFile,
 		ListenAddr:        DefaultListenAddr,
 		LabelPrefix:       DefaultLabelPrefix,
@@ -165,7 +178,25 @@ func Load(getenv func(string) string) (*Config, error) {
 	cfg.SnapshotOnWatcherStart = l.bool(EnvSnapshotOnWatcherStart, false)
 
 	if v := l.get(EnvWatcherPathPrefix); v != "" {
-		cfg.WatcherPathPrefix = l.absPath(EnvWatcherPathPrefix, v)
+		p, err := ParseWatcherPathPrefix(v)
+		if err != nil {
+			l.errorf("%s: %v", EnvWatcherPathPrefix, err)
+		}
+
+		cfg.WatcherPathPrefix = p
+	}
+
+	if v := l.get(EnvCleanupGrace); v != "" {
+		d, err := time.ParseDuration(v)
+
+		switch {
+		case err != nil:
+			l.errorf("%s: invalid duration %q, use a Go duration such as 24h or 168h (d is not a unit)", EnvCleanupGrace, v)
+		case d < MinCleanupGrace:
+			l.errorf("%s: %v is shorter than the minimum %v", EnvCleanupGrace, d, MinCleanupGrace)
+		default:
+			cfg.CleanupGrace = d
+		}
 	}
 
 	if v := l.get(EnvStateFile); v != "" {
@@ -341,6 +372,26 @@ func ParseHostPrefix(s string) (string, error) {
 	return path.Clean(s), nil
 }
 
+// ParseWatcherPathPrefix checks a WATCHER_PATH_PREFIX value: empty, or an
+// absolute path. The result is clean, and "/", which limits nothing, is
+// empty.
+func ParseWatcherPathPrefix(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", nil
+	}
+
+	if !path.IsAbs(s) {
+		return s, fmt.Errorf("%q is not an absolute path", s)
+	}
+
+	if s = path.Clean(s); s == "/" {
+		return "", nil
+	}
+
+	return s, nil
+}
+
 // LogValue implements slog.LogValuer. Secrets are never logged: only whether
 // the password is set and the webhook host.
 func (c *Config) LogValue() slog.Value {
@@ -363,6 +414,7 @@ func (c *Config) LogValue() slog.Value {
 		slog.Duration("reconcile_interval", c.ReconcileInterval),
 		slog.Bool("snapshot_on_watcher_start", c.SnapshotOnWatcherStart),
 		slog.String("watcher_path_prefix", c.WatcherPathPrefix),
+		slog.Duration("cleanup_grace", c.CleanupGrace),
 		slog.String("state_file", c.StateFile),
 		slog.String("listen_addr", c.ListenAddr),
 		slog.String("notify_webhook", webhook),
@@ -404,20 +456,6 @@ func (l *loader) bool(name string, def bool) bool {
 	}
 
 	return b
-}
-
-// absPath requires an absolute slash-separated path and cleans it.
-func (l *loader) absPath(name, v string) string {
-	if v == "" {
-		return ""
-	}
-
-	if !path.IsAbs(v) {
-		l.errorf("%s: %q is not an absolute path", name, v)
-		return v
-	}
-
-	return path.Clean(v)
 }
 
 // parseHTTPURL checks an http(s) URL. Errors do not echo the URL: a webhook

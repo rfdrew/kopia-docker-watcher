@@ -35,7 +35,7 @@ func (r *Reconciler) parse(c docker.Container) parsed {
 	pc := parsed{container: c, spec: spec, issues: issues}
 
 	for _, p := range spec.Paths {
-		sp, err := labels.SourcePath(r.hostPrefix, p)
+		sp, err := labels.SourcePathWithin(r.hostPrefix, r.watcherPrefix, p)
 		if err != nil {
 			pc.badPaths = append(pc.badPaths, pathError{path: p, err: err})
 			continue
@@ -51,6 +51,14 @@ func (r *Reconciler) parse(c docker.Container) parsed {
 
 // valid reports whether the labels can be applied.
 func (pc parsed) valid() bool { return !pc.issues.HasErrors() }
+
+// labelOK reports whether the label with the key has no error; the other
+// labels need not be valid.
+func (r *Reconciler) labelOK(pc parsed, key string) bool {
+	name := labels.Name(r.labelPrefix, key)
+
+	return !slices.ContainsFunc(pc.issues, func(is labels.Issue) bool { return is.Label == name && is.Severity == labels.Error })
+}
 
 // patch returns the policy fields the labels set.
 func (pc parsed) patch() backend.PolicyPatch {
@@ -72,6 +80,11 @@ type owner struct {
 	issues labels.Issues
 	// snap is what its labels say about snapshots.
 	snap snapLabels
+	// cleanup and deletePinned are what its labels ask of the cleanup of
+	// the path's source once no container backs it up: the most cautious
+	// values when the label in question has an error.
+	cleanup      labels.CleanupMode
+	deletePinned bool
 }
 
 // owners returns the containers that back up path p, stopped ones
@@ -86,10 +99,16 @@ func (r *Reconciler) owners(p string, containers []docker.Container) []owner {
 		}
 
 		o := owner{id: c.ID, name: c.Name, state: c.State, labels: c.Labels, valid: pc.valid(), issues: pc.issues,
-			snap: r.snapshotLabels(pc)}
+			snap: r.snapshotLabels(pc), cleanup: labels.CleanupPause}
 		if o.valid {
 			o.patch = pc.patch()
 		}
+
+		if r.labelOK(pc, labels.KeyCleanupOnRemove) {
+			o.cleanup = pc.spec.CleanupOnRemove
+		}
+
+		o.deletePinned = pc.spec.CleanupDeletePinned && r.labelOK(pc, labels.KeyCleanupDeletePinned)
 
 		out = append(out, o)
 	}

@@ -314,6 +314,113 @@ func TestSnapshotFields(t *testing.T) {
 	}
 }
 
+// The owners of a source and since when it has none are part of the file,
+// and a record without them still loads.
+func TestOwnerFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := open(t, path, Options{})
+
+	t0 := time.Date(2026, 10, 19, 8, 0, 0, 0, time.UTC)
+	owners := []Owner{
+		{ID: "c1", Name: "app", ComposeProject: "shop", LabelsHash: "sha256:ab", Cleanup: "all", DeletePinned: true, Gone: t0},
+		{ID: "c2", Name: "worker"},
+	}
+
+	if err := s.Update(srcA, func(r *Record) error {
+		r.Owners = owners
+		r.OwnersUpdated = t0
+		r.OrphanedSince = t0
+
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The reconciler sets Applied without touching them.
+	if err := setApplied(s, srcA, applied("0 * * * *", "")); err != nil {
+		t.Fatal(err)
+	}
+
+	var file struct {
+		Sources []map[string]json.RawMessage `json:"sources"`
+	}
+
+	if err := json.Unmarshal([]byte(readFile(t, path)), &file); err != nil {
+		t.Fatal(err)
+	}
+
+	e := file.Sources[0]
+	assertCompact(t, "owners", e["owners"], `[{"id":"c1","name":"app","composeProject":"shop","labelsHash":"sha256:ab",`+
+		`"cleanup":"all","deletePinned":true,"gone":"2026-10-19T08:00:00Z"},{"id":"c2","name":"worker"}]`)
+	assertCompact(t, "ownersUpdated", e["ownersUpdated"], `"2026-10-19T08:00:00Z"`)
+	assertCompact(t, "orphanedSince", e["orphanedSince"], `"2026-10-19T08:00:00Z"`)
+
+	s = reopen(t, s)
+
+	got, ok := s.Get(srcA)
+	if !ok || !slices.EqualFunc(got.Owners, owners, Owner.Equal) || !got.OwnersUpdated.Equal(t0) || !got.OrphanedSince.Equal(t0) {
+		t.Errorf("record = %+v", got)
+	}
+
+	if err := setApplied(s, srcB, applied("", "")); err != nil {
+		t.Fatal(err)
+	}
+
+	s = reopen(t, s)
+
+	if got, _ := s.Get(srcB); got.Owners != nil || !got.OwnersUpdated.IsZero() || !got.OrphanedSince.IsZero() {
+		t.Errorf("record without owner fields = %+v", got)
+	}
+}
+
+// Owner fields that cannot be decoded are dropped with the snapshot
+// fields; the policy fields stay.
+func TestOwnerFieldsSalvaged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	content := `{"version":1,"sources":[{"source":{"host":"kopia","userName":"root","path":"/data/a"},` +
+		`"savedScheduling":{"cron":["0 * * * *"]},"owners":[{"id":"c1","gone":"yesterday"}],"orphanedSince":"2026-10-19T08:00:00Z"}]}`
+
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	log, logs := newLogger()
+	s := open(t, path, Options{Logger: log})
+
+	got, ok := s.Get(srcA)
+	if !ok || string(got.SavedScheduling) != `{"cron":["0 * * * *"]}` || got.Owners != nil || !got.OrphanedSince.IsZero() {
+		t.Errorf("record = %+v", got)
+	}
+
+	if !strings.Contains(logs.String(), "the snapshot and owner state cannot be decoded") {
+		t.Errorf("log:\n%s", logs)
+	}
+}
+
+func TestOwnerEqual(t *testing.T) {
+	t0 := time.Date(2026, 10, 19, 8, 0, 0, 0, time.UTC)
+	o := Owner{ID: "c1", Name: "app", ComposeProject: "shop", LabelsHash: "h", Cleanup: "all", DeletePinned: true, Gone: t0}
+
+	if !o.Equal(Owner{ID: "c1", Name: "app", ComposeProject: "shop", LabelsHash: "h", Cleanup: "all", DeletePinned: true,
+		Gone: t0.In(time.FixedZone("x", 3600))}) {
+		t.Error("the same instant in another zone differs")
+	}
+
+	for _, p := range []Owner{
+		{ID: "c2", Name: "app", ComposeProject: "shop", LabelsHash: "h", Cleanup: "all", DeletePinned: true, Gone: t0},
+		{ID: "c1", Name: "web", ComposeProject: "shop", LabelsHash: "h", Cleanup: "all", DeletePinned: true, Gone: t0},
+		{ID: "c1", Name: "app", ComposeProject: "x", LabelsHash: "h", Cleanup: "all", DeletePinned: true, Gone: t0},
+		{ID: "c1", Name: "app", ComposeProject: "shop", LabelsHash: "i", Cleanup: "all", DeletePinned: true, Gone: t0},
+		{ID: "c1", Name: "app", ComposeProject: "shop", LabelsHash: "h", Cleanup: "pause", DeletePinned: true, Gone: t0},
+		{ID: "c1", Name: "app", ComposeProject: "shop", LabelsHash: "h", Cleanup: "all", Gone: t0},
+		{ID: "c1", Name: "app", ComposeProject: "shop", LabelsHash: "h", Cleanup: "all", DeletePinned: true},
+	} {
+		if o.Equal(p) {
+			t.Errorf("%+v equals %+v", o, p)
+		}
+	}
+}
+
 // A snapshot wait the reconciler cannot use, as one a newer watcher wrote,
 // does not make its entry unreadable.
 func TestSnapshotWaitsAreNotValidated(t *testing.T) {
@@ -365,7 +472,7 @@ func TestSnapshotFieldsSalvaged(t *testing.T) {
 		t.Errorf("record of b = %+v", b)
 	}
 
-	for _, want := range []string{"1 snapshot waits cannot be decoded", "the snapshot state cannot be decoded", "copy"} {
+	for _, want := range []string{"1 snapshot waits cannot be decoded", "the snapshot and owner state cannot be decoded", "copy"} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("log lacks %q:\n%s", want, logs)
 		}
@@ -925,6 +1032,9 @@ func TestKnownEntryKeys(t *testing.T) {
 		StopAbsorbedAt:          mark,
 		StopAbsorbedDescription: "d",
 		StopAbsorbedLastStart:   mark,
+		Owners:                  []Owner{{ID: "c1", Name: "app"}},
+		OwnersUpdated:           mark,
+		OrphanedSince:           mark,
 	}
 
 	data, err := json.Marshal(entryForTest{Source: srcA, Record: r})

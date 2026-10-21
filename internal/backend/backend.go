@@ -116,6 +116,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"time"
 )
 
@@ -123,8 +124,10 @@ import (
 // are safe for concurrent use. The reconciler calls them for different
 // sources at once; for one source it does not overlap PlanSource,
 // ApplyPlan, PreviewSchedule, DeletePolicy, TriggerSnapshot,
-// AnnotateSnapshot and ListSnapshots with each other, but WaitSnapshot may
-// run alongside them, also several times for one source.
+// AnnotateSnapshot, ListSnapshots and DeleteSnapshots with each other, but
+// WaitSnapshot may run alongside them, also several times for one source;
+// never alongside DeleteSnapshots or DeletePolicy, which the reconciler
+// calls only for a source it follows no snapshot of.
 //
 // Every method that takes a Source requires a complete one
 // (ErrIncompleteSource) with an absolute path (an error of neither kind
@@ -177,8 +180,22 @@ type Backend interface {
 
 	// DeletePolicy removes the policy of the path. A source with snapshots
 	// stays and inherits the host or global policy, so this is only for a
-	// source without snapshots. Deleting a missing policy succeeds.
+	// source without snapshots, which kopia server then forgets. Deleting a
+	// missing policy succeeds.
 	DeletePolicy(ctx context.Context, src Source) error
+
+	// DeleteSnapshots deletes the snapshots of src, checkpoints and
+	// incomplete ones included, and reports what it deleted. With pinned
+	// false a snapshot that carries a pin is kept: if src has one, only
+	// the snapshots without a pin are deleted, and src stays with its
+	// policy. Otherwise, and always with pinned true, src goes as a whole:
+	// every snapshot, pinned ones included, its policy and a running
+	// upload, which kopia server cancels. The snapshots are listed right
+	// before the delete, so their IDs never reach the caller: kopia server
+	// has no conditional delete, and a pin added between the listing and
+	// the delete is not seen. A source kopia server does not know has
+	// nothing to delete: the result is zero and the error nil.
+	DeleteSnapshots(ctx context.Context, src Source, pinned bool) (DeleteResult, error)
 
 	// The snapshot methods below serve the snapshot lifecycle. An
 	// implementation that cannot do one yet returns ErrNotImplemented;
@@ -267,7 +284,7 @@ func (s SourceStatus) Clone() SourceStatus {
 	out := s
 
 	if s.LastSnapshot != nil {
-		last := *s.LastSnapshot
+		last := s.LastSnapshot.Clone()
 		out.LastSnapshot = &last
 	}
 
@@ -284,6 +301,29 @@ type SnapshotInfo struct {
 	// Incomplete is empty for a complete snapshot, "checkpoint" for an
 	// intermediate one of a long upload, otherwise why it is incomplete.
 	Incomplete string
+	// Pins are the snapshot's pins: retention never deletes a pinned
+	// snapshot, and neither does the cleanup without leave to.
+	Pins []string
+}
+
+// Clone returns a deep copy of s.
+func (s SnapshotInfo) Clone() SnapshotInfo {
+	s.Pins = slices.Clone(s.Pins)
+
+	return s
+}
+
+// Pinned reports whether the snapshot carries a pin.
+func (s SnapshotInfo) Pinned() bool { return len(s.Pins) > 0 }
+
+// DeleteResult is what DeleteSnapshots deleted.
+type DeleteResult struct {
+	// Deleted counts the snapshots deleted, as listed before the delete.
+	Deleted int
+	// Kept counts the pinned snapshots kept.
+	Kept int
+	// Source reports that the source went as a whole, with its policy.
+	Source bool
 }
 
 // SnapshotTicket identifies a snapshot TriggerSnapshot queued. It is plain

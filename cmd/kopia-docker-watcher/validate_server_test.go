@@ -256,14 +256,16 @@ func TestValidateWithKopiaServer(t *testing.T) {
 		t.Fatalf("exit code = %d, stderr: %s\nstdout: %s", code, stderr, stdout)
 	}
 
-	want := `kopia.enable             true
-kopia.path               /data/, logs/./
-kopia.schedule           0 2 * * *
-kopia.snapshot-on-start  true
-kopia.snapshot-on-stop   false
-kopia.min-interval       10m0s
-kopia.description        (container name)
-kopia.tags               (none)
+	want := `kopia.enable                 true
+kopia.path                   /data/, logs/./
+kopia.schedule               0 2 * * *
+kopia.snapshot-on-start      true
+kopia.snapshot-on-stop       false
+kopia.min-interval           10m0s
+kopia.description            (container name)
+kopia.tags                   (none)
+kopia.cleanup-on-remove      pause
+kopia.cleanup-delete-pinned  false
 
 sources:
   /data/ -> root@nas:/host/data
@@ -463,14 +465,16 @@ func TestValidateAllContainers(t *testing.T) {
 	}
 
 	want := `container db (001122334455, exited)
-kopia.enable             false
-kopia.path               /srv/db
-kopia.schedule           0 * * * *
-kopia.snapshot-on-start  true
-kopia.snapshot-on-stop   false
-kopia.min-interval       10m0s
-kopia.description        (container name)
-kopia.tags               (none)
+kopia.enable                 false
+kopia.path                   /srv/db
+kopia.schedule               0 * * * *
+kopia.snapshot-on-start      true
+kopia.snapshot-on-stop       false
+kopia.min-interval           10m0s
+kopia.description            (container name)
+kopia.tags                   (none)
+kopia.cleanup-on-remove      pause
+kopia.cleanup-delete-pinned  false
 
 sources:
   /srv/db -> /srv/db
@@ -478,14 +482,16 @@ sources:
 warning: kopia.enable: "yes" is not a boolean, treated as false; use true or false
 
 container web (a1b2c3d4e5f6, running)
-kopia.enable             true
-kopia.path               /srv/web
-kopia.schedule           0 * * * *
-kopia.snapshot-on-start  true
-kopia.snapshot-on-stop   false
-kopia.min-interval       10m0s
-kopia.description        (container name)
-kopia.tags               (none)
+kopia.enable                 true
+kopia.path                   /srv/web
+kopia.schedule               0 * * * *
+kopia.snapshot-on-start      true
+kopia.snapshot-on-stop       false
+kopia.min-interval           10m0s
+kopia.description            (container name)
+kopia.tags                   (none)
+kopia.cleanup-on-remove      pause
+kopia.cleanup-delete-pinned  false
 
 sources:
   /srv/web -> /srv/web

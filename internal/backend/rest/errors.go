@@ -38,6 +38,8 @@ const (
 	reqUpload
 	// reqEditSnapshots: POST /api/v1/snapshots/edit.
 	reqEditSnapshots
+	// reqDeleteSnapshots: POST /api/v1/snapshots/delete.
+	reqDeleteSnapshots
 )
 
 // Texts of kopia server's 500 answers (internal/server/api_error.go,
