@@ -1,0 +1,147 @@
+# kopia server, kopia-docker-watcher and a container it backs up, on one host.
+#
+#   cp .env.example .env    # then edit .env
+#   docker compose up -d kopia
+#   docker compose logs kopia | grep 'SERVER CERT SHA256'
+#   # put the hex value into KOPIA_SERVER_CERT_FINGERPRINT in .env
+#   docker compose up -d
+#
+# See ../README.md and ../docs/configuration.md.
+
+name: kopia-docker-watcher-example
+
+services:
+  # kopia server takes the snapshots. It reads the files itself, so every
+  # path the labels name must be visible inside this container.
+  kopia:
+    image: kopia/kopia:0.23.1
+    # kopia server registers sources as user@host of its repository
+    # connection; a fixed host name keeps that stable across recreations.
+    hostname: kopia
+    restart: unless-stopped
+    # On the first start: create the repository and generate the TLS
+    # certificate. Later starts reuse both from the volumes, so the
+    # certificate fingerprint never changes (--tls-generate-cert refuses to
+    # overwrite existing files anyway).
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ ! -f /app/config/repository.config ]; then
+          kopia repository create filesystem --path=/repository --override-hostname=kopia --override-username=root
+        fi
+        tls="--tls-cert-file=/app/config/tls.crt --tls-key-file=/app/config/tls.key"
+        if [ ! -f /app/config/tls.crt ]; then
+          tls="$$tls --tls-generate-cert --tls-generate-cert-name=kopia --tls-generate-cert-name=localhost"
+        fi
+        # The UI must stay enabled (no --no-ui): the watcher uses its API.
+        # No --disable-csrf-token-checks: the watcher handles CSRF tokens.
+        exec kopia server start --address=0.0.0.0:51515 $$tls \
+          --server-username="$$KOPIA_SERVER_USERNAME" --server-password="$$KOPIA_SERVER_PASSWORD"
+    environment:
+      # The repository password belongs to kopia server only, never to the
+      # watcher.
+      KOPIA_PASSWORD: ${KOPIA_PASSWORD:?set KOPIA_PASSWORD in .env}
+      # The web UI user; the watcher logs in as this user.
+      KOPIA_SERVER_USERNAME: ${KOPIA_SERVER_USERNAME:-kopia}
+      KOPIA_SERVER_PASSWORD: ${KOPIA_SERVER_PASSWORD:?set KOPIA_SERVER_PASSWORD in .env}
+    volumes:
+      - kopia-config:/app/config
+      - kopia-cache:/app/cache
+      - kopia-logs:/app/logs
+      # A filesystem repository for the example; use your own storage.
+      - kopia-repository:/repository
+      # The data to back up, read-only, at the same path as on the host, so
+      # HOST_PREFIX stays empty. Alternatively mount the host root
+      # (- /:/host:ro) and set HOST_PREFIX=/host on the watcher.
+      - ${DATA_ROOT:-/srv/kopia-docker-watcher-example}:${DATA_ROOT:-/srv/kopia-docker-watcher-example}:ro
+    ports:
+      # The web UI, https://localhost:51515; the watcher does not need it.
+      - "127.0.0.1:51515:51515"
+
+  watcher:
+    image: ghcr.io/rfdrew/kopia-docker-watcher:0.1
+    restart: unless-stopped
+    depends_on:
+      - kopia
+    # The image runs as the non-root user 65532. To read the Docker socket it
+    # needs the group that owns the socket on the host:
+    #   stat -c %g /var/run/docker.sock
+    # Without the group the watcher cannot list containers and keeps failing.
+    # With docker-socket-proxy (below) drop group_add and the socket mount.
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID in .env to the GID of /var/run/docker.sock}"
+    volumes:
+      # Read access to containers and events is all the watcher needs, but
+      # :ro does not limit the Docker API; docker-socket-proxy does.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # STATE_FILE: what the watcher applied and which containers own each
+      # source. Mount a directory, not a single file. The image's directory
+      # belongs to the watcher's user, so a new named volume is writable.
+      - watcher-state:/var/lib/kopia-docker-watcher
+      # No data volumes and no KOPIA_PASSWORD: kopia server reads the files.
+    environment:
+      KOPIA_SERVER_URL: https://kopia:51515
+      KOPIA_SERVER_USERNAME: ${KOPIA_SERVER_USERNAME:-kopia}
+      KOPIA_SERVER_PASSWORD: ${KOPIA_SERVER_PASSWORD:?set KOPIA_SERVER_PASSWORD in .env}
+      # The hex value from "SERVER CERT SHA256:" in the kopia server log.
+      KOPIA_SERVER_CERT_FINGERPRINT: ${KOPIA_SERVER_CERT_FINGERPRINT:-}
+      # Set when kopia server sees the host paths under another directory.
+      HOST_PREFIX: ${HOST_PREFIX:-}
+      # Optional safety net: never touch sources outside this path.
+      WATCHER_PATH_PREFIX: ${WATCHER_PATH_PREFIX:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # With docker-socket-proxy:
+      # DOCKER_HOST: tcp://docker-socket-proxy:2375
+    # The watcher finishes its policy writes and saves the state in about
+    # 8 s after SIGTERM; give it more than that before Docker kills it.
+    stop_grace_period: 15s
+
+  # Least-privilege access to Docker: only GET requests to containers and
+  # events (the proxy also allows /_ping and /version, which the Docker
+  # client uses). To use it, uncomment this service and DOCKER_HOST above,
+  # and remove group_add and the docker.sock mount from the watcher.
+  #
+  # docker-socket-proxy:
+  #   image: tecnativa/docker-socket-proxy:latest  # pin a version
+  #   restart: unless-stopped
+  #   environment:
+  #     CONTAINERS: 1
+  #     EVENTS: 1
+  #     POST: 0
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  # A container the watcher backs up. Its data is a bind mount at a host path
+  # that kopia server also mounts.
+  app:
+    image: alpine:3
+    restart: unless-stopped
+    command: ["sh", "-c", "while true; do date >> /data/log.txt; sleep 60; done"]
+    volumes:
+      - ${DATA_ROOT:-/srv/kopia-docker-watcher-example}/data:/data
+    labels:
+      kopia.enable: "true"
+      # A host path; kopia server sees it at the same path (or under
+      # HOST_PREFIX).
+      kopia.path: ${DATA_ROOT:-/srv/kopia-docker-watcher-example}/data
+      # Separate several cron expressions with ";". An empty value leaves
+      # the schedule to the host or global policy.
+      kopia.schedule: "0 3 * * *"
+      kopia.snapshot-on-start: "true"
+      kopia.snapshot-on-stop: "true"
+      kopia.min-interval: "1h"
+      kopia.description: "example app data"
+      # Written into the snapshot description: kopia server cannot set tags
+      # through its API.
+      kopia.tags: "env:example,app:alpine"
+      # After docker compose down and CLEANUP_GRACE (24h), delete the source
+      # with its snapshots; pinned snapshots stay. The default is pause.
+      kopia.cleanup-on-remove: "all"
+
+volumes:
+  kopia-config:
+  kopia-cache:
+  kopia-logs:
+  kopia-repository:
+  watcher-state:
