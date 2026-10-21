@@ -132,6 +132,42 @@ func TestDeleteSnapshotsKeepsPinned(t *testing.T) {
 	assertRoutes(t, f, "GET sources", "GET snapshots")
 }
 
+// kopia server reports the pins of a snapshot also on the oldest snapshot
+// with the same content: that one counts as pinned and stays too.
+func TestDeleteSnapshotsSameContentAsPinned(t *testing.T) {
+	f := newFakeKopia()
+	b := newBackend(t, f)
+	t0 := time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC)
+	same := func(id string, at time.Time, pins ...string) kopiaclient.Snapshot {
+		s := pinned(snapshot(id, at, at, ""), pins...)
+		s.RootID = "root-same"
+
+		return s
+	}
+
+	f.setPolicy(info("/data/app"), `{"scheduling":{"manual":true}}`)
+	f.set(func(f *fakeKopia) {
+		f.snapshots[info("/data/app")] = []kopiaclient.Snapshot{
+			same("first", t0), snapshot("other", t0.Add(time.Minute), t0.Add(time.Minute), ""), same("pinned", t0.Add(2*time.Minute), "keep"),
+		}
+		f.sources[info("/data/app")].snapshots = true
+	})
+
+	listed, err := b.ListSnapshots(t.Context(), src("/data/app"))
+	if err != nil || len(listed) != 3 || !listed[0].Pinned() || listed[1].Pinned() || !listed[2].Pinned() {
+		t.Fatalf("listed = %+v, %v", listed, err)
+	}
+
+	res, err := b.DeleteSnapshots(t.Context(), src("/data/app"), false)
+	if err != nil || res != (backend.DeleteResult{Deleted: 1, Kept: 2}) {
+		t.Errorf("result = %+v, %v", res, err)
+	}
+
+	if reqs := deleteRequests(t, f); len(reqs) != 1 || !slices.Equal(reqs[0].SnapshotManifestIDs, []string{"other"}) {
+		t.Errorf("delete requests = %+v", reqs)
+	}
+}
+
 // With leave to delete pinned snapshots, the source goes as a whole.
 func TestDeleteSnapshotsPinnedAllowed(t *testing.T) {
 	f, b := deleteFixture(t, true)

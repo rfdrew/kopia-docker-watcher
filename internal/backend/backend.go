@@ -307,7 +307,9 @@ type SnapshotInfo struct {
 	// intermediate one of a long upload, otherwise why it is incomplete.
 	Incomplete string
 	// Pins are the snapshot's pins: retention never deletes a pinned
-	// snapshot, and neither does the cleanup without leave to.
+	// snapshot, and neither does the cleanup without leave to. kopia server
+	// (0.23) also reports on the oldest of the snapshots with the same
+	// content the pins of the others, so that one counts as pinned too.
 	Pins []string
 }
 

@@ -24,6 +24,11 @@ const maxDeleteIDs = 1000
 // delete or by its answer ("unknown source"), has nothing to delete. When a
 // request fails, the result counts the snapshots of the requests before it.
 //
+// kopia server reports on the oldest of the snapshots with the same content
+// the pins of the others too (handleListSnapshots merges them into it while
+// it counts the unique snapshots, also for all=1): such a snapshot counts as
+// pinned and stays, a conservative mistake.
+//
 // kopia server checks no pins. With deleteSourceAndPolicy it deletes the
 // manifests it lists itself, so a snapshot pinned after the listing goes
 // too. With IDs such a snapshot stays: the edit that pinned it saved it

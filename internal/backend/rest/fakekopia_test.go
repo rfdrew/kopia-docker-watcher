@@ -47,7 +47,10 @@ import (
 //     or a 404 NOT_FOUND, GET /api/v1/tasks/{id}/logs its log (null for an
 //     unknown task).
 //   - GET /api/v1/snapshots lists the source's snapshots, oldest first,
-//     and without all=1 keeps the oldest of those with the same root.
+//     and without all=1 keeps the oldest of those with the same root. With
+//     all=1 too, the oldest of those with the same root carries the pins
+//     of all of them, as kopia server merges them into it while it counts
+//     the unique snapshots.
 //   - POST /api/v1/snapshots/edit changes the description and adds pins;
 //     a changed snapshot gets a new ID, an unknown ID is a 500.
 //   - POST /api/v1/snapshots/delete is a 404 NOT_FOUND for a source kopia
@@ -472,6 +475,19 @@ func (f *fakeKopia) listSnapshots(q url.Values) (int, string) {
 	})
 
 	resp := map[string]any{"unfilteredCount": len(snaps)}
+
+	// kopia server's uniqueSnapshots, which runs for all=1 as well, adds
+	// the pins of later snapshots with the same root to the first one.
+	for i := range snaps {
+		first := slices.IndexFunc(snaps, func(x kopiaclient.Snapshot) bool { return x.RootID == snaps[i].RootID })
+		if first == i || len(snaps[i].Pins) == 0 {
+			continue
+		}
+
+		pins := slices.Concat(snaps[first].Pins, snaps[i].Pins)
+		slices.Sort(pins)
+		snaps[first].Pins = slices.Compact(pins)
+	}
 
 	if q.Get("all") == "" {
 		var unique []kopiaclient.Snapshot

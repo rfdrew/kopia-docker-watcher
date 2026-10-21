@@ -5,6 +5,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"slices"
@@ -115,8 +116,11 @@ func TestIntegrationCleanup(t *testing.T) {
 		id := engine.run(filepath.Base(p), enable, pathLabel(p), "kopia.schedule=", noOnStart, "kopia.cleanup-on-remove="+mode)
 		pass(t, p)
 
+		// Each snapshot with other content: kopia server reports the pins
+		// of a snapshot on the oldest one with the same content too.
 		var starts []time.Time
-		for range n {
+		for i := range n {
+			s.Exec(t, "sh", "-c", fmt.Sprintf("echo %d >> %s/file.txt", i, p))
 			starts = append(starts, snapshot(t, source(p)))
 		}
 
