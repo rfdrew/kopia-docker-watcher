@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"testing"
@@ -271,6 +272,72 @@ func TestDeleteSnapshotsErrors(t *testing.T) {
 
 		if !errors.Is(err, context.Canceled) {
 			t.Errorf("err = %v, want context.Canceled", err)
+		}
+	})
+}
+
+// The IDs of a source with many snapshots go in several requests, each
+// small enough for kopia server; a failed request ends the delete with
+// what the requests before it deleted.
+func TestDeleteSnapshotsInChunks(t *testing.T) {
+	setup := func(t *testing.T) (*fakeKopia, *Backend) {
+		t.Helper()
+
+		f := newFakeKopia()
+		b := newBackend(t, f)
+		t0 := time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC)
+
+		f.setPolicy(info("/data/app"), `{"scheduling":{"manual":true}}`)
+		f.set(func(f *fakeKopia) {
+			snaps := []kopiaclient.Snapshot{pinned(snapshot("kept", t0, t0, ""), "keep")}
+
+			for i := range 2*maxDeleteIDs + 500 {
+				at := t0.Add(time.Duration(i+1) * time.Minute)
+				snaps = append(snaps, snapshot(fmt.Sprintf("%032x", i), at, at, ""))
+			}
+
+			f.snapshots[info("/data/app")] = snaps
+			f.sources[info("/data/app")].snapshots = true
+		})
+		f.resetRequests()
+
+		return f, b
+	}
+
+	t.Run("all chunks", func(t *testing.T) {
+		f, b := setup(t)
+
+		res, err := b.DeleteSnapshots(t.Context(), src("/data/app"), false)
+		if err != nil || res != (backend.DeleteResult{Deleted: 2*maxDeleteIDs + 500, Kept: 1}) {
+			t.Fatalf("result = %+v, %v", res, err)
+		}
+
+		reqs := f.requestsTo("POST snapshots/delete")
+		if len(reqs) != 3 {
+			t.Fatalf("%d delete requests", len(reqs))
+		}
+
+		for _, r := range reqs {
+			if len(r.Body) > maxFakeBody {
+				t.Errorf("request of %d bytes", len(r.Body))
+			}
+		}
+
+		if left := f.snapshots[info("/data/app")]; len(left) != 1 || left[0].ID != "kept" {
+			t.Errorf("left = %d snapshots", len(left))
+		}
+	})
+
+	t.Run("second chunk fails", func(t *testing.T) {
+		f, b := setup(t)
+		f.inject("POST snapshots/delete", injection{after: true, status: http.StatusOK, body: `{}`})
+		f.inject("POST snapshots/delete", injection{status: http.StatusInternalServerError, body: `{"code":"INTERNAL","error":"boom"}`})
+
+		res, err := b.DeleteSnapshots(t.Context(), src("/data/app"), false)
+		assertError(t, err, opDeleteSnapshots, src("/data/app"), backend.ErrTemporary)
+
+		if res != (backend.DeleteResult{Deleted: maxDeleteIDs, Kept: 1}) {
+			t.Errorf("result = %+v", res)
 		}
 	})
 }

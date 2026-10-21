@@ -194,7 +194,10 @@ type Backend interface {
 	// before the delete, so their IDs never reach the caller: kopia server
 	// has no conditional delete, and a pin added between the listing and
 	// the delete is not seen. A source kopia server does not know has
-	// nothing to delete: the result is zero and the error nil.
+	// nothing to delete: the result is zero and the error nil. A delete
+	// that fails may have deleted some snapshots, which the result counts,
+	// and kopia server may have carried out a request whose answer was
+	// lost: an error does not mean that nothing went.
 	DeleteSnapshots(ctx context.Context, src Source, pinned bool) (DeleteResult, error)
 
 	// The snapshot methods below serve the snapshot lifecycle. An
@@ -269,7 +272,9 @@ type SourceStatus struct {
 	Status Status
 	// LastSnapshot is the newest saved snapshot, nil if there is none. It
 	// moves only when a snapshot is saved, so it may be a checkpoint of a
-	// running upload or a canceled snapshot.
+	// running upload or a canceled snapshot; and when kopia server next
+	// refreshes the source, so after DeleteSnapshots kept pinned snapshots
+	// it may be a deleted one until then.
 	LastSnapshot *SnapshotInfo
 	// NextSnapshotTime is when kopia server's scheduler runs the source
 	// next; zero if not scheduled, as with a paused policy.

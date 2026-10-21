@@ -345,6 +345,13 @@ func TestValidateKopiaServerFindings(t *testing.T) {
 			stdout: []string{"error: kopia.path: /data: the stored policy: scheduling is not a JSON object"},
 		},
 		{
+			name:   "path outside the watcher path prefix is not sent",
+			env:    kopiaEnv("WATCHER_PATH_PREFIX", "/srv"),
+			args:   []string{"kopia.enable=true", "kopia.path=/srv/app,/data"},
+			code:   1,
+			stdout: []string{"/srv/app -> root@nas:/srv/app", `error: kopia.path: "/data" makes the source path /data, which is outside WATCHER_PATH_PREFIX /srv`},
+		},
+		{
 			name:   "relative path is not sent",
 			args:   []string{"kopia.enable=true", "kopia.path=data"},
 			code:   1,

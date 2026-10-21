@@ -70,6 +70,12 @@ type pass struct {
 	// outside reports a path outside WATCHER_PATH_PREFIX, which the pass
 	// leaves alone.
 	outside bool
+	// owned is what the record said about the owners when the pass began;
+	// ownersTaken reports that the pass has recorded its owners. Only
+	// passes change the owners of a record, so a pass that would not
+	// change them need not touch the store.
+	owned       ownership
+	ownersTaken bool
 	// cleanupNote says for a dry run what the cleanup of a source without
 	// owners would do.
 	cleanupNote string
@@ -232,6 +238,7 @@ func (ps *pass) run() error {
 		ps.outcome = "left alone: outside WATCHER_PATH_PREFIX " + ps.watcherPrefix
 		ps.warnOnce("outside "+ps.path, "the state has a source outside WATCHER_PATH_PREFIX; the watcher neither pauses nor "+
 			"cleans it up", "path", ps.path, "prefix", ps.watcherPrefix)
+		ps.forgetOwners()
 
 		return nil
 	}
@@ -253,13 +260,15 @@ func (ps *pass) run() error {
 
 	rec, had := ps.store.Get(src)
 	ps.last, ps.had = rec.Applied, had
+	ps.owned = ownership{owners: rec.Owners, orphaned: rec.OrphanedSince}
 
-	// The owners go into the state with the policy step's changes of the
-	// record. An owner that came back is recorded before kopia server is
-	// asked anything, so that it calls the cleanup off even if the rest of
-	// the pass fails.
-	if had && len(ps.owners) > 0 && !rec.OrphanedSince.IsZero() {
-		ps.trackOwners()
+	// The owners go into the state with the changes of the record the pass
+	// makes anyway; a pass that fails before it makes one still records
+	// them, as the pass saw them at its start, so that it is known when an
+	// owner left or came back. A source new to the state gets them with its
+	// first record.
+	if had {
+		defer ps.trackOwners()
 	}
 
 	if !ps.desire() {
@@ -309,7 +318,7 @@ func (ps *pass) run() error {
 		return err
 	}
 
-	// Unless the policy step wrote the record.
+	// A record the policy step made has them already.
 	ps.trackOwners()
 
 	if err := ps.snapshots(); err != nil {
@@ -506,8 +515,12 @@ func (ps *pass) storeApplied(a backend.Applied) error {
 		return nil
 	})
 
-	if err = storeErr(err); err == nil && changed {
-		ps.logOwners(before)
+	if err = storeErr(err); err == nil {
+		ps.ownersTaken = true
+
+		if changed {
+			ps.logOwners(before)
+		}
 	}
 
 	return err

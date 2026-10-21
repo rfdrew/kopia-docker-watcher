@@ -77,8 +77,11 @@ type ContainerSpec struct {
 // any more, the value of the cleanup-on-remove label. Docker forgets the
 // labels of a container it removes, so the watcher remembers the mode of
 // every container that backs a source up. A mode other than CleanupPause
-// acts only after CLEANUP_GRACE without a container, and never on a source
-// of kopia server's that the watcher did not register.
+// acts only after CLEANUP_GRACE without a container, only on a source the
+// state records owners of, and never on one of another kopia server
+// identity. A source kopia server had before a container first named it,
+// as one the Python version made, is managed like any other: CleanupAll
+// deletes the snapshots it had before too.
 type CleanupMode string
 
 // Cleanup modes, from the most cautious.

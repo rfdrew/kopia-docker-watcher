@@ -1212,10 +1212,11 @@ func (f *Fake) ListSnapshots(ctx context.Context, src backend.Source) ([]backend
 
 // DeleteSnapshots implements backend.Backend like the REST backend: with
 // pinned false and a pinned snapshot, the snapshots without a pin go and
-// the source stays with its policy; otherwise the source goes as a whole,
-// with its snapshots and policy. A source kopia server does not know has
-// nothing to delete. A failure after the call took effect, as with
-// FailNextAfter, returns the zero result.
+// the source stays with its policy and its last snapshot, as kopia server
+// does not refresh it; otherwise the source goes as a whole, with its
+// snapshots and policy. A source kopia server does not know has nothing to
+// delete. A failure after the call took effect, as with FailNextAfter,
+// returns the zero result.
 func (f *Fake) DeleteSnapshots(ctx context.Context, src backend.Source, pinned bool) (backend.DeleteResult, error) {
 	after, err := f.enter(ctx, Call{Method: DeleteSnapshots, Source: src, Pinned: pinned})
 	if err != nil {
@@ -1248,19 +1249,10 @@ func (f *Fake) DeleteSnapshots(ctx context.Context, src backend.Source, pinned b
 		res.Deleted, res.Source = len(s.snapshots), true
 		delete(f.sources, src)
 	} else {
+		// kopia server does not refresh the source after the delete: its
+		// last snapshot stays as it was.
 		res.Deleted = len(s.snapshots) - res.Kept
 		s.snapshots = slices.DeleteFunc(s.snapshots, func(snap backend.SnapshotInfo) bool { return !snap.Pinned() })
-
-		if last := s.status.LastSnapshot; last != nil && !last.Pinned() {
-			s.status.LastSnapshot = nil
-
-			for _, snap := range s.snapshots {
-				if s.status.LastSnapshot == nil || !snap.StartTime.Before(s.status.LastSnapshot.StartTime) {
-					last := snap.Clone()
-					s.status.LastSnapshot = &last
-				}
-			}
-		}
 	}
 
 	if after != nil {

@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"slices"
 	"strings"
@@ -452,7 +453,8 @@ func TestCleanupWatcherPathPrefix(t *testing.T) {
 	})
 
 	// A source of the state outside the prefix is neither paused nor
-	// cleaned up.
+	// cleaned up, and loses its owners on record: they cannot decide its
+	// cleanup once the prefix is widened again.
 	t.Run("state source outside", func(t *testing.T) {
 		h, c := cleanupHarness(t)
 		id := h.engine.run("app", enable, pathLabel(app), noOnStart, cleanupAll)
@@ -473,19 +475,33 @@ func TestCleanupWatcherPathPrefix(t *testing.T) {
 			h.fullPass(app)
 		}
 
-		if calls := h.fake.Calls(); len(calls) != 0 {
-			t.Errorf("calls = %+v", calls)
+		for _, call := range h.fake.Calls() {
+			if call.Method != backendtest.ServerIdentity {
+				t.Errorf("call = %+v", call)
+			}
 		}
 
 		h.mustPolicy(app, `{"scheduling":{"cron":["0 * * * *"]}}`)
 
-		if rec := h.record(app); !rec.OrphanedSince.IsZero() || len(rec.Owners) != 1 || !rec.Owners[0].Gone.IsZero() {
+		if rec := h.record(app); !rec.OrphanedSince.IsZero() || rec.Owners != nil || rec.Patch.IsZero() {
 			t.Errorf("record = %+v", rec)
 		}
 
 		if n := h.count("the state has a source outside WATCHER_PATH_PREFIX"); n != 1 {
 			t.Errorf("warned %d times:\n%s", n, h.logs)
 		}
+
+		// The prefix goes; the source has no owner, and is only paused.
+		h.restart(c, withWatcherPrefix(""))
+		h.fullPass(app)
+		c.add(2 * grace)
+		h.fullPass(app)
+
+		if !h.paused(app) {
+			t.Error("not paused")
+		}
+
+		h.mustKeep(app, 1)
 	})
 
 	// The check right before a delete holds even if a pass got that far.
@@ -784,6 +800,242 @@ func TestCleanupNotWhileOwnersExist(t *testing.T) {
 	}
 }
 
+// While a container the state remembers as an owner exists, by its ID or
+// by its name, CLEANUP_GRACE does not run: recreating it under its name, as
+// docker compose up or watchtower does, starts no cleanup. Once it is gone,
+// the grace runs in full.
+func TestCleanupGraceWaitsForRememberedContainers(t *testing.T) {
+	h, c := cleanupHarness(t)
+	old := h.engine.run("app", enable, pathLabel(app), noOnStart, cleanupAll)
+	h.mustPass(app)
+	h.fake.AddSnapshot(h.src(app), snap(-time.Hour))
+
+	h.restart(c, func(o *Options) { o.LabelPrefix = "backup" })
+	h.fullPass(app)
+	c.add(3 * grace)
+	h.fullPass(app)
+
+	if rec := h.record(app); !rec.OrphanedSince.IsZero() {
+		t.Fatalf("orphaned since %v while the container exists", rec.OrphanedSince)
+	}
+
+	// Recreated under its name, with the same labels.
+	h.engine.remove(old)
+	recreated := h.engine.run("app", enable, pathLabel(app), noOnStart, cleanupAll)
+	c.add(time.Minute)
+	h.fullPass(app)
+	c.add(3 * grace)
+	h.fullPass(app)
+	h.mustKeep(app, 1)
+
+	// Gone for good: the grace starts now.
+	h.engine.remove(recreated)
+	c.add(time.Minute)
+	h.fullPass(app)
+
+	if rec := h.record(app); !rec.OrphanedSince.Equal(c.now()) {
+		t.Fatalf("orphaned since %v, want %v", rec.OrphanedSince, c.now())
+	}
+
+	c.add(grace - time.Second)
+	h.fullPass(app)
+	h.mustKeep(app, 1)
+
+	c.add(time.Second)
+	h.fullPass(app)
+	h.mustNoSource(app)
+}
+
+// A departure recorded late, as after kopia server or the watcher was down,
+// does not drop an owner that left shortly before: the mode stays the most
+// cautious.
+func TestCleanupDepartureRecordedLate(t *testing.T) {
+	setup := func(t *testing.T) (*harness, *testClock, string) {
+		t.Helper()
+
+		h, c := cleanupHarness(t)
+		careful := h.engine.run("careful", enable, pathLabel(app), noOnStart, cleanupPause)
+		eager := h.engine.run("eager", enable, pathLabel(app), noOnStart, cleanupAll)
+		h.mustPass(app)
+		h.fake.AddSnapshot(h.src(app), snap(-time.Hour))
+
+		h.r.HandleEvent(h.engine.remove(careful))
+		h.mustPass(app)
+
+		return h, c, eager
+	}
+
+	t.Run("kopia server unavailable", func(t *testing.T) {
+		h, c, eager := setup(t)
+
+		c.add(10 * time.Second)
+		h.r.HandleEvent(h.engine.remove(eager))
+		h.fake.FailNext(backendtest.PlanSource, &backend.Error{Op: "PlanSource", Kind: backend.ErrUnavailable, Err: errors.New("down")})
+
+		if res := h.pass(app); !res.retry {
+			t.Fatalf("res = %+v", res)
+		}
+
+		// The failed pass recorded the departure when it saw it.
+		if rec := h.record(app); !rec.OrphanedSince.Equal(t0.Add(10 * time.Second)) {
+			t.Errorf("orphaned since %v", rec.OrphanedSince)
+		}
+
+		c.add(15 * time.Minute)
+		h.mustPass(app)
+		c.add(2 * grace)
+		h.fullPass(app)
+		h.mustKeep(app, 1)
+	})
+
+	t.Run("watcher down", func(t *testing.T) {
+		h, c, eager := setup(t)
+
+		h.engine.remove(eager)
+		c.add(30 * time.Minute)
+		h.restart(c)
+		h.fullPass(app)
+
+		if rec := h.record(app); len(rec.Owners) != 2 {
+			t.Fatalf("owners = %+v", rec.Owners)
+		}
+
+		c.add(2 * grace)
+		h.fullPass(app)
+		h.mustKeep(app, 1)
+	})
+}
+
+// A container that comes back while kopia server is unavailable calls the
+// cleanup off all the same: if it goes again before a pass succeeds, the
+// grace counts from then, not from the first time the source was without
+// an owner.
+func TestCleanupCalledOffWhileKopiaIsDown(t *testing.T) {
+	h, c := cleanupHarness(t)
+	h.abandon([]string{cleanupAll}, snap(-time.Hour))
+
+	c.add(grace - 10*time.Minute)
+	back := h.engine.run("app", enable, pathLabel(app), noOnStart, cleanupAll)
+	h.fake.FailNext(backendtest.PlanSource, &backend.Error{Op: "PlanSource", Kind: backend.ErrUnavailable, Err: errors.New("down")})
+
+	if res := h.pass(app); !res.retry {
+		t.Fatalf("res = %+v", res)
+	}
+
+	if rec := h.record(app); !rec.OrphanedSince.IsZero() {
+		t.Fatalf("orphaned since %v while the container is back", rec.OrphanedSince)
+	}
+
+	c.add(5 * time.Minute)
+	h.engine.remove(back)
+	c.add(10 * time.Minute)
+	h.fullPass(app)
+	h.mustKeep(app, 1)
+
+	c.add(grace)
+	h.fullPass(app)
+	h.mustNoSource(app)
+}
+
+// A source kopia server forgot before the watcher saw it without owners is
+// forgotten by the state once CLEANUP_GRACE has passed, so that a source
+// made at that path later by someone else is not taken for it.
+func TestCleanupForgetsSourceUnknownBeforeAbandoned(t *testing.T) {
+	h, c := cleanupHarness(t)
+	id := h.engine.run("app", enable, pathLabel(app), noOnStart, cleanupAll)
+	h.mustPass(app)
+
+	// While the watcher is down, the container goes and the source is
+	// deleted in the web UI.
+	h.engine.remove(id)
+
+	if err := h.fake.DeletePolicy(t.Context(), h.src(app)); err != nil {
+		t.Fatal(err)
+	}
+
+	h.restart(c)
+	h.fake.ResetCalls()
+	h.fullPass(app)
+
+	if rec := h.record(app); !rec.OrphanedSince.Equal(t0) {
+		t.Fatalf("record = %+v", rec)
+	}
+
+	c.add(grace)
+	h.fullPass(app)
+
+	if _, ok := h.store.Get(h.src(app)); ok {
+		t.Fatal("the record is left")
+	}
+
+	// A source made there later by hand is none of the watcher's business.
+	h.fake.SetPolicy(h.src(app), `{"retention":{"keepDaily":30}}`)
+	h.fake.AddSnapshot(h.src(app), snap(time.Hour))
+	c.add(2 * grace)
+	h.fullPass(app)
+	h.fullPass(app)
+
+	for _, call := range h.fake.Calls() {
+		if call.Method == backendtest.ApplyPlan || call.Method == backendtest.DeletePolicy || call.Method == backendtest.DeleteSnapshots {
+			t.Errorf("call = %+v", call)
+		}
+	}
+}
+
+// Records of another kopia server identity are never cleaned up.
+func TestCleanupLeavesOtherIdentity(t *testing.T) {
+	h, c := cleanupHarness(t)
+	h.abandon([]string{cleanupAll}, snap(-time.Hour))
+	old := h.src(app)
+
+	h.fake.SetIdentity("root", "kopia-2")
+	h.restart(c)
+
+	for range 3 {
+		c.add(2 * grace)
+
+		paths, err := h.r.paths(t.Context())
+		if err != nil || !slices.Contains(paths, app) {
+			t.Fatalf("paths = %v, %v", paths, err)
+		}
+
+		h.fullPass(app)
+	}
+
+	if rec, ok := h.store.Get(old); !ok || len(rec.Owners) != 1 || !rec.OrphanedSince.Equal(t0) {
+		t.Errorf("record of the old identity = %+v, %t", rec, ok)
+	}
+
+	if len(h.fake.CallsTo(backendtest.DeleteSnapshots)) != 0 || len(h.fake.CallsTo(backendtest.DeletePolicy)) != 0 {
+		t.Errorf("calls = %+v", h.fake.Calls())
+	}
+
+	if n := len(h.fake.Snapshots(old)); n != 1 {
+		t.Errorf("%d snapshots of the old source", n)
+	}
+}
+
+// A source kopia server had before a container named it is managed like
+// any other: all deletes its earlier snapshots too, as documented.
+func TestCleanupAdoptedSource(t *testing.T) {
+	h, c := cleanupHarness(t)
+	h.fake.SetPolicy(h.src(app), `{"retention":{"keepDaily":30}}`)
+	h.fake.AddSnapshot(h.src(app), snap(-300*24*time.Hour))
+
+	id := h.engine.run("app", enable, pathLabel(app), noOnStart, cleanupAll)
+	h.mustPass(app)
+
+	if calls := h.fake.CallsTo(backendtest.ApplyPlan); len(calls) != 1 || calls[0].Plan.Action != backend.ActionUpdate {
+		t.Fatalf("ApplyPlan calls = %+v", calls)
+	}
+
+	h.r.HandleEvent(h.engine.remove(id))
+	h.mustPass(app)
+	c.add(grace)
+	h.fullPass(app)
+	h.mustNoSource(app)
+}
+
 // The state forgets a source kopia server no longer knows once its owners
 // asked for a cleanup and CLEANUP_GRACE has passed; with the pause it
 // keeps the record, as before.
@@ -838,6 +1090,10 @@ func TestCleanupDeleteFails(t *testing.T) {
 
 	if !h.fake.Known(h.src(app)) || len(h.fake.Snapshots(h.src(app))) != 1 {
 		t.Fatal("deleted by a call that failed before it took effect")
+	}
+
+	if !h.logged("cleanup: deleting the snapshots of the abandoned source failed", `"cleanup":"all"`, `"snapshots":1`, `"deleted":0`) {
+		t.Errorf("not logged:\n%s", h.logs)
 	}
 
 	h.fake.FailNextAfter(backendtest.DeleteSnapshots, temporary("DeleteSnapshots"))
@@ -929,11 +1185,13 @@ func TestMergeOwners(t *testing.T) {
 		o.Gone = at
 		return o
 	}
+	listedA := func(o state.Owner) bool { return o.ID == "a" }
 
 	for _, tt := range []struct {
 		name          string
 		prev, cur     []state.Owner
 		orphaned      time.Time
+		listed        func(state.Owner) bool
 		want          []state.Owner
 		wantOrphaned  time.Time
 		wantMode      string
@@ -947,17 +1205,25 @@ func TestMergeOwners(t *testing.T) {
 			want: []state.Owner{a}, wantMode: "all"},
 		{name: "last leaves", prev: []state.Owner{gone(b, t0.Add(-time.Minute)), a}, want: []state.Owner{gone(a, t0), gone(b, t0.Add(-time.Minute))},
 			wantOrphaned: t0, wantMode: "pause"},
-		// Once the source has no owner, the window counts from the last
-		// departure, not from now.
+		// Departures are pruned only by a pass that sees an owner: one
+		// recorded late, after a downtime, keeps the earlier ones.
+		{name: "last leaves, recorded late", prev: []state.Owner{gone(b, t0.Add(-time.Hour)), a},
+			want: []state.Owner{gone(a, t0), gone(b, t0.Add(-time.Hour))}, wantOrphaned: t0, wantMode: "pause"},
 		{name: "orphaned for long", prev: []state.Owner{gone(a, t0.Add(-48*time.Hour)), gone(b, t0.Add(-48*time.Hour-ownerLinger))},
 			orphaned: t0.Add(-48 * time.Hour), want: []state.Owner{gone(a, t0.Add(-48*time.Hour)), gone(b, t0.Add(-48*time.Hour-ownerLinger))},
 			wantOrphaned: t0.Add(-48 * time.Hour), wantMode: "pause"},
-		{name: "orphaned, the earlier left long before", prev: []state.Owner{gone(a, t0.Add(-time.Hour)), gone(b, t0.Add(-2*time.Hour))},
-			orphaned: t0.Add(-time.Hour), want: []state.Owner{gone(a, t0.Add(-time.Hour))}, wantOrphaned: t0.Add(-time.Hour), wantMode: "all"},
+		// A container on record that is still listed keeps the source
+		// from counting as without an owner, and calls off a count that
+		// started.
+		{name: "still listed", prev: []state.Owner{a}, listed: listedA, want: []state.Owner{gone(a, t0)}, wantMode: "all"},
+		{name: "listed again", prev: []state.Owner{gone(a, t0.Add(-time.Hour))}, orphaned: t0.Add(-time.Hour), listed: listedA,
+			want: []state.Owner{gone(a, t0.Add(-time.Hour))}, wantMode: "all"},
+		{name: "another one listed", prev: []state.Owner{gone(b, t0.Add(-time.Hour))}, orphaned: t0.Add(-time.Hour), listed: listedA,
+			want: []state.Owner{gone(b, t0.Add(-time.Hour))}, wantOrphaned: t0.Add(-time.Hour), wantMode: "pause"},
 		{name: "never had owners", wantOrphaned: t0, wantMode: "pause"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got, orphaned := mergeOwners(tt.prev, tt.cur, t0, tt.orphaned)
+			got, orphaned := mergeOwners(tt.prev, tt.cur, t0, tt.orphaned, tt.listed)
 			if !slices.EqualFunc(got, tt.want, state.Owner.Equal) || !orphaned.Equal(tt.wantOrphaned) {
 				t.Errorf("mergeOwners = %+v, %v\nwant %+v, %v", got, orphaned, tt.want, tt.wantOrphaned)
 			}

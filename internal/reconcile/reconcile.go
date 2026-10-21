@@ -114,8 +114,9 @@
 // downtime of the watcher in which its containers were removed, the state
 // records since when, and the source is paused. cleanup-on-remove decides
 // what else becomes of it, the most cautious mode of its last owners, and
-// of those that left within ownerLinger before the last one, so that the
-// order in which docker compose down removes them does not matter:
+// of those that left within ownerLinger before the last pass that saw one
+// of them, so that the order in which docker compose down removes them
+// does not matter:
 //
 //   - pause, the default: nothing else;
 //   - policy: the policy of a source without snapshots is deleted, and the
@@ -131,11 +132,18 @@
 // its last owner, nor while a snapshot the watcher queued, such as the one
 // at the stop, has not finished, nor while a snapshot is pending or
 // uploading. A container that backs the source up again before calls the
-// cleanup off. Nor is anything deleted while a container the state
-// remembers as an owner still exists: Docker labels never change, so it
-// lost the path only because the watcher's configuration did, and its
-// source is not abandoned. Every deletion is logged with the source, the
-// mode and how many snapshots went. A dry run prints what the cleanup would
+// cleanup off. Nor does CLEANUP_GRACE run while a container the state
+// remembers as an owner still exists, by its ID or its name: Docker labels
+// never change, so it lost the path only because the watcher's
+// configuration did, and its source is not abandoned; a container
+// recreated under its name is the same service. A source kopia server had
+// before a container first named it is managed like any other, so all
+// deletes the snapshots it had before too. A source outside
+// WATCHER_PATH_PREFIX loses its owners on record, so that they cannot
+// decide its cleanup should the prefix be widened again. Every deletion is
+// logged with the source, the mode and how many snapshots went, and a
+// failed one with what it was about to delete, as kopia server may have
+// carried it out all the same. A dry run prints what the cleanup would
 // delete, and when.
 //
 // # Errors

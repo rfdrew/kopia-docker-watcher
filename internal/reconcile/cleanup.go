@@ -12,16 +12,18 @@ import (
 	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
+	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
 	"github.com/rfdrew/kopia-docker-watcher/internal/labels"
 	"github.com/rfdrew/kopia-docker-watcher/internal/state"
 )
 
 const (
 	// ownerLinger is how long an owner that stopped backing a source up
-	// still counts for the source's cleanup mode, before the source's last
-	// owner leaves and after. docker compose down removes the containers
-	// of a project one by one, so without it the mode would depend on the
-	// order of the removals: the last container to go, alone, would decide.
+	// still counts for the source's cleanup mode, counted from the last
+	// pass that saw the source with an owner. docker compose down removes
+	// the containers of a project one by one, so without it the mode would
+	// depend on the order of the removals: the last container to go, alone,
+	// would decide.
 	ownerLinger = 10 * time.Minute
 
 	// composeProjectLabel names the docker compose project of a container.
@@ -60,12 +62,22 @@ func labelsHash(prefix string, l map[string]string) string {
 }
 
 // mergeOwners returns the owners to record for a source whose owners are
-// cur at now, given those recorded before, prev, and when the source has
-// been without an owner since, orphaned (zero if it had one). An owner of
-// prev that is not in cur is marked gone at now, and kept for ownerLinger:
-// counted from now while the source has owners, from the departure of its
-// last owner once it has none.
-func mergeOwners(prev, cur []state.Owner, now, orphaned time.Time) ([]state.Owner, time.Time) {
+// cur at now, given those recorded before, prev, and since when the source
+// has been without an owner, orphaned (zero if it had one).
+//
+// An owner of prev that is not in cur is marked gone at now. Gone owners
+// are dropped ownerLinger after they left, but only by a pass that sees
+// the source with an owner: a departure recorded late, after kopia server
+// or the watcher was down, is never measured against an earlier one, so it
+// cannot make the mode less cautious.
+//
+// The source counts as without an owner only once no container on record
+// is listed any more, by its ID or its name (listed reports one that is):
+// Docker never changes the labels of a container, so one that no longer
+// names the path lost it because the watcher's configuration changed, and
+// a container recreated under the same name, as by docker compose up, is
+// the same service. CLEANUP_GRACE does not run meanwhile.
+func mergeOwners(prev, cur []state.Owner, now, orphaned time.Time, listed func(state.Owner) bool) ([]state.Owner, time.Time) {
 	out := slices.Clone(cur)
 
 	for _, p := range prev {
@@ -80,22 +92,16 @@ func mergeOwners(prev, cur []state.Owner, now, orphaned time.Time) ([]state.Owne
 		out = append(out, p)
 	}
 
-	ref := now
-	if len(cur) == 0 {
-		ref = time.Time{}
-
-		for _, o := range out {
-			ref = later(ref, o.Gone)
-		}
+	if len(cur) > 0 {
+		out = slices.DeleteFunc(out, func(o state.Owner) bool { return !o.Gone.IsZero() && o.Gone.Before(now.Add(-ownerLinger)) })
 	}
 
-	out = slices.DeleteFunc(out, func(o state.Owner) bool { return !o.Gone.IsZero() && o.Gone.Before(ref.Add(-ownerLinger)) })
 	slices.SortFunc(out, func(a, b state.Owner) int {
 		return cmp.Or(strings.Compare(a.Name, b.Name), strings.Compare(a.ID, b.ID))
 	})
 
 	switch {
-	case len(cur) > 0:
+	case len(cur) > 0, listed != nil && slices.ContainsFunc(out, listed):
 		orphaned = time.Time{}
 	case orphaned.IsZero():
 		orphaned = now
@@ -161,7 +167,7 @@ type ownership struct {
 func (ps *pass) takeOwners(r *state.Record) (ownership, bool) {
 	before := ownership{owners: r.Owners, orphaned: r.OrphanedSince}
 
-	owners, orphaned := mergeOwners(r.Owners, ps.ownerRecords(), ps.started, r.OrphanedSince)
+	owners, orphaned := mergeOwners(r.Owners, ps.ownerRecords(), ps.started, r.OrphanedSince, ps.listed)
 	if slices.EqualFunc(owners, r.Owners, state.Owner.Equal) && orphaned.Equal(r.OrphanedSince) {
 		return before, false
 	}
@@ -175,13 +181,21 @@ func (ps *pass) takeOwners(r *state.Record) (ownership, bool) {
 // if it has one, unless an earlier change of the pass did. It writes only
 // what changed, and nothing in a dry run.
 func (ps *pass) trackOwners() {
-	if ps.dryRun {
+	if ps.dryRun || ps.ownersTaken {
+		return
+	}
+
+	owners, orphaned := mergeOwners(ps.owned.owners, ps.ownerRecords(), ps.started, ps.owned.orphaned, ps.listed)
+	if slices.EqualFunc(owners, ps.owned.owners, state.Owner.Equal) && orphaned.Equal(ps.owned.orphaned) {
+		ps.ownersTaken = true
 		return
 	}
 
 	if _, ok := ps.store.Get(ps.src); !ok {
 		return
 	}
+
+	ps.ownersTaken = true
 
 	var (
 		before  ownership
@@ -211,12 +225,39 @@ func (ps *pass) logOwners(before ownership) {
 		ps.log.Warn("no container backs the source up any more; it is paused, and cleaned up once CLEANUP_GRACE has "+
 			"passed unless a container backs it up again", "source", ps.src.String(), "cleanup", string(mode),
 			"cleanup_due", rec.OrphanedSince.Add(ps.cleanupGrace).Format(timeFormat), "last_owners", recordNames(rec.Owners))
-	case !before.orphaned.IsZero() && rec.OrphanedSince.IsZero():
+	case !before.orphaned.IsZero() && rec.OrphanedSince.IsZero() && len(ps.owners) > 0:
 		if m, _ := cleanupOf(before.owners); m != labels.CleanupPause {
 			ps.log.Info("a container backs the abandoned source up again; its cleanup is called off", "source", ps.src.String(),
 				"cleanup", string(m), "owners", ownerNames(ps.owners))
 		}
 	}
+}
+
+// forgetOwners drops what the record of the source of a path outside
+// WATCHER_PATH_PREFIX says about its owners. Passes do not follow such a
+// source, so that would go stale: were the prefix widened again, an owner
+// replaced meanwhile by one that asks for less could decide the cleanup.
+// Without owners on record the source is only paused, until a container
+// backs it up again. Only the state changes; nothing in a dry run.
+func (ps *pass) forgetOwners() {
+	if ps.dryRun {
+		return
+	}
+
+	src, err := ps.source(ps.ctx, ps.path)
+	if err != nil {
+		return
+	}
+
+	ps.updateRecord(src, func(r *state.Record) bool {
+		if r.Owners == nil && r.OrphanedSince.IsZero() {
+			return false
+		}
+
+		r.Owners, r.OrphanedSince, r.OwnersUpdated = nil, time.Time{}, ps.started
+
+		return true
+	})
 }
 
 // recordNames returns the names of recorded owners, each once.
@@ -256,7 +297,9 @@ func (ps *pass) planCleanup(rec state.Record) cleanupPlan {
 	cp.mode, cp.pinned = cleanupOf(rec.Owners)
 
 	if cp.since.IsZero() {
-		// A dry run, which records nothing.
+		// Not on record: in a dry run, which records nothing, before the
+		// pass recorded its owners, or while a container on record still
+		// exists, which the switch below tells.
 		cp.since = ps.started
 	}
 
@@ -291,12 +334,20 @@ func (ps *pass) existingOwners(owners []state.Owner) []string {
 	var out []string
 
 	for _, o := range owners {
-		if _, ok := ps.container(o.ID); ok && !slices.Contains(out, o.Name) {
+		if ps.listed(o) && !slices.Contains(out, o.Name) {
 			out = append(out, o.Name)
 		}
 	}
 
 	return out
+}
+
+// listed reports whether the listing of the pass has the container of an
+// owner on record, by its ID or by its name: Docker names are unique, and
+// a container recreated under the name of an owner, as by docker compose up
+// or watchtower, takes its place.
+func (ps *pass) listed(o state.Owner) bool {
+	return slices.ContainsFunc(ps.containers, func(c docker.Container) bool { return c.ID == o.ID || o.Name != "" && c.Name == o.Name })
 }
 
 // cleanup carries out the cleanup-on-remove of a source kopia server knows
@@ -369,6 +420,9 @@ func (ps *pass) cleanupPolicy(snaps []backend.SnapshotInfo) error {
 	}
 
 	if err := ps.backend.DeletePolicy(ps.ctx, ps.src); err != nil {
+		ps.log.Warn("cleanup: deleting the policy of the abandoned source failed; kopia server may have deleted it all the same",
+			append(attrs, "error", err.Error())...)
+
 		return err
 	}
 
@@ -410,6 +464,14 @@ func (ps *pass) cleanupAll(cp cleanupPlan, snaps []backend.SnapshotInfo) error {
 	}
 
 	if err != nil {
+		planned := len(snaps)
+		if !cp.pinned {
+			planned -= pinned
+		}
+
+		ps.log.Warn("cleanup: deleting the snapshots of the abandoned source failed; kopia server may have deleted them all the same",
+			append(attrs, "snapshots", planned, "deleted", res.Deleted, "error", err.Error())...)
+
 		return err
 	}
 
@@ -457,7 +519,7 @@ func (ps *pass) forgetAbandoned() error {
 	}
 
 	if ps.dryRun {
-		rec.Owners, rec.OrphanedSince = mergeOwners(rec.Owners, nil, ps.started, rec.OrphanedSince)
+		rec.Owners, rec.OrphanedSince = mergeOwners(rec.Owners, nil, ps.started, rec.OrphanedSince, ps.listed)
 	}
 
 	if cp := ps.planCleanup(rec); cp.mode == labels.CleanupPause || cp.wait != "" {
@@ -488,7 +550,7 @@ func (ps *pass) noteCleanup() {
 	}
 
 	rec, _ := ps.store.Get(ps.src)
-	rec.Owners, rec.OrphanedSince = mergeOwners(rec.Owners, nil, ps.started, rec.OrphanedSince)
+	rec.Owners, rec.OrphanedSince = mergeOwners(rec.Owners, nil, ps.started, rec.OrphanedSince, ps.listed)
 	cp := ps.planCleanup(rec)
 	mode := labels.Name(ps.labelPrefix, labels.KeyCleanupOnRemove) + "=" + string(cp.mode)
 

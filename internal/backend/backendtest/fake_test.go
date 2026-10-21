@@ -1063,9 +1063,9 @@ func TestDeleteSnapshots(t *testing.T) {
 			t.Error("the policy is gone")
 		}
 
-		// The last snapshot is the pinned one now.
+		// The last snapshot stays until kopia server refreshes the source.
 		sources, _ := f.ListSources(ctx)
-		if len(sources) != 1 || sources[0].LastSnapshot == nil || !sources[0].LastSnapshot.StartTime.Equal(t0.Add(-time.Hour)) {
+		if len(sources) != 1 || sources[0].LastSnapshot == nil || !sources[0].LastSnapshot.StartTime.Equal(t0.Add(time.Hour)) {
 			t.Errorf("sources = %+v", sources)
 		}
 

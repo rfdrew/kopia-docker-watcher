@@ -56,6 +56,9 @@ import (
 //     manifests, an unknown ID being no error and one of another source a
 //     500. It does not refresh.
 //
+// A request body over maxFakeBody bytes is a plain-text 413, as kopia
+// server reads no more.
+//
 // Requests are recorded. inject queues a response for the next request of
 // a route, sent instead of the real one (before) or after the request took
 // effect (after), as a lost answer.
@@ -121,6 +124,9 @@ type injection struct {
 	status int
 	body   string
 }
+
+// maxFakeBody is how much of a request body kopia server reads.
+const maxFakeBody = 100_000
 
 const (
 	fakeUser = "root"
@@ -306,6 +312,10 @@ func (f *fakeKopia) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	if hook != nil {
 		hook(r)
+	}
+
+	if len(body) > maxFakeBody {
+		return reply(req, http.StatusRequestEntityTooLarge, "error reading request body"), nil
 	}
 
 	if inj != nil && !inj.after {

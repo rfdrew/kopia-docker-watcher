@@ -190,10 +190,16 @@ type Record struct {
 	StopAbsorbedLastStart   time.Time `json:"stopAbsorbedLastStart,omitzero"`
 
 	// Owners are the containers that back the source up, and those that
-	// stopped doing so a short while before the last of them did, sorted
-	// by name and ID. The cleanup of a source without owners acts on what
-	// their labels asked for, the most cautious of it. A record written
-	// before owners existed has none, which asks for nothing but the pause.
+	// stopped doing so shortly before the last time the watcher saw one of
+	// them, sorted by name and ID. The cleanup of a source without owners
+	// acts on what their labels asked for, the most cautious of it. A record
+	// written before owners existed has none, which asks for nothing but
+	// the pause.
+	//
+	// The owner fields came with the first release, so no released watcher
+	// keeps them without keeping them up to date. A build from before them,
+	// run for a while, leaves them stale; the cleanup then acts on owners
+	// that may have been replaced meanwhile.
 	Owners []Owner `json:"owners,omitempty"`
 
 	// OwnersUpdated is when Owners or OrphanedSince last changed.
@@ -201,7 +207,8 @@ type Record struct {
 
 	// OrphanedSince is when the watcher first found the source without an
 	// owner, also after a downtime in which its containers were removed;
-	// zero while it has one. CLEANUP_GRACE counts from it.
+	// zero while it has one, and while a container on record still exists.
+	// CLEANUP_GRACE counts from it.
 	OrphanedSince time.Time `json:"orphanedSince,omitzero"`
 }
 
