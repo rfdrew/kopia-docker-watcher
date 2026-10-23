@@ -9,6 +9,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
+	"github.com/rfdrew/kopia-docker-watcher/internal/notify"
 	"github.com/rfdrew/kopia-docker-watcher/internal/reconcile"
 	"github.com/rfdrew/kopia-docker-watcher/internal/version"
 )
@@ -45,6 +46,7 @@ type Metrics struct {
 	managed         *prometheus.GaugeVec
 	paused          *prometheus.GaugeVec
 	owner           *prometheus.GaugeVec
+	notifications   *prometheus.CounterVec
 
 	// mu guards sources, the sources reported as managed by path, and
 	// keeps the series of one source consistent with each other.
@@ -52,7 +54,10 @@ type Metrics struct {
 	sources map[string]reconcile.SourceMetrics
 }
 
-var _ reconcile.Metrics = (*Metrics)(nil)
+var (
+	_ reconcile.Metrics = (*Metrics)(nil)
+	_ notify.Metrics    = (*Metrics)(nil)
+)
 
 // New returns Metrics with every series at its start: no source, no
 // snapshot, every kind of reconcile error at zero.
@@ -100,6 +105,12 @@ func New() *Metrics {
 			Name:      "source_owner",
 			Help:      "1 for each container that backs up a source the watcher manages, stopped ones included.",
 		}, []string{"path", "container"}),
+		notifications: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "notifications_total",
+			Help: "Notifications to NOTIFY_WEBHOOK_URL by result: sent, failed after every attempt or at once " +
+				"on an error that trying again cannot fix, or dropped as too many waited or the watcher stopped.",
+		}, []string{"result"}),
 	}
 
 	buildInfo := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
@@ -113,17 +124,27 @@ func New() *Metrics {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		buildInfo, m.lastSuccess, m.duration, m.failures, m.reconcileErrors, m.managed, m.paused, m.owner,
+		m.notifications,
 	)
 
-	// Every kind starts at zero, so that the first error shows as an
+	// Every kind and result starts at zero, so that the first shows as an
 	// increase.
 	for _, r := range reconcile.Reasons() {
 		m.reconcileErrors.WithLabelValues(string(r))
 	}
 
+	for _, r := range notify.Results() {
+		m.notifications.WithLabelValues(string(r))
+	}
+
 	m.countSources()
 
 	return m
+}
+
+// Notification implements notify.Metrics.
+func (m *Metrics) Notification(r notify.Result) {
+	m.notifications.WithLabelValues(string(r)).Inc()
 }
 
 // ReconcileError implements reconcile.Metrics: it counts the error by its

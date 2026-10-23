@@ -12,7 +12,7 @@ import (
 
 func TestHealthz(t *testing.T) {
 	rec := httptest.NewRecorder()
-	Handler(New()).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", http.NoBody))
+	Handler(New(), nil).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", http.NoBody))
 
 	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != `{"status":"ok"}` {
 		t.Fatalf("GET /healthz = %d %q", rec.Code, rec.Body.String())
@@ -23,17 +23,31 @@ func TestHealthz(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	Handler(New()).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/healthz", http.NoBody))
+	Handler(New(), nil).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/healthz", http.NoBody))
 
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("POST /healthz = %d", rec.Code)
 	}
 
 	rec = httptest.NewRecorder()
-	Handler(New()).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", http.NoBody))
+	Handler(New(), nil).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", http.NoBody))
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("GET / = %d", rec.Code)
+	}
+}
+
+// /healthz serves the health handler it is given, 503 included.
+func TestHealthzHandler(t *testing.T) {
+	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"status":"unhealthy"}`, http.StatusServiceUnavailable)
+	})
+
+	rec := httptest.NewRecorder()
+	Handler(New(), healthz).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", http.NoBody))
+
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "unhealthy") {
+		t.Fatalf("GET /healthz = %d %q", rec.Code, rec.Body.String())
 	}
 }
 
@@ -44,7 +58,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	m.LastSuccess("/data/app", time.Unix(1792731600, 0))
 
 	rec := httptest.NewRecorder()
-	Handler(m).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", http.NoBody))
+	Handler(m, nil).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", http.NoBody))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /metrics = %d %q", rec.Code, rec.Body.String())
@@ -77,7 +91,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	Handler(m).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/metrics", http.NoBody))
+	Handler(m, nil).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/metrics", http.NoBody))
 
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("POST /metrics = %d", rec.Code)
@@ -113,7 +127,7 @@ func (t handlerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func TestProbe(t *testing.T) {
-	ok := &http.Client{Transport: handlerTransport{Handler(New())}}
+	ok := &http.Client{Transport: handlerTransport{Handler(New(), nil)}}
 	if err := Probe(t.Context(), ok, "http://127.0.0.1:8080/healthz"); err != nil {
 		t.Fatal(err)
 	}

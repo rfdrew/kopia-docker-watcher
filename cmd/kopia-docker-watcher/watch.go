@@ -6,13 +6,17 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
+	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend/rest"
 	"github.com/rfdrew/kopia-docker-watcher/internal/config"
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
+	"github.com/rfdrew/kopia-docker-watcher/internal/health"
 	"github.com/rfdrew/kopia-docker-watcher/internal/kopiaclient"
 	"github.com/rfdrew/kopia-docker-watcher/internal/metrics"
+	"github.com/rfdrew/kopia-docker-watcher/internal/notify"
 	"github.com/rfdrew/kopia-docker-watcher/internal/reconcile"
 	"github.com/rfdrew/kopia-docker-watcher/internal/state"
 	"github.com/rfdrew/kopia-docker-watcher/internal/version"
@@ -57,6 +61,18 @@ const (
 	maxKopiaRetry = 30 * time.Second
 	// kopiaCheckTimeout bounds one attempt.
 	kopiaCheckTimeout = 30 * time.Second
+
+	// minStall is how long a pass may run, or paths may wait for one,
+	// before /healthz reports the reconciler stuck; twice
+	// RECONCILE_INTERVAL when that is longer.
+	minStall = 10 * time.Minute
+)
+
+// The components of /healthz.
+const (
+	componentDocker    = "docker"
+	componentKopia     = "kopia"
+	componentReconcile = "reconcile"
 )
 
 // errStopped means the watcher was asked to stop before it was ready.
@@ -119,19 +135,44 @@ type watcher struct {
 	// metrics receives what the reconciler reports; nil in a dry run,
 	// which serves no HTTP.
 	metrics *metrics.Metrics
+	// health checks the components for /healthz; nil in a dry run.
+	health *health.Checker
+	// notifier sends the notifications; nil in a dry run and without
+	// NOTIFY_WEBHOOK_URL.
+	notifier *notify.Notifier
 }
 
-// run serves /healthz and /metrics, waits for kopia server and reconciles
-// until ctx is done or the HTTP server fails.
+// run serves /healthz and /metrics, sends the notifications, waits for
+// kopia server and reconciles until ctx is done or the HTTP server fails.
 func (w *watcher) run(ctx context.Context) int {
+	w.metrics = metrics.New()
+	w.health = health.New(health.Options{Interval: w.d.healthInterval, Logger: w.log},
+		componentDocker, componentKopia, componentReconcile)
+
+	if w.cfg.NotifyWebhookURL != "" {
+		n, err := notify.New(notify.Options{
+			URL:        w.cfg.NotifyWebhookURL,
+			Format:     w.cfg.NotifyWebhookFormat,
+			ErrorAfter: w.cfg.NotifyErrorAfter,
+			Transport:  w.d.webhookTransport,
+			Logger:     w.log,
+			Metrics:    w.metrics,
+		})
+		if err != nil {
+			w.log.Error("cannot set up the notifications", "error", err.Error())
+			return 1
+		}
+
+		w.notifier = n
+	}
+
 	ln, err := w.d.listen("tcp", w.cfg.ListenAddr)
 	if err != nil {
 		w.log.Error("cannot listen", "addr", w.cfg.ListenAddr, "error", err.Error())
 		return 1
 	}
 
-	w.metrics = metrics.New()
-	srv := metrics.NewServer(ln, w.log, w.metrics)
+	srv := metrics.NewServer(ln, w.log, w.metrics, w.health)
 	serveErr := make(chan error, 1)
 
 	w.log.Info("serving HTTP", "addr", ln.Addr().String())
@@ -142,6 +183,20 @@ func (w *watcher) run(ctx context.Context) int {
 	// status 1.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// The health checks stop with the watcher. The notifications stop only
+	// once the reconciler has, as its passes may go on for ShutdownGrace
+	// and notify.
+	var background sync.WaitGroup
+
+	notifyCtx, stopNotify := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopNotify()
+
+	background.Go(func() { w.health.Run(ctx) })
+
+	if w.notifier != nil {
+		background.Go(func() { w.notifier.Run(notifyCtx) })
+	}
 
 	watchDone := make(chan int, 1)
 
@@ -180,6 +235,10 @@ func (w *watcher) run(ctx context.Context) int {
 		}
 	}
 
+	cancel()
+	stopNotify()
+	background.Wait()
+
 	w.log.Info("stopped")
 
 	return code
@@ -194,6 +253,11 @@ func (w *watcher) watch(ctx context.Context) (code int) {
 		return 1
 	}
 
+	// Until kopia server is ready, the attempts to reach it are its health
+	// checks.
+	w.health.Pending(componentDocker, "waiting for kopia server")
+	w.health.Pending(componentReconcile, "waiting for kopia server")
+
 	if err := w.waitForKopia(ctx, kopia); err != nil {
 		if errors.Is(err, errStopped) {
 			return 0
@@ -201,6 +265,10 @@ func (w *watcher) watch(ctx context.Context) (code int) {
 
 		return 1
 	}
+
+	w.health.Set(componentKopia, kopiaCheck(kopia))
+
+	throttled := w.applyThrottle(ctx, kopia)
 
 	store, err := state.Open(w.cfg.StateFile, state.Options{Logger: w.log})
 	if err != nil {
@@ -227,11 +295,16 @@ func (w *watcher) watch(ctx context.Context) (code int) {
 	}
 	defer closer.Close()
 
+	w.health.Set(componentDocker, dockerCheck(engine))
+
 	rec, err := w.reconciler(kopia, store, engine)
 	if err != nil {
 		w.log.Error("cannot create the reconciler", "error", err.Error())
 		return 1
 	}
+
+	stall := max(2*w.cfg.ReconcileInterval, minStall)
+	w.health.Set(componentReconcile, func(context.Context) error { return rec.CheckProgress(time.Now(), stall) })
 
 	recDone := make(chan struct{})
 	eventsDone := make(chan struct{})
@@ -259,6 +332,10 @@ loop:
 		case <-tick:
 			w.log.Debug("starting the periodic full reconcile")
 			rec.ReconcileAll()
+
+			if !throttled {
+				throttled = w.applyThrottle(ctx, kopia)
+			}
 		case <-ctx.Done():
 			break loop
 		}
@@ -348,8 +425,15 @@ func (w *watcher) kopiaClient() (*kopiaclient.Client, error) {
 }
 
 func (w *watcher) reconciler(kopia *kopiaclient.Client, store *state.Store, engine docker.Engine) (*reconcile.Reconciler, error) {
-	var m reconcile.Metrics
-	if w.metrics != nil {
+	var (
+		m reconcile.Metrics
+		o reconcile.Observer
+	)
+
+	switch {
+	case w.metrics != nil && w.notifier != nil:
+		m, o = teeMetrics{w.metrics, w.notifier}, w.notifier
+	case w.metrics != nil:
 		m = w.metrics
 	}
 
@@ -359,6 +443,7 @@ func (w *watcher) reconciler(kopia *kopiaclient.Client, store *state.Store, engi
 		Store:         store,
 		Logger:        w.log,
 		Metrics:       m,
+		Observer:      o,
 		HostPrefix:    w.cfg.HostPrefix,
 		LabelPrefix:   w.cfg.LabelPrefix,
 		Strict:        w.strict,
@@ -374,7 +459,8 @@ func (w *watcher) reconciler(kopia *kopiaclient.Client, store *state.Store, engi
 
 // waitForKopia asks kopia server for the repository status until it
 // reports a connected repository, with a delay that doubles after every
-// attempt (bug 6 of the Python version). Every attempt is logged. An error
+// attempt (bug 6 of the Python version). Every attempt is logged and
+// recorded as a health check of kopia server. An error
 // retrying cannot fix, such as wrong credentials, is logged and returned at
 // once; errStopped means ctx ended first.
 func (w *watcher) waitForKopia(ctx context.Context, kopia *kopiaclient.Client) error {
@@ -383,6 +469,10 @@ func (w *watcher) waitForKopia(ctx context.Context, kopia *kopiaclient.Client) e
 
 	for attempt := 1; ; attempt++ {
 		st, err := w.checkKopia(ctx, kopia)
+
+		if ctx.Err() == nil {
+			w.health.Record(componentKopia, connectedErr(st, err))
+		}
 
 		switch {
 		case ctx.Err() != nil:
@@ -438,6 +528,150 @@ func (w *watcher) logConnected(st *kopiaclient.RepoStatus) {
 	}
 
 	w.log.Info("connected to kopia server", attrs...)
+
+	if w.notifier != nil {
+		w.notifier.SetHost(st.Hostname)
+	}
+}
+
+// kopiaCheck is the health check of kopia server: it must answer and have
+// a repository connected.
+func kopiaCheck(kopia *kopiaclient.Client) health.CheckFunc {
+	return func(ctx context.Context) error {
+		return connectedErr(kopia.RepoStatus(ctx))
+	}
+}
+
+// connectedErr is the error of a repository status that has no repository
+// connected, or err.
+func connectedErr(st *kopiaclient.RepoStatus, err error) error {
+	switch {
+	case err != nil:
+		return err
+	case !st.Connected:
+		return errors.New("kopia server has no repository connected")
+	default:
+		return nil
+	}
+}
+
+// pinger is a Docker engine that can ping, such as *docker.Client.
+type pinger interface {
+	Ping(ctx context.Context) error
+}
+
+// dockerCheck is the health check of Docker: a ping, or a listing of the
+// containers for an engine that cannot ping.
+func dockerCheck(engine docker.Engine) health.CheckFunc {
+	if p, ok := engine.(pinger); ok {
+		return p.Ping
+	}
+
+	return func(ctx context.Context) error {
+		_, err := engine.Containers(ctx)
+		return err
+	}
+}
+
+// applyThrottle sets the limits of the KOPIA_THROTTLE_ variables on kopia
+// server, if any is set, keeping the others as kopia server has them; with
+// none set, it leaves the limits alone, to kopia server or to Terraform.
+// It reports false when it failed in a way that the next full reconcile
+// may fix.
+func (w *watcher) applyThrottle(ctx context.Context, kopia *kopiaclient.Client) (done bool) {
+	t := w.cfg.Throttle
+	if !t.Set() {
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, kopiaCheckTimeout)
+	defer cancel()
+
+	have, err := kopia.Throttle(ctx)
+	if err == nil {
+		want := mergeThrottle(*have, t)
+		if want == *have {
+			w.log.Info("kopia server's throttle is as configured", "throttle", want)
+			return true
+		}
+
+		if err = kopia.SetThrottle(ctx, want); err == nil {
+			w.log.Info("set kopia server's throttle", "throttle", want, "was", *have)
+			return true
+		}
+	}
+
+	switch {
+	case errors.Is(err, context.Canceled):
+		return true
+	case errors.Is(err, kopiaclient.ErrNoStorage):
+		w.log.Error("cannot set kopia server's throttle: it has no repository storage of its own to limit; "+
+			"unset the KOPIA_THROTTLE_ variables", "error", err.Error())
+
+		return true
+	case kopiaclient.IsRetryable(err):
+		w.log.Warn("cannot set kopia server's throttle; trying again at the next full reconcile", "error", err.Error())
+		return false
+	default:
+		w.log.Error("cannot set kopia server's throttle", "error", err.Error())
+		return true
+	}
+}
+
+// mergeThrottle returns l with the limits set in t.
+func mergeThrottle(l kopiaclient.ThrottleLimits, t config.Throttle) kopiaclient.ThrottleLimits {
+	set := func(dst *float64, v *float64) {
+		if v != nil {
+			*dst = *v
+		}
+	}
+
+	set(&l.UploadBytesPerSecond, t.UploadBytesPerSecond)
+	set(&l.DownloadBytesPerSecond, t.DownloadBytesPerSecond)
+	set(&l.ReadsPerSecond, t.ReadsPerSecond)
+	set(&l.WritesPerSecond, t.WritesPerSecond)
+	set(&l.ListsPerSecond, t.ListsPerSecond)
+
+	if t.ConcurrentReads != nil {
+		l.ConcurrentReads = *t.ConcurrentReads
+	}
+
+	if t.ConcurrentWrites != nil {
+		l.ConcurrentWrites = *t.ConcurrentWrites
+	}
+
+	return l
+}
+
+// teeMetrics reports to the metrics and to the notifier.
+type teeMetrics struct {
+	m *metrics.Metrics
+	n *notify.Notifier
+}
+
+func (t teeMetrics) ReconcileError(path string, reason reconcile.Reason) {
+	t.m.ReconcileError(path, reason)
+	t.n.ReconcileError(path, reason)
+}
+
+func (t teeMetrics) Source(path string, s reconcile.SourceMetrics) {
+	t.m.Source(path, s)
+	t.n.Source(path, s)
+}
+
+func (t teeMetrics) LastSuccess(path string, start time.Time) {
+	t.m.LastSuccess(path, start)
+	t.n.LastSuccess(path, start)
+}
+
+func (t teeMetrics) ForgetSource(path string) {
+	t.m.ForgetSource(path)
+	t.n.ForgetSource(path)
+}
+
+func (t teeMetrics) SnapshotFinished(path string, res backend.SnapshotResult) {
+	t.m.SnapshotFinished(path, res)
+	t.n.SnapshotFinished(path, res)
 }
 
 // logKopiaError explains an error of kopia server that retrying cannot fix.

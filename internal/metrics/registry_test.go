@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
+	"github.com/rfdrew/kopia-docker-watcher/internal/notify"
 	"github.com/rfdrew/kopia-docker-watcher/internal/reconcile"
 )
 
@@ -20,7 +21,7 @@ func scrape(t *testing.T, m *Metrics) map[string]float64 {
 	t.Helper()
 
 	rec := httptest.NewRecorder()
-	Handler(m).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, MetricsPath, http.NoBody))
+	Handler(m, nil).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, MetricsPath, http.NoBody))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /metrics = %d %s", rec.Code, rec.Body)
@@ -291,4 +292,25 @@ func TestReconcileError(t *testing.T) {
 			t.Errorf("a reconcile error with a path: %s", s)
 		}
 	}
+}
+
+// Notifications count by result, each starting at zero.
+func TestNotification(t *testing.T) {
+	m := New()
+
+	assertSamples(t, scrape(t, m), map[string]float64{
+		`kopia_watcher_notifications_total{result="sent"}`:    0,
+		`kopia_watcher_notifications_total{result="failed"}`:  0,
+		`kopia_watcher_notifications_total{result="dropped"}`: 0,
+	})
+
+	m.Notification(notify.ResultSent)
+	m.Notification(notify.ResultSent)
+	m.Notification(notify.ResultFailed)
+
+	assertSamples(t, scrape(t, m), map[string]float64{
+		`kopia_watcher_notifications_total{result="sent"}`:    2,
+		`kopia_watcher_notifications_total{result="failed"}`:  1,
+		`kopia_watcher_notifications_total{result="dropped"}`: 0,
+	})
 }

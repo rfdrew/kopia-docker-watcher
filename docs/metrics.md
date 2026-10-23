@@ -2,7 +2,8 @@
 
 The watcher serves [Prometheus](https://prometheus.io) metrics at `GET /metrics` on
 [`LISTEN_ADDR`](configuration.md#listen_addr) (`:8080` by default), next to `/healthz`, in the Prometheus text
-format. `run --dry-run` serves no HTTP and so no metrics.
+format. `run --dry-run` serves no HTTP and so no metrics. `/healthz` is described in
+[configuration.md](configuration.md#health-check).
 
 The endpoint has no authentication and no TLS, and the metrics name your source paths and containers. Keep
 `LISTEN_ADDR` on a network you trust: scrape it from the Docker network the watcher runs in rather than publishing
@@ -19,6 +20,7 @@ the port.
 | [`kopia_watcher_managed_sources`](#kopia_watcher_managed_sources-and-kopia_watcher_source_paused) | gauge | `state` | Managed sources, active and paused |
 | [`kopia_watcher_source_paused`](#kopia_watcher_managed_sources-and-kopia_watcher_source_paused) | gauge | `path` | 1 while a source is paused, 0 while it is active |
 | [`kopia_watcher_source_owner`](#kopia_watcher_source_owner) | gauge | `path`, `container` | 1 for each container that backs up a source |
+| [`kopia_watcher_notifications_total`](#kopia_watcher_notifications_total) | counter | `result` | Notifications to `NOTIFY_WEBHOOK_URL`: sent, failed, dropped |
 | `kopia_watcher_build_info` | gauge | `version` | Always 1; the version of the watcher |
 
 The metrics of the Go runtime (`go_*`) and of the process (`process_*`) come with them.
@@ -132,6 +134,17 @@ Join it to show the containers of a source, for example the last success with on
 kopia_watcher_source_owner * on(path) group_left kopia_watcher_last_success_timestamp_seconds
 ```
 
+### `kopia_watcher_notifications_total`
+
+The notifications to [`NOTIFY_WEBHOOK_URL`](configuration.md#notifications), by what became of them. Every
+`result` starts at 0, also without a webhook.
+
+| `result` | Counted when |
+|---|---|
+| `sent` | the webhook answered with a 2xx |
+| `failed` | every attempt failed, or the webhook answered in a way that trying again does not fix, such as 400 or 404; the log tells why |
+| `dropped` | 64 notifications were waiting already, or the watcher stopped before it was sent |
+
 ## Scraping
 
 The example in [examples/](../examples/) does not publish the watcher's port. A Prometheus in the same Docker
@@ -190,6 +203,12 @@ groups:
         expr: increase(kopia_watcher_reconcile_errors_total{kind!~"temporary|unavailable|docker"}[30m]) > 0
         annotations:
           summary: "The watcher cannot apply the labels ({{ $labels.kind }}); see its log"
+
+      # The notifications do not reach the webhook.
+      - alert: KopiaWatcherNotificationsFailing
+        expr: increase(kopia_watcher_notifications_total{result!="sent"}[1h]) > 0
+        annotations:
+          summary: "Notifications to NOTIFY_WEBHOOK_URL were {{ $labels.result }}; see the watcher's log"
 
       - alert: KopiaWatcherDown
         expr: up{job="kopia-docker-watcher"} == 0

@@ -1,8 +1,8 @@
 // Package metrics serves the watcher's HTTP endpoints on LISTEN_ADDR:
 //
-//   - /healthz answers 200 while the process serves HTTP; it backs the
-//     image's HEALTHCHECK through the healthcheck subcommand. Checks of
-//     Docker, kopia server and the reconcile loop come later;
+//   - /healthz serves the health of the watcher (package health): 200
+//     while it is ok or starting, 503 while it is unhealthy. It backs the
+//     image's HEALTHCHECK through the healthcheck subcommand;
 //   - /metrics serves Metrics in the Prometheus text format.
 package metrics
 
@@ -25,14 +25,20 @@ const (
 	MetricsPath = "/metrics"
 )
 
-// Handler returns the HTTP handler with all endpoints; /metrics serves m.
-func Handler(m *Metrics) http.Handler {
+// Handler returns the HTTP handler with all endpoints: /healthz serves
+// healthz, /metrics serves m. A nil healthz answers 200 while the process
+// serves HTTP.
+func Handler(m *Metrics, healthz http.Handler) http.Handler {
+	if healthz == nil {
+		healthz = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			_, _ = io.WriteString(w, `{"status":"ok"}`+"\n")
+		})
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET "+HealthzPath, func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = io.WriteString(w, `{"status":"ok"}`+"\n")
-	})
+	mux.Handle("GET "+HealthzPath, healthz)
 	mux.Handle("GET "+MetricsPath, promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{}))
 
 	return mux
@@ -44,11 +50,11 @@ type Server struct {
 	ln  net.Listener
 }
 
-// NewServer serves Handler(m) on ln until Shutdown.
-func NewServer(ln net.Listener, log *slog.Logger, m *Metrics) *Server {
+// NewServer serves Handler(m, healthz) on ln until Shutdown.
+func NewServer(ln net.Listener, log *slog.Logger, m *Metrics, healthz http.Handler) *Server {
 	return &Server{
 		srv: &http.Server{
-			Handler:           Handler(m),
+			Handler:           Handler(m, healthz),
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       10 * time.Second,
 			WriteTimeout:      10 * time.Second,
@@ -97,7 +103,8 @@ func HealthcheckURL(listenAddr string) (string, error) {
 	return "http://" + net.JoinHostPort(host, port) + HealthzPath, nil
 }
 
-// Probe requests url and succeeds on 200.
+// Probe requests url and succeeds on 200; /healthz answers 503 while the
+// watcher is unhealthy.
 func Probe(ctx context.Context, client *http.Client, url string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {

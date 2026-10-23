@@ -7,6 +7,7 @@ import (
 	"io"
 	"maps"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -301,5 +302,20 @@ func TestEventsFailure(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no error")
+	}
+}
+
+func TestPing(t *testing.T) {
+	f := newFakeDocker()
+	c := newFakeDockerClient(t, f)
+
+	if err := c.Ping(t.Context()); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+
+	f.set(func(f *fakeDocker) { f.failPing = true })
+
+	if err := c.Ping(t.Context()); err == nil || !strings.Contains(err.Error(), "daemon is busy") {
+		t.Fatalf("Ping of a failing daemon: %v", err)
 	}
 }
