@@ -1259,7 +1259,9 @@ func (f *Fake) AnnotateSnapshot(ctx context.Context, src backend.Source, startTi
 	}
 
 	snap := &s.snapshots[found]
-	snap.Description = description
+	if description != "" {
+		snap.Description = description
+	}
 
 	for _, p := range addPins {
 		if !slices.Contains(snap.Pins, p) {

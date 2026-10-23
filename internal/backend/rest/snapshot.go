@@ -689,11 +689,12 @@ func (b *Backend) failure(ctx context.Context, src backend.Source, task *kopiacl
 // snapshot's ID is read from GET /api/v1/snapshots with all=1 right before
 // the edit and never kept: an edit saves a new manifest under a new ID and
 // deletes the old one. The description and the pins go in one edit, and
-// only what changes does: the description when it differs, the pins the
-// snapshot does not carry yet. When nothing changes, nothing is sent, so a
-// repeated call leaves the snapshot and its ID alone. A snapshot edited or
-// deleted by another client between the listing and the edit makes the
-// edit fail with ErrTemporary; the next call lists the snapshots again.
+// only what changes does: the description when it is set and differs, the
+// pins the snapshot does not carry yet. When nothing changes, nothing is
+// sent, so a repeated call leaves the snapshot and its ID alone. A snapshot
+// edited or deleted by another client between the listing and the edit
+// makes the edit fail with ErrTemporary; the next call lists the snapshots
+// again.
 func (b *Backend) AnnotateSnapshot(ctx context.Context, src backend.Source, startTime time.Time, description string, addPins []string) error {
 	if _, err := b.lookup(ctx, opAnnotateSnapshot, src); err != nil {
 		return err
@@ -725,7 +726,7 @@ func (b *Backend) AnnotateSnapshot(ctx context.Context, src backend.Source, star
 
 	req := kopiaclient.EditSnapshotsRequest{Snapshots: []string{snap.ID}}
 
-	if snap.Description != description {
+	if description != "" && snap.Description != description {
 		req.Description = &description
 	}
 

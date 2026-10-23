@@ -70,6 +70,10 @@ type ContainerSpec struct {
 	// key once.
 	Tags []Tag
 
+	// PinOnStop is the pin added to the snapshot taken at a stop of the
+	// container, as a template for PinName; empty for none.
+	PinOnStop string
+
 	// Policy holds the fields written to the Kopia policy of every path.
 	// A field left unset is inherited from the parent policies: those of
 	// parent directories, then user@host, host and global. The schedule
@@ -256,6 +260,11 @@ func Parse(labels map[string]string, opts Options) (ContainerSpec, Issues) {
 	if len(p.spec.ExcludeVolumes) > 0 && len(p.spec.Volumes) == 0 {
 		p.label = Name(p.prefix, KeyExcludeVolumes)
 		p.warn("has no effect without "+Name(p.prefix, KeyVolumes), "", "")
+	}
+
+	if p.spec.PinOnStop != "" && !p.spec.SnapshotOnStop {
+		p.label = Name(p.prefix, KeyPinOnStop)
+		p.warn("has no effect unless "+Name(p.prefix, KeySnapshotOnStop)+" is true", "", "")
 	}
 
 	if p.spec.CleanupDeletePinned && p.spec.CleanupOnRemove != CleanupAll {

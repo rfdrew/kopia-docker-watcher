@@ -44,6 +44,7 @@ kopia-docker-watcher validate --all
 | [`kopia.min-interval`](#kopiamin-interval) | `10m` | Go duration, `0` for no minimum |
 | [`kopia.description`](#kopiadescription) | the container name | text |
 | [`kopia.tags`](#kopiatags) | — | `key:value` pairs, separated by `,` |
+| [`kopia.pin-on-stop`](#kopiapin-on-stop) | — | pin name, with `{date}` and `{time}` |
 | [`kopia.cleanup-on-remove`](#kopiacleanup-on-remove) | `pause` | `pause`, `policy` or `all` |
 | [`kopia.cleanup-delete-pinned`](#kopiacleanup-delete-pinned) | `false` | boolean |
 | [`kopia.pre-exec`](#kopiapre-exec) | — | [command](#commands): JSON array or shell command |
@@ -83,7 +84,8 @@ inherits the field from its parent policies.
 
 The names, defaults and boolean values of the Python version's labels (`enable`, `path`, `schedule`,
 `snapshot-on-start`, `snapshot-on-stop`, `description`, `tags`) are kept. `volumes`, `exclude-volumes`,
-`min-interval`, `cleanup-on-remove`, `cleanup-delete-pinned`, the policy labels and the [hooks](#hooks) are new.
+`min-interval`, `pin-on-stop`, `cleanup-on-remove`, `cleanup-delete-pinned`, the policy labels and the [hooks](#hooks) are
+new.
 
 ## Warnings, errors and strict mode
 
@@ -105,8 +107,9 @@ What happens to a container with an error:
 - A source it manages keeps the policy fields it last applied. The pause still follows the container: the source
   is paused while the container is stopped and unpaused while it runs.
 - `kopia.description` and `kopia.tags` are not used; its snapshots are described by the container name.
-- `kopia.snapshot-on-start`, `kopia.snapshot-on-stop`, `kopia.min-interval`, `kopia.cleanup-on-remove` and
-  `kopia.cleanup-delete-pinned` still apply as long as that label itself has no error. A cleanup label with an
+- `kopia.snapshot-on-start`, `kopia.snapshot-on-stop`, `kopia.min-interval`, `kopia.pin-on-stop`,
+  `kopia.cleanup-on-remove` and `kopia.cleanup-delete-pinned` still apply as long as that label itself has no
+  error. A cleanup label with an
   error counts as `pause`.
 - A hook whose label, or `kopia.hook-timeout`, has an error does not run: a `kopia.pre-exec` with an error takes
   no snapshot instead of one without it, a `kopia.post-exec` with an error fails after the snapshot.
@@ -124,7 +127,7 @@ lies outside `WATCHER_PATH_PREFIX`. The same holds for the source of a mount tha
 **Unknown labels** under the prefix are a warning with a hint where there is one: `kopia.snapshot_on_stop` gets
 "did you mean kopia.snapshot-on-stop?", and `kopia.compression` gets "it is a group of labels such as
 kopia.compression.algorithm". Labels planned for later releases are a warning "not supported by this version" and
-ignored: `kopia.stop-during-backup`, `kopia.pause-during-backup`, `kopia.pin-on-stop` and `kopia.depends-on`.
+ignored: `kopia.stop-during-backup`, `kopia.pause-during-backup` and `kopia.depends-on`.
 
 ### Booleans
 
@@ -296,6 +299,63 @@ does not wait for the snapshot.
 
 The labels of the container whose event it is decide: with several owners, each container's own
 `snapshot-on-start` and `snapshot-on-stop` apply to its own starts and stops.
+
+### `kopia.pin-on-stop`
+
+A pin that the watcher adds to the stop snapshot of the container, so that kopia's retention never deletes it.
+Use it to keep the state of a service from right before an update:
+
+```yaml
+labels:
+  kopia.snapshot-on-stop: "true"
+  kopia.pin-on-stop: "before-update-{date}"
+```
+
+`docker compose down`, or the stop of `docker compose up` that replaces the container with one of a new image,
+then leaves a snapshot pinned `before-update-2026-10-23`. The pin is set in the same `snapshots/edit` as the
+description. Remove it with `kopia snapshot pin --remove before-update-2026-10-23 <snapshot ID>` or in the web
+UI once it is no longer needed: pinned snapshots pile up otherwise.
+
+**The name.** Kopia accepts any text as a pin; the watcher accepts letters, digits, punctuation and symbols
+without whitespace, at most 128 characters once the placeholders are filled in, so that the pin can be typed in
+`kopia snapshot pin` unquoted. Spaces around the value are trimmed. Two placeholders give each stop a pin of its
+own, filled in with the time of the stop (the `die` event) in UTC:
+
+| Placeholder | Becomes |
+|---|---|
+| `{date}` | `2026-10-23` |
+| `{time}` | `14-05-09` (`HH-MM-SS`, no `:`, so it is safe in a shell and a file name) |
+
+Any other `{` or `}`, such as `{data}`, is an error in the name. An empty or invalid name is a warning, and the
+stop snapshot is taken without a pin. Without `{date}` or `{time}` every stop adds the same pin, to a new
+snapshot each time.
+
+**Which snapshot.** The pin goes on the snapshot that counts as the stop snapshot (see
+[`kopia.snapshot-on-stop`](#kopiasnapshot-on-stop)):
+
+- the snapshot the watcher queued at the stop;
+- when a snapshot was pending at the stop, the one that run saves: it reads the files after the stop;
+- when kopia server lost the run and the watcher takes the snapshot again, the one taken again;
+- **when the run saved no snapshot because nothing changed since the last one**
+  ([`kopia.retention.ignore-identical`](#kopiaretentionignore-identical)), the last complete snapshot of the
+  source taken before the stop snapshot was queued, which holds the same files. A snapshot taken later, such as
+  one of the updated service, is never pinned for the stop. That is the point of the pin: the state before the update is kept,
+  whether or not it changed since the last snapshot. Its description is left as it is.
+
+A stop snapshot that fails or is canceled gets no pin, and the watcher logs a warning. A snapshot saved with
+file errors (`incomplete`) is pinned all the same, like it is described.
+
+- `kopia.pin-on-stop` needs `kopia.snapshot-on-stop=true`. Without it the label has no effect, and the watcher
+  (and `validate`) warns about it.
+- With several owners, the pin is that of the container that stopped. The stop of another owner adds its own pin,
+  if it has one, to its own stop snapshot.
+- The pin is worked out at the stop and kept in `STATE_FILE` until the snapshot is pinned, so a restart of the
+  watcher in between, or a container removed meanwhile, loses nothing.
+- kopia server (0.23) lists the pins of identical snapshots also on the oldest of them, even with `all=1`. So the
+  watcher does not add a pin to that oldest snapshot when a newer identical copy already carries it: the files
+  are kept either way.
+- [`kopia.cleanup-on-remove=all`](#kopiacleanup-on-remove) keeps pinned snapshots, the source and its paused
+  policy, unless [`kopia.cleanup-delete-pinned`](#kopiacleanup-delete-pinned) is `true`.
 
 ### `kopia.min-interval`
 
@@ -706,6 +766,8 @@ those kopia server shows merged as identical.
 - **Pinned snapshots that must stay**: the snapshots without a pin are deleted by their IDs, at most 1000 per
   request. The pinned snapshots and the paused policy stay, so the source stays in kopia server, paused. When
   every snapshot is pinned, nothing is deleted.
+- Pins come from [`kopia.pin-on-stop`](#kopiapin-on-stop), from the web UI or from `kopia snapshot pin`. A stop
+  snapshot pinned by `kopia.pin-on-stop`, such as the one of `docker compose down`, therefore outlives `all`.
 - kopia server shows the pins of identical snapshots on the oldest of them. Such a snapshot counts as pinned and
   stays, even if its own pin is on a newer copy. This errs on the side of keeping data.
 - A snapshot pinned between the listing and the delete stays in the second case and goes in the first.
@@ -740,5 +802,5 @@ for each abandoned source what the cleanup would delete, and when.
 
 ### `kopia.cleanup-delete-pinned`
 
-`true` lets `kopia.cleanup-on-remove=all` delete pinned snapshots too, and with them the whole source. Default
-`false`. With any other cleanup mode it has no effect, and the watcher warns about it.
+`true` lets `kopia.cleanup-on-remove=all` delete pinned snapshots too, those of `kopia.pin-on-stop` included,
+and with them the whole source. Default `false`. With any other cleanup mode it has no effect, and the watcher warns about it.

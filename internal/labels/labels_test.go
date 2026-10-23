@@ -488,7 +488,7 @@ func TestParseStrict(t *testing.T) {
 		"kopia.tags":             "standalone,env:dev,env:prod",
 		"kopia.bogus":            "1",
 		"kopia.Enable":           "true",
-		"kopia.pin-on-stop":      "keep",
+		"kopia.depends-on":       "db",
 	}
 
 	want := spec(func(s *ContainerSpec) {
@@ -501,8 +501,8 @@ func TestParseStrict(t *testing.T) {
 		checkParse(t, labels, Options{}, want, []string{
 			"warning kopia.Enable: unknown label, ignored; did you mean kopia.enable?",
 			"warning kopia.bogus: unknown label, ignored",
+			"warning kopia.depends-on: not supported by this version, ignored",
 			`warning kopia.path: "/data" is listed more than once`,
-			"warning kopia.pin-on-stop: not supported by this version, ignored",
 			`warning kopia.snapshot-on-stop: "yes" is not a boolean, treated as false; use true or false`,
 			`warning kopia.tags: tag "standalone" is not key:value, ignored`,
 			`warning kopia.tags: tag key "env" is repeated, the last value is used`,
@@ -515,8 +515,8 @@ func TestParseStrict(t *testing.T) {
 		checkParse(t, labels, Options{Strict: true}, want, []string{
 			"error kopia.Enable: unknown label; did you mean kopia.enable?",
 			"error kopia.bogus: unknown label",
+			"error kopia.depends-on: not supported by this version",
 			`error kopia.path: "/data" is listed more than once`,
-			"error kopia.pin-on-stop: not supported by this version",
 			`error kopia.snapshot-on-stop: "yes" is not a boolean; use true or false`,
 			`error kopia.tags: tag "standalone" is not key:value`,
 			`error kopia.tags: tag key "env" is repeated`,

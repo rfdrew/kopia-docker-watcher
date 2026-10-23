@@ -180,6 +180,7 @@ func (ps *pass) startHookRun(reqs []snapRequest, status *backend.SourceStatus, r
 		}
 
 		r.SnapshotWaits = slices.DeleteFunc(r.SnapshotWaits, func(x state.SnapshotWait) bool { return replaced[x.ID] })
+		prunePins(r)
 		r.LastTriggered = now
 		r.HookRun = &run
 		ps.takeDue(r)
