@@ -13,8 +13,9 @@ import (
 
 // serveLifecycle serves POST /containers/{id}/stop, start, pause and
 // unpause as Docker does: 204 once done, 304 for a stop or start that
-// changes nothing, 409 for a pause or unpause that cannot be done, 404 for
-// a missing container. It changes the state the fake inspects.
+// changes nothing, 409 for a pause of a container that is not running or
+// paused already, 500 for an unpause of one that is not paused, 404 for a
+// missing container. It changes the state the fake inspects.
 func (f *fakeDocker) serveLifecycle(w http.ResponseWriter, r *http.Request, path string) bool {
 	rest, ok := strings.CutPrefix(path, "/containers/")
 	if !ok || r.Method != http.MethodPost {
@@ -63,15 +64,21 @@ func (f *fakeDocker) serveLifecycle(w http.ResponseWriter, r *http.Request, path
 
 		to = container.StateRunning
 	case "pause":
-		if st.Status != container.StateRunning {
+		switch st.Status {
+		case container.StateRunning:
+		case container.StatePaused:
+			writeDockerError(w, http.StatusConflict, "Container "+id+" is already paused")
+			return true
+		default:
 			writeDockerError(w, http.StatusConflict, "Container "+id+" is not running")
 			return true
 		}
 
 		to = container.StatePaused
 	case "unpause":
+		// The daemon answers this one with 500, not 409.
 		if st.Status != container.StatePaused {
-			writeDockerError(w, http.StatusConflict, "Container "+id+" is not paused")
+			writeDockerError(w, http.StatusInternalServerError, "Container "+id+" is not paused")
 			return true
 		}
 
@@ -145,16 +152,33 @@ func TestLifecycle(t *testing.T) {
 		t.Errorf("stop query = %v, want none: the container's own timeout", q)
 	}
 
-	if err := c.Unpause(ctx, "db"); !errors.Is(err, ErrNotPaused) {
-		t.Errorf("unpause of a running container: %v, want ErrNotPaused", err)
+	// Done already is no error, whatever Docker answers.
+	if err := c.Unpause(ctx, "db"); err != nil {
+		t.Errorf("unpause of a running container: %v", err)
 	}
+
+	if err := c.Pause(ctx, "db"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.Pause(ctx, "db"); err != nil {
+		t.Errorf("pause of a paused container: %v", err)
+	}
+
+	state(StatePaused)
 
 	if err := c.Stop(ctx, "db"); err != nil {
 		t.Fatal(err)
 	}
 
+	state(StateExited)
+
 	if err := c.Pause(ctx, "db"); !errors.Is(err, ErrNotRunning) {
 		t.Errorf("pause of a stopped container: %v, want ErrNotRunning", err)
+	}
+
+	if err := c.Unpause(ctx, "db"); !errors.Is(err, ErrNotPaused) {
+		t.Errorf("unpause of a stopped container: %v, want ErrNotPaused", err)
 	}
 
 	for name, do := range map[string]func(context.Context, string) error{"stop": c.Stop, "start": c.Start,

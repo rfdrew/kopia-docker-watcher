@@ -143,29 +143,31 @@ func (f *fakeEngine) Start(ctx context.Context, id string) error {
 	})
 }
 
-// Pause implements docker.Engine.
+// Pause implements docker.Engine: a paused container stays paused, one
+// that is neither running nor paused is docker.ErrNotRunning.
 func (f *fakeEngine) Pause(ctx context.Context, id string) error {
 	return f.change(ctx, "pause", id, func(c *docker.Container) error {
-		if c.State != docker.StateRunning {
+		switch c.State {
+		case docker.StateRunning, docker.StatePaused:
+			c.State = docker.StatePaused
+			return nil
+		default:
 			return fmt.Errorf("pause container %s: %w", id, docker.ErrNotRunning)
 		}
-
-		c.State = docker.StatePaused
-
-		return nil
 	})
 }
 
-// Unpause implements docker.Engine.
+// Unpause implements docker.Engine: a running container stays running,
+// one that is neither paused nor running is docker.ErrNotPaused.
 func (f *fakeEngine) Unpause(ctx context.Context, id string) error {
 	return f.change(ctx, "unpause", id, func(c *docker.Container) error {
-		if c.State != docker.StatePaused {
+		switch c.State {
+		case docker.StatePaused, docker.StateRunning:
+			c.State = docker.StateRunning
+			return nil
+		default:
 			return fmt.Errorf("unpause container %s: %w", id, docker.ErrNotPaused)
 		}
-
-		c.State = docker.StateRunning
-
-		return nil
 	})
 }
 

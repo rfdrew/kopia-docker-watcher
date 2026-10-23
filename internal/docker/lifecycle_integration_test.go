@@ -70,9 +70,12 @@ func TestIntegrationLifecycle(t *testing.T) {
 
 	state(StatePaused)
 
-	if err := c.Pause(ctx, id); !errors.Is(err, ErrNotRunning) {
+	// Done already is no error, whatever the daemon answers.
+	if err := c.Pause(ctx, id); err != nil {
 		t.Errorf("pause of a paused container: %v", err)
 	}
+
+	state(StatePaused)
 
 	if err := c.Unpause(ctx, id); err != nil {
 		t.Fatal(err)
@@ -80,7 +83,7 @@ func TestIntegrationLifecycle(t *testing.T) {
 
 	state(StateRunning)
 
-	if err := c.Unpause(ctx, id); !errors.Is(err, ErrNotPaused) {
+	if err := c.Unpause(ctx, id); err != nil {
 		t.Errorf("unpause of a running container: %v", err)
 	}
 
@@ -100,6 +103,14 @@ func TestIntegrationLifecycle(t *testing.T) {
 
 	if err := c.Stop(ctx, id); err != nil {
 		t.Errorf("stop of a stopped container: %v", err)
+	}
+
+	if err := c.Pause(ctx, id); !errors.Is(err, ErrNotRunning) {
+		t.Errorf("pause of a stopped container: %v, want ErrNotRunning", err)
+	}
+
+	if err := c.Unpause(ctx, id); !errors.Is(err, ErrNotPaused) {
+		t.Errorf("unpause of a stopped container: %v, want ErrNotPaused", err)
 	}
 
 	if err := c.Start(ctx, id); err != nil {

@@ -1250,3 +1250,73 @@ func TestHeldSharedContainer(t *testing.T) {
 	h.mustActions("stop db", "start db", "stop db", "start db")
 	h.mustNotHeld()
 }
+
+// A pause or an unpause that finds its work done already, as when someone
+// else paused or unpaused the container just before, succeeds: the
+// snapshot is taken, and the container counts as back.
+func TestPauseAlreadyDone(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	withHooks(h)
+	id := h.engine.run("cache", enable, pathLabel(app), noOnStart, pauseDuring)
+
+	h.engine.setLifecycle(func(_ context.Context, action string, _ docker.Container) error {
+		switch action {
+		case "pause":
+			h.engine.setState(id, docker.StatePaused)
+		case "unpause":
+			h.engine.setState(id, docker.StateRunning)
+		}
+
+		return nil
+	})
+
+	h.passAndSettle(app)
+	c.add(time.Hour)
+	h.passAndSettle(app)
+
+	if run := h.record(app).HookRun; run == nil || run.DownError != "" || run.DownTaken != 1 {
+		t.Fatalf("hook run %+v\nlog:\n%s", run, h.logs)
+	}
+
+	h.mustState(id, docker.StatePaused)
+	h.runHooked(app, 3)
+
+	h.mustTriggers(app, 1)
+	h.mustActions("pause cache", "unpause cache")
+	h.mustState(id, docker.StateRunning)
+	h.mustNotHeld()
+
+	if r := h.metrics.returnResults(app); len(r) != 1 || r[0].Error != "" || r[0].Mode != ModePause {
+		t.Fatalf("returns = %+v", r)
+	}
+}
+
+// The fake engine keeps docker.Engine's contract for a pause or an unpause
+// with nothing to do, and for one that cannot be done.
+func TestFakeEnginePauseContract(t *testing.T) {
+	f := newFakeEngine()
+	id := f.run("cache")
+	ctx := context.Background()
+
+	for _, step := range []struct {
+		do   func(context.Context, string) error
+		want docker.State
+	}{
+		{f.Pause, docker.StatePaused}, {f.Pause, docker.StatePaused}, {f.Unpause, docker.StateRunning}, {f.Unpause, docker.StateRunning},
+	} {
+		if err := step.do(ctx, id); err != nil || f.container(id).State != step.want {
+			t.Fatalf("state %s, error %v; want %s", f.container(id).State, err, step.want)
+		}
+	}
+
+	f.setState(id, docker.StateExited)
+
+	if err := f.Pause(ctx, id); !errors.Is(err, docker.ErrNotRunning) {
+		t.Errorf("pause of a stopped container: %v", err)
+	}
+
+	if err := f.Unpause(ctx, id); !errors.Is(err, docker.ErrNotPaused) {
+		t.Errorf("unpause of a stopped container: %v", err)
+	}
+}

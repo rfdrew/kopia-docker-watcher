@@ -66,13 +66,14 @@ type Engine interface {
 	// error. A missing container is ErrNotFound.
 	Start(ctx context.Context, id string) error
 
-	// Pause freezes the processes of the running container id. A container
-	// that is not running, or is paused already, is ErrNotRunning; a missing
-	// one ErrNotFound.
+	// Pause freezes the processes of the running container id. Pausing a
+	// paused container is no error. A container that is neither running nor
+	// paused is ErrNotRunning, a missing one ErrNotFound.
 	Pause(ctx context.Context, id string) error
 
-	// Unpause thaws the processes of the paused container id. A container
-	// that is not paused is ErrNotPaused; a missing one ErrNotFound.
+	// Unpause thaws the processes of the paused container id. Unpausing a
+	// running container is no error. A container that is neither paused nor
+	// running is ErrNotPaused, a missing one ErrNotFound.
 	Unpause(ctx context.Context, id string) error
 }
 
