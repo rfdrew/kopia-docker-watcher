@@ -36,6 +36,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -59,6 +60,12 @@ type Backend struct {
 	// /api/v1/sources; nil before the first. It is only a hint for the
 	// filter of ListSources, which checks it against the answer.
 	ident atomic.Pointer[identity]
+
+	// algorithms are the compression algorithms of kopia server's first
+	// answer to GET /api/v1/repo/algorithms; nil before it. algoMu keeps
+	// calls that find no answer yet from asking all at once.
+	algoMu     sync.Mutex
+	algorithms []backend.Algorithm
 }
 
 type identity struct {
@@ -82,6 +89,7 @@ func New(client *kopiaclient.Client, log *slog.Logger) *Backend {
 // Backend method names, the Op of errors.
 const (
 	opServerIdentity   = "ServerIdentity"
+	opAlgorithms       = "CompressionAlgorithms"
 	opResolvePath      = "ResolvePath"
 	opListSources      = "ListSources"
 	opPlanSource       = "PlanSource"
@@ -111,6 +119,39 @@ func (b *Backend) ServerIdentity(ctx context.Context) (userName, host string, er
 	b.remember(resp)
 
 	return resp.LocalUsername, resp.LocalHost, nil
+}
+
+// CompressionAlgorithms implements backend.Backend with GET
+// /api/v1/repo/algorithms. The first answer is kept for the life of the
+// Backend: the list is that of the kopia server build, and a kopia server
+// upgraded under a running watcher is noticed only by its next start.
+func (b *Backend) CompressionAlgorithms(ctx context.Context) ([]backend.Algorithm, error) {
+	b.algoMu.Lock()
+	defer b.algoMu.Unlock()
+
+	if b.algorithms == nil {
+		res, err := b.client.SupportedAlgorithms(ctx)
+		if err != nil {
+			return nil, fail(ctx, opAlgorithms, backend.Source{}, reqRead, err)
+		}
+
+		algos := make([]backend.Algorithm, 0, len(res.Compression))
+		for _, a := range res.Compression {
+			if a.ID != "" {
+				algos = append(algos, backend.Algorithm{Name: a.ID, Deprecated: a.Deprecated})
+			}
+		}
+
+		if len(algos) == 0 {
+			return nil, &backend.Error{Op: opAlgorithms,
+				Err: fmt.Errorf("%w: kopia server lists no compression algorithms", kopiaclient.ErrUnexpectedResponse)}
+		}
+
+		slices.SortFunc(algos, func(x, y backend.Algorithm) int { return strings.Compare(x.Name, y.Name) })
+		b.algorithms = algos
+	}
+
+	return slices.Clone(b.algorithms), nil
 }
 
 // ResolvePath implements backend.Backend with paths/resolve.

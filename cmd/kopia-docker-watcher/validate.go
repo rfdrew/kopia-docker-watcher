@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
 	"github.com/rfdrew/kopia-docker-watcher/internal/config"
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
 	"github.com/rfdrew/kopia-docker-watcher/internal/kopiaclient"
@@ -42,11 +43,12 @@ the docker CLI reaches it, through DOCKER_HOST.
 
 Each path of the path label is put under HOST_PREFIX and must then be
 absolute. With KOPIA_SERVER_URL set, kopia server checks more, read-only:
-it normalizes every path (paths/resolve) and computes the next snapshot
-times of the path's stored policy with the schedule of the labels in place
+it normalizes every path (paths/resolve), computes the next snapshot times
+of the path's stored policy with the policy fields of the labels in place
 (policy/resolve), in its own time zone, which rejects a bad cron
-expression. Whether a path exists is not checked: only registering a
-source does that. Without KOPIA_SERVER_URL only the labels are checked.
+expression, and lists the compression algorithms it supports
+(repo/algorithms). Whether a path exists is not checked: only registering
+a source does that. Without KOPIA_SERVER_URL only the labels are checked.
 
 Options:
   --strict          treat warnings as errors
@@ -176,6 +178,9 @@ type validator struct {
 	strict        bool
 	// kopia is nil without KOPIA_SERVER_URL: only the labels are checked.
 	kopia *kopiaclient.Client
+	// algorithms are the compression algorithms of kopia server, asked
+	// for the first label set that names one.
+	algorithms []backend.Algorithm
 	// checked counts the label sets checked, for the footer.
 	checked int
 }
@@ -410,6 +415,10 @@ func (v *validator) check(ctx context.Context, input map[string]string) report {
 	r := report{spec: spec, issues: issues, noLabels: !hasPrefixed(input, v.prefix), server: v.kopia != nil}
 	pathLabel := labels.Name(v.prefix, labels.KeyPath)
 
+	if v.kopia != nil {
+		v.checkCompressor(ctx, &r)
+	}
+
 	for _, p := range spec.Paths {
 		sp, err := labels.SourcePathWithin(v.hostPrefix, v.watcherPrefix, p)
 		if err != nil {
@@ -427,6 +436,35 @@ func (v *validator) check(ctx context.Context, input map[string]string) report {
 	}
 
 	return r
+}
+
+// checkCompressor checks the compression algorithm of the labels against
+// the ones kopia server supports.
+func (v *validator) checkCompressor(ctx context.Context, r *report) {
+	name, key := labels.Compressor(r.spec.Policy)
+	if name == "" || name == labels.NoCompression {
+		return
+	}
+
+	if v.algorithms == nil {
+		res, err := v.kopia.SupportedAlgorithms(ctx)
+		if err != nil {
+			r.addError(labels.Name(v.prefix, key), fmt.Sprintf("cannot list the compression algorithms of kopia server: %v", err))
+			return
+		}
+
+		for _, a := range res.Compression {
+			v.algorithms = append(v.algorithms, backend.Algorithm{Name: a.ID, Deprecated: a.Deprecated})
+		}
+
+		slices.SortFunc(v.algorithms, func(a, b backend.Algorithm) int { return strings.Compare(a.Name, b.Name) })
+	}
+
+	for _, is := range labels.CheckCompressor(v.prefix, r.spec.Policy, v.algorithms, v.strict) {
+		if !slices.Contains(r.issues, is) {
+			r.issues = append(r.issues, is)
+		}
+	}
 }
 
 // checkSource asks kopia server to normalize the path of src and to compute
@@ -452,7 +490,12 @@ func (v *validator) checkSource(ctx context.Context, r *report, src *sourceRepor
 		return
 	}
 
-	updates, err := previewPolicy(stored, r.spec.Policy.Scheduling.Cron)
+	if r.spec.Policy.Validate() != nil {
+		// The labels report it; there is no policy to preview.
+		return
+	}
+
+	updates, err := previewPolicy(stored, r.spec.Policy)
 	if err != nil {
 		r.addError(pathLabel, fmt.Sprintf("%s: the stored policy: %v", source.Path, err))
 		return
@@ -468,7 +511,7 @@ func (v *validator) checkSource(ctx context.Context, r *report, src *sourceRepor
 	}
 
 	if res.SchedulingError != "" {
-		r.addError(labels.Name(v.prefix, labels.KeySchedule), "kopia server rejects the schedule: "+res.SchedulingError)
+		r.addError(labels.Name(v.prefix, labels.ScheduleKey(r.spec.Policy)), "kopia server rejects the schedule: "+res.SchedulingError)
 		return
 	}
 
@@ -485,12 +528,14 @@ func (r *report) addError(label, msg string) {
 	}
 }
 
-// previewPolicy returns the policy stored for a path with the schedule of
-// the labels in place, as the watcher would apply it to a running
-// container: the cron expressions replaced, or removed for an empty
-// schedule, and no manual flag, which kopia does not accept together with
-// cron. Every other field is kept as stored.
-func previewPolicy(stored json.RawMessage, cron []string) (json.RawMessage, error) {
+// previewPolicy returns the policy stored for a path with the policy
+// fields of the labels merged in, as the watcher would apply them to a
+// running container: no manual flag, which kopia does not accept together
+// with a schedule, the cron expressions of the stored policy replaced or,
+// for an empty schedule, removed, and the other fields of the labels set.
+// Every other field is kept as stored. validate has no state, so a field a
+// removed label left behind is kept too.
+func previewPolicy(stored json.RawMessage, patch backend.PolicyPatch) (json.RawMessage, error) {
 	var pol map[string]json.RawMessage
 	if err := json.Unmarshal(stored, &pol); err != nil {
 		return nil, errors.New("not a JSON object")
@@ -508,23 +553,8 @@ func previewPolicy(stored json.RawMessage, cron []string) (json.RawMessage, erro
 		}
 	}
 
-	if sched == nil {
-		sched = map[string]json.RawMessage{}
-	}
-
-	delete(sched, "manual")
-	delete(sched, "cron")
-
-	if len(cron) > 0 {
-		b, err := json.Marshal(cron)
-		if err != nil {
-			return nil, err
-		}
-
-		sched["cron"] = b
-	}
-
 	delete(pol, "scheduling")
+	delete(sched, "manual")
 
 	if len(sched) > 0 {
 		b, err := json.Marshal(sched)
@@ -535,7 +565,22 @@ func previewPolicy(stored json.RawMessage, cron []string) (json.RawMessage, erro
 		pol["scheduling"] = b
 	}
 
-	return json.Marshal(pol)
+	current, err := json.Marshal(pol)
+	if err != nil {
+		return nil, err
+	}
+
+	// The schedule label is always the watcher's: with the cron of the
+	// last patch the merge removes a stored cron the labels leave to
+	// inheritance.
+	last := backend.Applied{Patch: backend.PolicyPatch{Scheduling: backend.SchedulingPatch{Cron: []string{labels.DefaultSchedule}}}}
+
+	m, err := backend.Merge(current, backend.Desired{Patch: patch}, last)
+	if err != nil {
+		return nil, err
+	}
+
+	return m.Unpaused, nil
 }
 
 // print writes the report: the parsed labels, the sources and the issues.
@@ -592,7 +637,7 @@ func (v *validator) printFooter(w io.Writer) {
 	}
 
 	if v.kopia == nil {
-		_, _ = fmt.Fprintf(w, "\nkopia server checks skipped: %s is not set, so cron expressions and the paths as kopia server sees them were not checked\n", config.EnvKopiaServerURL)
+		_, _ = fmt.Fprintf(w, "\nkopia server checks skipped: %s is not set, so schedules, the compression algorithm and the paths as kopia server sees them were not checked\n", config.EnvKopiaServerURL)
 		return
 	}
 
@@ -699,7 +744,7 @@ func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 
 	row(labels.KeyEnable, strconv.FormatBool(spec.Enable))
 	row(labels.KeyPath, orNone(strings.Join(spec.Paths, ", "), "(none)"))
-	row(labels.KeySchedule, orNone(strings.Join(spec.Policy.Scheduling.Cron, "; "), "(inherit from the parent policies)"))
+	row(labels.KeySchedule, orNone(strings.Join(scheduleOf(spec.Policy), "; "), "(inherit from the parent policies)"))
 	row(labels.KeySnapshotOnStart, strconv.FormatBool(spec.SnapshotOnStart))
 	row(labels.KeySnapshotOnStop, strconv.FormatBool(spec.SnapshotOnStop))
 	row(labels.KeyMinInterval, minInterval(spec.MinInterval))
@@ -715,6 +760,54 @@ func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 	row(labels.KeyCleanupDeletePinned, strconv.FormatBool(spec.CleanupDeletePinned))
 
 	_ = tw.Flush()
+
+	printPolicyFields(w, spec.Policy)
+}
+
+// scheduleOf returns the cron expressions the policy fields set, those of
+// policy-json if it sets them; as written when they are not a list of
+// strings.
+func scheduleOf(pol backend.PolicyPatch) []string {
+	fields, err := pol.Fields()
+	if err != nil {
+		return pol.Scheduling.Cron
+	}
+
+	for _, f := range fields {
+		if f.Name() != "scheduling.cron" {
+			continue
+		}
+
+		var crons []string
+		if json.Unmarshal(f.Value, &crons) != nil {
+			return []string{string(f.Value)}
+		}
+
+		return crons
+	}
+
+	return nil
+}
+
+// printPolicyFields lists the Kopia policy fields the labels set, but for
+// the cron expressions of the schedule row.
+func printPolicyFields(w io.Writer, pol backend.PolicyPatch) {
+	fields, err := pol.Fields()
+	if err != nil {
+		// The labels report it.
+		return
+	}
+
+	fields = slices.DeleteFunc(fields, func(f backend.Field) bool { return f.Name() == "scheduling.cron" })
+	if len(fields) == 0 {
+		return
+	}
+
+	_, _ = fmt.Fprintln(w, "\npolicy fields:")
+
+	for _, f := range fields {
+		_, _ = fmt.Fprintf(w, "  %s = %s\n", printable(f.Name()), printable(string(f.Value)))
+	}
 }
 
 // printable quotes a value with control characters, so that a newline or a

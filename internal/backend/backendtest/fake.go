@@ -42,6 +42,18 @@ import (
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
 )
 
+// DefaultAlgorithms are the compression algorithms of a new Fake, a part
+// of what kopia 0.23 lists.
+var DefaultAlgorithms = []backend.Algorithm{
+	{Name: "deflate-default"},
+	{Name: "gzip"},
+	{Name: "lz4"},
+	{Name: "pgzip"},
+	{Name: "s2-default"},
+	{Name: "zstd"},
+	{Name: "zstd-fastest"},
+}
+
 // Identity of a new Fake.
 const (
 	DefaultUserName = "root"
@@ -55,18 +67,21 @@ type Method string
 
 // Methods.
 const (
-	ServerIdentity   Method = "ServerIdentity"
-	ResolvePath      Method = "ResolvePath"
-	ListSources      Method = "ListSources"
-	PlanSource       Method = "PlanSource"
-	ApplyPlan        Method = "ApplyPlan"
-	PreviewSchedule  Method = "PreviewSchedule"
-	DeletePolicy     Method = "DeletePolicy"
-	TriggerSnapshot  Method = "TriggerSnapshot"
-	WaitSnapshot     Method = "WaitSnapshot"
-	AnnotateSnapshot Method = "AnnotateSnapshot"
-	ListSnapshots    Method = "ListSnapshots"
-	DeleteSnapshots  Method = "DeleteSnapshots"
+	ServerIdentity Method = "ServerIdentity"
+	ResolvePath    Method = "ResolvePath"
+	ListSources    Method = "ListSources"
+	// CompressionAlgorithms is recorded on every call; the Fake keeps no
+	// cache of its own.
+	CompressionAlgorithms Method = "CompressionAlgorithms"
+	PlanSource            Method = "PlanSource"
+	ApplyPlan             Method = "ApplyPlan"
+	PreviewSchedule       Method = "PreviewSchedule"
+	DeletePolicy          Method = "DeletePolicy"
+	TriggerSnapshot       Method = "TriggerSnapshot"
+	WaitSnapshot          Method = "WaitSnapshot"
+	AnnotateSnapshot      Method = "AnnotateSnapshot"
+	ListSnapshots         Method = "ListSnapshots"
+	DeleteSnapshots       Method = "DeleteSnapshots"
 )
 
 // Call is one recorded call. Only the fields of the method's arguments are
@@ -122,6 +137,8 @@ type Fake struct {
 	missing  map[string]bool // paths that do not exist on kopia server
 	badCrons map[string]bool
 	upcoming []time.Time
+	// algorithms are the compression algorithms kopia server supports.
+	algorithms []backend.Algorithm
 
 	calls       []Call
 	failBefore  map[failKey][]error
@@ -162,6 +179,7 @@ func New() *Fake {
 		sources:     map[backend.Source]*sourceState{},
 		missing:     map[string]bool{},
 		badCrons:    map[string]bool{},
+		algorithms:  slices.Clone(DefaultAlgorithms),
 		failBefore:  map[failKey][]error{},
 		failAfter:   map[failKey][]error{},
 		failRegPut:  map[backend.Source][]error{},
@@ -197,6 +215,15 @@ func (f *Fake) SetClock(now func() time.Time) {
 	defer f.mu.Unlock()
 
 	f.now = now
+}
+
+// SetCompressionAlgorithms replaces the compression algorithms kopia
+// server supports.
+func (f *Fake) SetCompressionAlgorithms(algos ...backend.Algorithm) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.algorithms = slices.Clone(algos)
 }
 
 // SetNormalizer makes the fake store every written policy as fn returns
@@ -687,6 +714,27 @@ func (f *Fake) ListSources(ctx context.Context) ([]backend.SourceStatus, error) 
 			out = append(out, f.sources[src].status.Clone())
 		}
 	}
+
+	return out, nil
+}
+
+// CompressionAlgorithms implements backend.Backend with the algorithms of
+// SetCompressionAlgorithms, DefaultAlgorithms at first, sorted by name.
+func (f *Fake) CompressionAlgorithms(ctx context.Context) ([]backend.Algorithm, error) {
+	after, err := f.enter(ctx, Call{Method: CompressionAlgorithms})
+	if err != nil {
+		return nil, err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if after != nil {
+		return nil, after
+	}
+
+	out := slices.Clone(f.algorithms)
+	slices.SortFunc(out, func(a, b backend.Algorithm) int { return strings.Compare(a.Name, b.Name) })
 
 	return out, nil
 }

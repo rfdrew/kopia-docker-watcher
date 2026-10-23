@@ -152,6 +152,13 @@ type Backend interface {
 	// identity, sorted by path.
 	ListSources(ctx context.Context) ([]SourceStatus, error)
 
+	// CompressionAlgorithms returns the compression algorithms kopia
+	// server supports (GET /api/v1/repo/algorithms), sorted by name. The
+	// list depends only on the build of kopia server, so it is asked once
+	// and kept; a call that fails is not kept. "none", which turns
+	// compression off, is accepted in a policy but not listed.
+	CompressionAlgorithms(ctx context.Context) ([]Algorithm, error)
+
 	// PlanSource works out what ApplyPlan has to do to bring want.Source to
 	// the desired state, from what kopia server has now: whether it knows
 	// the source, and the policy defined for the path. last is what the
@@ -234,6 +241,13 @@ type Backend interface {
 	// /api/v1/snapshots with all=1, so that snapshots of identical
 	// content are listed one by one).
 	ListSnapshots(ctx context.Context, src Source) ([]SnapshotInfo, error)
+}
+
+// Algorithm is a compression algorithm of kopia server.
+type Algorithm struct {
+	Name string
+	// Deprecated algorithms still work, but kopia advises against them.
+	Deprecated bool
 }
 
 // SchedulePreview is the answer of PreviewSchedule.

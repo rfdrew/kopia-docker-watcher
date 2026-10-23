@@ -13,9 +13,12 @@ import (
 // belongs to whoever else edits it (the web UI, the kopia CLI, Terraform)
 // and is kept as it is.
 //
-// A field the labels leave to inheritance is not in the patch. When a field
-// that was in the last applied patch is no longer in the new one, Merge
-// takes it out of the policy, so the policy inherits it again.
+// The typed sections mirror the sections of a Kopia policy: their JSON
+// names are Kopia's, so the JSON form of a section is the part of the
+// policy it sets. A field the labels leave to inheritance is not in the
+// patch: a nil pointer, an empty list or string, or a zero size. When a
+// field that was in the last applied patch is no longer in the new one,
+// Merge takes it out of the policy, so the policy inherits it again.
 //
 // The pause is not part of the patch: it is Desired.Paused, and it is
 // always the watcher's.
@@ -24,16 +27,22 @@ import (
 // applied patch. Fields are only ever added, with omitempty or omitzero,
 // and never renamed.
 type PolicyPatch struct {
-	Scheduling SchedulingPatch `json:"scheduling,omitzero"`
+	Scheduling    SchedulingPatch    `json:"scheduling,omitzero"`
+	Retention     RetentionPatch     `json:"retention,omitzero"`
+	Files         FilesPatch         `json:"files,omitzero"`
+	ErrorHandling ErrorHandlingPatch `json:"errorHandling,omitzero"`
+	Compression   CompressionPatch   `json:"compression,omitzero"`
+	Upload        UploadPatch        `json:"upload,omitzero"`
 
 	// Raw is a JSON object merged into the policy after the typed fields,
 	// for labels that carry policy JSON as is. Objects in it are merged
 	// field by field; any other value, arrays and null included, replaces
 	// the field it names and is owned as a whole. Raw wins over a typed
 	// field with the same name. It must not set scheduling.manual, which
-	// belongs to the pause. kopia server drops fields it does not know and
-	// zero values of plain fields, so such a field never reads back as
-	// written; Applied.StoredHash keeps that from causing a write on every
+	// belongs to the pause, or actions, the commands kopia server would
+	// run. kopia server drops fields it does not know and zero values of
+	// plain fields, so such a field never reads back as written;
+	// Applied.StoredHash keeps that from causing a write on every
 	// reconcile.
 	Raw json.RawMessage `json:"raw,omitempty"`
 }
@@ -44,14 +53,102 @@ type SchedulingPatch struct {
 	// own the field, as when the schedule label is set to an empty value
 	// to inherit the schedule.
 	Cron []string `json:"cron,omitempty"`
+	// IntervalSeconds is written to scheduling.intervalSeconds; zero means
+	// not owned.
+	IntervalSeconds int64 `json:"intervalSeconds,omitempty"`
+	// TimeOfDay is written to scheduling.timeOfDay.
+	TimeOfDay []TimeOfDay `json:"timeOfDay,omitempty"`
+	// RunMissed is written to scheduling.runMissed.
+	RunMissed *bool `json:"runMissed,omitempty"`
+}
+
+// TimeOfDay is one time of day of a schedule, in kopia server's time zone.
+type TimeOfDay struct {
+	Hour   int `json:"hour"`
+	Minute int `json:"min"`
+}
+
+// RetentionPatch is the retention section of a PolicyPatch. A count of
+// zero is owned: it keeps no snapshot of that kind.
+type RetentionPatch struct {
+	KeepLatest               *int  `json:"keepLatest,omitempty"`
+	KeepHourly               *int  `json:"keepHourly,omitempty"`
+	KeepDaily                *int  `json:"keepDaily,omitempty"`
+	KeepWeekly               *int  `json:"keepWeekly,omitempty"`
+	KeepMonthly              *int  `json:"keepMonthly,omitempty"`
+	KeepAnnual               *int  `json:"keepAnnual,omitempty"`
+	IgnoreIdenticalSnapshots *bool `json:"ignoreIdenticalSnapshots,omitempty"`
+}
+
+// FilesPatch is the files section of a PolicyPatch.
+type FilesPatch struct {
+	// Ignore are the ignore rules, in .gitignore syntax.
+	Ignore []string `json:"ignore,omitempty"`
+	// IgnoreDotFiles are the names of the files that hold ignore rules,
+	// such as .kopiaignore.
+	IgnoreDotFiles  []string `json:"ignoreDotFiles,omitempty"`
+	IgnoreCacheDirs *bool    `json:"ignoreCacheDirs,omitempty"`
+	// MaxFileSize is in bytes; zero means not owned.
+	MaxFileSize   int64 `json:"maxFileSize,omitempty"`
+	OneFileSystem *bool `json:"oneFileSystem,omitempty"`
+}
+
+// ErrorHandlingPatch is the errorHandling section of a PolicyPatch.
+type ErrorHandlingPatch struct {
+	IgnoreFileErrors      *bool `json:"ignoreFileErrors,omitempty"`
+	IgnoreDirectoryErrors *bool `json:"ignoreDirectoryErrors,omitempty"`
+	IgnoreUnknownTypes    *bool `json:"ignoreUnknownTypes,omitempty"`
+}
+
+// CompressionPatch is the compression section of a PolicyPatch.
+type CompressionPatch struct {
+	// CompressorName is a compression algorithm kopia server supports
+	// (Backend.CompressionAlgorithms), or "none".
+	CompressorName string `json:"compressorName,omitempty"`
+	// MinSize and MaxSize are in bytes; zero means not owned.
+	MinSize int64 `json:"minSize,omitempty"`
+	MaxSize int64 `json:"maxSize,omitempty"`
+	// OnlyCompress and NeverCompress are file extensions with the dot,
+	// such as .txt.
+	OnlyCompress  []string `json:"onlyCompress,omitempty"`
+	NeverCompress []string `json:"neverCompress,omitempty"`
+}
+
+// UploadPatch is the upload section of a PolicyPatch.
+type UploadPatch struct {
+	MaxParallelFileReads *int `json:"maxParallelFileReads,omitempty"`
 }
 
 // IsZero reports whether s sets nothing.
-func (s SchedulingPatch) IsZero() bool { return len(s.Cron) == 0 }
+func (s SchedulingPatch) IsZero() bool {
+	return len(s.Cron) == 0 && s.IntervalSeconds == 0 && len(s.TimeOfDay) == 0 && s.RunMissed == nil
+}
+
+// IsZero reports whether r sets nothing.
+func (r RetentionPatch) IsZero() bool { return r == RetentionPatch{} }
+
+// IsZero reports whether f sets nothing.
+func (f FilesPatch) IsZero() bool {
+	return len(f.Ignore) == 0 && len(f.IgnoreDotFiles) == 0 && f.IgnoreCacheDirs == nil && f.MaxFileSize == 0 &&
+		f.OneFileSystem == nil
+}
+
+// IsZero reports whether e sets nothing.
+func (e ErrorHandlingPatch) IsZero() bool { return e == ErrorHandlingPatch{} }
+
+// IsZero reports whether c sets nothing.
+func (c CompressionPatch) IsZero() bool {
+	return c.CompressorName == "" && c.MinSize == 0 && c.MaxSize == 0 && len(c.OnlyCompress) == 0 &&
+		len(c.NeverCompress) == 0
+}
+
+// IsZero reports whether u sets nothing.
+func (u UploadPatch) IsZero() bool { return u == UploadPatch{} }
 
 // IsZero reports whether p sets nothing.
 func (p PolicyPatch) IsZero() bool {
-	return p.Scheduling.IsZero() && isNull(p.Raw)
+	return p.Scheduling.IsZero() && p.Retention.IsZero() && p.Files.IsZero() && p.ErrorHandling.IsZero() &&
+		p.Compression.IsZero() && p.Upload.IsZero() && isNull(p.Raw)
 }
 
 // Field is one policy field a patch owns: the path of object keys from the
@@ -67,36 +164,43 @@ func (f Field) Name() string { return strings.Join(f.Path, ".") }
 // manualField is the scheduling field of the pause.
 var manualField = []string{"scheduling", "manual"}
 
+// actionsSection is the section of the commands kopia server runs before
+// and after a snapshot. The watcher never sets it: the commands would run
+// on kopia server, which has to allow them.
+const actionsSection = "actions"
+
 // Fields returns the fields p owns, sorted by path: the typed fields, then
 // the leaves of Raw on top. An invalid patch is an ErrConfig error.
 func (p PolicyPatch) Fields() ([]Field, error) {
 	byName := map[string]Field{}
 
-	if len(p.Scheduling.Cron) > 0 {
-		v, err := encode(p.Scheduling.Cron)
-		if err != nil {
-			return nil, configError(err)
-		}
+	typed := p
+	typed.Raw = nil
 
-		f := Field{Path: []string{"scheduling", "cron"}, Value: v}
+	enc, err := encode(typed)
+	if err != nil {
+		return nil, configError(err)
+	}
+
+	// The sections' JSON names are Kopia's and unset fields are omitted,
+	// so the leaves of the typed sections are the fields they own; a list
+	// such as timeOfDay is one leaf.
+	fields, err := leaves(enc)
+	if err != nil {
+		return nil, configError(err)
+	}
+
+	for _, f := range fields {
 		byName[f.Name()] = f
 	}
 
 	if !isNull(p.Raw) {
-		if !isObject(p.Raw) {
-			return nil, configError(fmt.Errorf("raw policy must be a JSON object, got %s", truncate(p.Raw)))
-		}
-
-		raw, err := leaves(p.Raw)
+		raw, err := rawFields(p.Raw)
 		if err != nil {
-			return nil, configError(fmt.Errorf("raw policy: %w", err))
+			return nil, err
 		}
 
 		for _, f := range raw {
-			if slices.Equal(f.Path, manualField) {
-				return nil, configError(errors.New("raw policy must not set scheduling.manual: the watcher pauses a source when all its containers are stopped"))
-			}
-
 			byName[f.Name()] = f
 		}
 	}
@@ -115,6 +219,57 @@ func (p PolicyPatch) Fields() ([]Field, error) {
 	}
 
 	return out, nil
+}
+
+// rawFields returns the leaves of a Raw patch, checking that it is a JSON
+// object that sets neither the pause nor actions.
+func rawFields(raw json.RawMessage) ([]Field, error) {
+	if !isObject(raw) {
+		return nil, configError(fmt.Errorf("raw policy must be a JSON object, got %s", truncate(raw)))
+	}
+
+	obj, err := parseObject(raw)
+	if err != nil {
+		return nil, configError(fmt.Errorf("raw policy: %w", err))
+	}
+
+	// kopia server decodes a policy without regard to case, so the keys
+	// are compared that way. An empty object has no leaves, so these are
+	// checked by key.
+	for k, v := range obj {
+		switch {
+		case strings.EqualFold(k, actionsSection):
+			return nil, configError(errors.New("raw policy must not set actions: they would run commands on kopia server"))
+		case !strings.EqualFold(k, manualField[0]) || !isObject(v):
+			continue
+		}
+
+		sched, err := parseObject(v)
+		if err != nil {
+			return nil, configError(fmt.Errorf("raw policy: %w", err))
+		}
+
+		for f := range sched {
+			if strings.EqualFold(f, manualField[1]) {
+				return nil, configError(errors.New("raw policy must not set scheduling.manual: the watcher pauses a source when all its containers are stopped"))
+			}
+		}
+	}
+
+	fields, err := leaves(raw)
+	if err != nil {
+		return nil, configError(fmt.Errorf("raw policy: %w", err))
+	}
+
+	// A field is known by its dotted name, so a key with a dot would pass
+	// for a nested field.
+	for _, f := range fields {
+		if slices.ContainsFunc(f.Path, func(k string) bool { return strings.Contains(k, ".") }) {
+			return nil, configError(fmt.Errorf("raw policy field %q has a key with a dot", f.Path))
+		}
+	}
+
+	return fields, nil
 }
 
 // Validate reports an invalid patch as an ErrConfig error.
@@ -160,10 +315,52 @@ func configError(err error) error {
 
 // Clone returns a deep copy of p.
 func (p PolicyPatch) Clone() PolicyPatch {
-	return PolicyPatch{
-		Scheduling: SchedulingPatch{Cron: slices.Clone(p.Scheduling.Cron)},
-		Raw:        slices.Clone(p.Raw),
+	out := p
+
+	out.Scheduling.Cron = slices.Clone(p.Scheduling.Cron)
+	out.Scheduling.TimeOfDay = slices.Clone(p.Scheduling.TimeOfDay)
+	out.Scheduling.RunMissed = clonePtr(p.Scheduling.RunMissed)
+
+	out.Retention = RetentionPatch{
+		KeepLatest:               clonePtr(p.Retention.KeepLatest),
+		KeepHourly:               clonePtr(p.Retention.KeepHourly),
+		KeepDaily:                clonePtr(p.Retention.KeepDaily),
+		KeepWeekly:               clonePtr(p.Retention.KeepWeekly),
+		KeepMonthly:              clonePtr(p.Retention.KeepMonthly),
+		KeepAnnual:               clonePtr(p.Retention.KeepAnnual),
+		IgnoreIdenticalSnapshots: clonePtr(p.Retention.IgnoreIdenticalSnapshots),
 	}
+
+	out.Files.Ignore = slices.Clone(p.Files.Ignore)
+	out.Files.IgnoreDotFiles = slices.Clone(p.Files.IgnoreDotFiles)
+	out.Files.IgnoreCacheDirs = clonePtr(p.Files.IgnoreCacheDirs)
+	out.Files.OneFileSystem = clonePtr(p.Files.OneFileSystem)
+
+	out.ErrorHandling = ErrorHandlingPatch{
+		IgnoreFileErrors:      clonePtr(p.ErrorHandling.IgnoreFileErrors),
+		IgnoreDirectoryErrors: clonePtr(p.ErrorHandling.IgnoreDirectoryErrors),
+		IgnoreUnknownTypes:    clonePtr(p.ErrorHandling.IgnoreUnknownTypes),
+	}
+
+	out.Compression.OnlyCompress = slices.Clone(p.Compression.OnlyCompress)
+	out.Compression.NeverCompress = slices.Clone(p.Compression.NeverCompress)
+
+	out.Upload.MaxParallelFileReads = clonePtr(p.Upload.MaxParallelFileReads)
+
+	out.Raw = slices.Clone(p.Raw)
+
+	return out
+}
+
+// clonePtr returns a copy of *v in a new variable; nil for nil.
+func clonePtr[T any](v *T) *T {
+	if v == nil {
+		return nil
+	}
+
+	c := *v
+
+	return &c
 }
 
 // union returns a patch that owns the fields of a and b, with b's value

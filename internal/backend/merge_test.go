@@ -217,10 +217,10 @@ func TestMerge(t *testing.T) {
 		},
 		{
 			name:    "an object the removal empties goes too",
-			current: `{"actions":{"beforeSnapshotRoot":{"script":"x.sh"},"afterSnapshotRoot":{"script":"y.sh"}}}`,
+			current: `{"logging":{"directories":{"snapshotted":{"minLevel":5}},"entries":{"snapshotted":{"minLevel":3}}}}`,
 			want:    Desired{},
-			last:    Applied{Patch: PolicyPatch{Raw: json.RawMessage(`{"actions":{"beforeSnapshotRoot":{"script":"x.sh"}}}`)}},
-			policy:  `{"actions":{"afterSnapshotRoot":{"script":"y.sh"}}}`,
+			last:    Applied{Patch: PolicyPatch{Raw: json.RawMessage(`{"logging":{"directories":{"snapshotted":{"minLevel":5}}}}`)}},
+			policy:  `{"logging":{"entries":{"snapshotted":{"minLevel":3}}}}`,
 			changed: true,
 		},
 		{
@@ -252,13 +252,13 @@ func TestMerge(t *testing.T) {
 		},
 		{
 			name:    "an empty object the watcher does not own stays",
-			current: `{"actions":{"beforeSnapshotRoot":{}},"scheduling":{"cron":["0 * * * *"]}}`,
+			current: `{"logging":{"directories":{}},"scheduling":{"cron":["0 * * * *"]}}`,
 			want:    Desired{Patch: cronPatch("5 * * * *")},
 			last: Applied{Patch: PolicyPatch{
 				Scheduling: SchedulingPatch{Cron: []string{"0 * * * *"}},
-				Raw:        json.RawMessage(`{"actions":{"beforeSnapshotRoot":{"script":"x.sh"}}}`),
+				Raw:        json.RawMessage(`{"logging":{"directories":{"snapshotted":{"minLevel":5}}}}`),
 			}},
-			policy:  `{"actions":{"beforeSnapshotRoot":{}},"scheduling":{"cron":["5 * * * *"]}}`,
+			policy:  `{"logging":{"directories":{}},"scheduling":{"cron":["5 * * * *"]}}`,
 			changed: true,
 		},
 		{

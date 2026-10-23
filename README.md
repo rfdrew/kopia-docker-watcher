@@ -26,15 +26,18 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
   containers and brings the source of one path in line with the labels of every container that names that path,
   stopped containers included. A full reconcile every `RECONCILE_INTERVAL` (5 minutes by default) catches
   anything an event missed.
-- The policy of a path is merged, not replaced: the watcher writes only the fields its labels set (in v0.1.0 the
-  schedule) and the pause. Retention, compression, ignore rules and anything else you set in the Kopia web UI stay
-  as they are.
+- The policy of a path is merged, not replaced: the watcher writes only the fields its labels set (the schedule,
+  and retention, compression, ignore rules and the other fields of the policy labels) and the pause. Anything
+  else you set in the Kopia web UI stays as it is, and a field whose label is removed goes back to inheriting.
 - What the watcher has applied, the snapshots it waits for, and which containers own each source are kept in
   `STATE_FILE`, a small JSON file that must live on a volume.
 
-## What v0.1.0 does
+## What it does
 
 - Registers a source per path of `kopia.path` and keeps `scheduling.cron` in line with `kopia.schedule`.
+- Sets the fields of the path's policy that the [policy labels](docs/labels.md#policy-labels) ask for: an
+  interval or times of day, retention, ignore rules and file limits, error handling, compression (checked
+  against the algorithms kopia server has), parallel file reads, and any other field with `kopia.policy-json`.
 - Pauses a source (`scheduling.manual=true`) while all its containers are stopped and restores the previous
   schedule when one starts again. A crash-looping container does not toggle the pause.
 - Takes a snapshot at a container start (`kopia.snapshot-on-start`, rate-limited by `kopia.min-interval`) and
@@ -52,31 +55,22 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
 - Serves Prometheus metrics on `/metrics`: when each source last had a complete snapshot (scheduled ones
   included), failures and durations of the watcher's own snapshots, reconcile errors, and the managed sources
   with their containers. See [docs/metrics.md](docs/metrics.md).
+- Checks on `/healthz` that Docker answers, that kopia server answers with a repository connected, and that the
+  reconcile loop is not stuck, and answers 503 when one of them has failed for a while; the image's
+  `HEALTHCHECK` uses it. See [the health check](docs/configuration.md#health-check).
+- Posts a notification to `NOTIFY_WEBHOOK_URL` when a path starts failing (a failed snapshot of the watcher,
+  labels that cannot be applied, kopia server failing for a while) and when it works again, once each, as JSON or
+  for ntfy, Slack or Telegram. See [notifications](docs/configuration.md#notifications).
+- Sets kopia server's upload, download and storage operation limits from the `KOPIA_THROTTLE_` variables; unset,
+  it leaves them to kopia server or Terraform. See [throttle](docs/configuration.md#throttle).
+  [docs/terraform.md](docs/terraform.md) splits kopia server's configuration between the watcher and
+  terraform-provider-kopia.
 
-Not in v0.1.0:
+Not supported yet:
 
-- **No full health check.** `/healthz` answers 200 while the process serves HTTP; it does not check Docker,
-  kopia server or the reconcile loop. Added after v0.1.0, see below.
-- **No webhook.** `NOTIFY_WEBHOOK_URL` is read and validated, but nothing is sent to it. Added after v0.1.0, see
-  below.
-- No policy labels beyond the schedule (retention, compression, ignore rules, …), no `kopia.volumes`, no hooks
-  (`pre-exec`, `stop-during-backup`, …). These label names are reserved: the watcher warns that they are not
-  supported by this version and ignores them.
+- No `kopia.volumes`, no hooks (`pre-exec`, `stop-during-backup`, …). These label names are reserved: the
+  watcher warns that they are not supported by this version and ignores them.
 - No snapshot tags: kopia server cannot set them through its API yet, so `kopia.tags` go into the description.
-
-## Since v0.1.0 (unreleased)
-
-- **Health check.** `/healthz` checks that Docker answers, that kopia server answers with a repository
-  connected, and that the reconcile loop is not stuck, and answers 503 when one of them has failed for a while.
-  The image's `HEALTHCHECK` uses it. See [the health check](docs/configuration.md#health-check).
-- **Notifications.** With `NOTIFY_WEBHOOK_URL` the watcher posts a notification when a path starts failing (a
-  failed snapshot of the watcher, labels that cannot be applied, kopia server failing for a while) and
-  when it works again, once each, as JSON or for ntfy, Slack or Telegram. See
-  [notifications](docs/configuration.md#notifications).
-- **Throttle.** The `KOPIA_THROTTLE_` variables set kopia server's upload, download and storage operation
-  limits; unset, the watcher leaves them to kopia server or Terraform. See [throttle](docs/configuration.md#throttle).
-- **With Terraform.** [docs/terraform.md](docs/terraform.md) splits kopia server's configuration between the
-  watcher and terraform-provider-kopia.
 
 ## Requirements
 
@@ -162,8 +156,8 @@ The image runs `kopia-docker-watcher run` by default.
 
 `--strict` turns every label warning into an error. Without `KOPIA_SERVER_URL`, `validate` checks only the
 labels; with it, `validate` needs the full watcher configuration (credentials, TLS) and a kopia server with a
-connected repository, and kopia server also normalizes every path and computes the next snapshot times of the
-schedule, which rejects a bad cron expression. Neither checks that a path exists. `validate` exits 0 if the
+connected repository, and kopia server also normalizes every path, computes the next snapshot times of the
+schedule, which rejects a bad cron expression, and checks the compression algorithm. Neither checks that a path exists. `validate` exits 0 if the
 labels can be applied (warnings allowed), 1 if not or if Docker or kopia server could not be asked, and 2 on a
 usage or configuration error. `run --help` and `validate --help` print the full usage and exit codes.
 

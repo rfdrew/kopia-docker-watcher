@@ -46,3 +46,27 @@ func (c *Client) RepoStatus(ctx context.Context) (*RepoStatus, error) {
 
 	return &st, nil
 }
+
+// AlgorithmInfo is one algorithm of GET /api/v1/repo/algorithms.
+type AlgorithmInfo struct {
+	ID         string `json:"id"`
+	Deprecated bool   `json:"deprecated"`
+}
+
+// SupportedAlgorithms is the response of GET /api/v1/repo/algorithms: the
+// algorithms of this build of kopia server. Only the compression ones
+// matter to the watcher.
+type SupportedAlgorithms struct {
+	Compression []AlgorithmInfo `json:"compression"`
+}
+
+// SupportedAlgorithms returns the algorithms kopia server supports. It
+// works without a connected repository.
+func (c *Client) SupportedAlgorithms(ctx context.Context) (*SupportedAlgorithms, error) {
+	var res SupportedAlgorithms
+	if err := c.call(ctx, request{method: http.MethodGet, path: "repo/algorithms"}, &res); err != nil {
+		return nil, err
+	}
+
+	return &res, nil
+}

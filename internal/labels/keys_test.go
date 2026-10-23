@@ -70,7 +70,7 @@ func TestPythonLabelsSupported(t *testing.T) {
 		}
 	}
 
-	if !slices.Contains(plannedKeys, "compression.algorithm") || slices.Contains(knownKeys(), "compression") {
+	if !slices.Contains(knownKeys(), "compression.algorithm") || slices.Contains(knownKeys(), "compression") {
 		t.Error("the compression algorithm must be kopia.compression.algorithm")
 	}
 }
