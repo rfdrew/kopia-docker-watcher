@@ -223,7 +223,7 @@ func TestVolumeEventsOfNewContainer(t *testing.T) {
 	passes := h.start()
 
 	id := h.engine.runMounted("shop-db-1", []docker.Mount{dataMount, configMount}, enable, shopLabel,
-		volumesLabel("data,/etc/shop"), onStop, noInterval)
+		volumesLabel("data,/etc/shop"), onStop, noOnStart)
 	h.r.HandleEvent(h.engine.event(docker.KindStarted, id))
 
 	waitPasses(t, passes, shopData, shopConfig)
