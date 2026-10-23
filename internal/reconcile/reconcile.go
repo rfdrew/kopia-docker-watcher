@@ -409,10 +409,12 @@ type Reconciler struct {
 	reportedLost map[waitKey]bool
 
 	// mounts holds the volume paths of the containers last listed or
-	// inspected; inspects the events of containers with the volumes label
+	// inspected, removed the containers removed since the last full
+	// listing; inspects the events of containers with the volumes label
 	// whose inspect is due, in their order, and inspectWake signals a new
 	// one. See volumes.go.
 	mounts      map[string][]string
+	removed     map[string]bool
 	inspects    []volumeEvent
 	inspectWake chan struct{}
 
@@ -510,6 +512,7 @@ func New(opts Options) (*Reconciler, error) {
 		deferred:       map[string]bool{},
 		sweepDue:       map[string]bool{},
 		mounts:         map[string][]string{},
+		removed:        map[string]bool{},
 		inspectWake:    make(chan struct{}, 1),
 		passStarts:     map[string]time.Time{},
 

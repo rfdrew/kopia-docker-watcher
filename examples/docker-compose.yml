@@ -172,13 +172,10 @@ services:
     volumes:
       - notes:/notes
       - /etc/localtime:/etc/localtime:ro
-    tmpfs:
-      - /tmp
     labels:
       kopia.enable: "true"
       # The volume by its short name; "/notes" (the mount destination) or "*"
-      # pick it too. "*" skips the read-only /etc/localtime and warns about
-      # the tmpfs unless kopia.exclude-volumes lists /tmp.
+      # pick it too. "*" skips the read-only /etc/localtime.
       kopia.volumes: "notes"
       kopia.schedule: "0 4 * * *"
 

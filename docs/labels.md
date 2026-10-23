@@ -193,7 +193,14 @@ volumes:
   volume of a driver other than `local` (its data has no directory on the host), a socket such as
   `/var/run/docker.sock` (a bind mount whose host path ends in `.sock`), and a mount Docker reports no host path
   for. With `*` these warnings come for every such mount the container can write to; list them in
-  [`kopia.exclude-volumes`](#kopiaexclude-volumes) to silence them.
+  [`kopia.exclude-volumes`](#kopiaexclude-volumes) to silence them. A tmpfs of `docker run --tmpfs` or the compose
+  `tmpfs:` key is not among the mounts Docker reports: it is neither picked nor warned about, and naming it is an
+  error (in `kopia.exclude-volumes`, a warning).
+- **A `local` volume with `driver_opts`**, such as an NFS or CIFS share, is mounted by Docker on the host at its
+  `_data` directory only while a container uses it. A kopia server container that mounts `/var/lib/docker/volumes`
+  with the default propagation does not see such a mount and backs up an empty directory. Mount the directory with
+  `rslave` propagation (`/var/lib/docker/volumes:/var/lib/docker/volumes:ro,rslave`), or back up the share where
+  it lives.
 - **An error:** an item that names no volume or mount destination of the container, and one that is not a volume
   name (letters, digits, `_`, `.` and `-`, starting with a letter or digit), an absolute path or `*`. A label that
   picks nothing to back up is a warning, or an error when `kopia.path` is not set either.
@@ -204,7 +211,10 @@ volumes:
   path](#kopiapath): with `kopia.volumes`, each of them is an owner.
 - Docker's events do not carry the mounts. When a container with `kopia.volumes` starts, stops or is removed, the
   watcher queues the sources it last saw for that container and those the state records it as an owner of, and,
-  unless it was removed, lists the containers to find the sources its mounts make now.
+  unless it was removed, lists the containers to find the sources its mounts make now. A container removed
+  before the watcher listed it even once, such as a `docker run --rm` of a few seconds, leaves no trace of its
+  mounts: its sources get no events, so no snapshot at its stop, and the next full reconcile
+  (`RECONCILE_INTERVAL`) pauses them.
 - `validate --container` and `validate --all` list the sources the mounts make, naming the mount of each:
   `volume shop_data at /var/lib/postgresql/data -> /var/lib/docker/volumes/shop_data/_data`. With labels given on
   the command line there is no container, and `validate` says so instead.

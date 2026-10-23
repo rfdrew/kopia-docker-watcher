@@ -17,9 +17,13 @@ import (
 //     in a listing or an inspect, and those the state records it as an
 //     owner of: all that is left after the container is removed;
 //   - after a listing of the containers, which runs in the order of the
-//     events outside HandleEvent, the paths its mounts make now.
+//     events outside HandleEvent, the paths its mounts make now. One
+//     listing serves all the events that wait for it.
 //
-// Each path gets the event once.
+// Each path gets the event once. A container removed before any listing
+// saw it, such as a short docker run --rm, leaves no trace of its mounts:
+// its events queue none of its volume sources, which the next full
+// reconcile finds without the events.
 
 // volumeEvent is an event waiting for the listing of its container, with
 // the paths it was already queued for.
@@ -47,13 +51,15 @@ func (r *Reconciler) noteMounts(pc parsed) {
 }
 
 // forgetMounts drops the volume paths of the containers a listing did not
-// have. r.mu is held.
+// have, and the removals handled since the last one. r.mu is held.
 func (r *Reconciler) forgetMounts(seen map[string]bool) {
 	for id := range r.mounts {
 		if !seen[id] {
 			delete(r.mounts, id)
 		}
 	}
+
+	clear(r.removed)
 }
 
 // handleVolumeEvent queues the paths of an event of a container with the
@@ -72,7 +78,11 @@ func (r *Reconciler) handleVolumeEvent(ev docker.Event, queued []string) {
 	defer r.mu.Unlock()
 
 	if ev.Kind == docker.KindRemoved {
+		// A listing that began before the removal must not record the
+		// mounts again.
 		delete(r.mounts, ev.ContainerID)
+		r.removed[ev.ContainerID] = true
+
 		return
 	}
 
@@ -128,55 +138,64 @@ func (r *Reconciler) queueEvent(ev docker.Event, paths, queued []string) []strin
 func (r *Reconciler) inspectLoop(ctx context.Context) {
 	for {
 		r.mu.Lock()
-
-		if len(r.inspects) == 0 {
-			r.mu.Unlock()
-
-			select {
-			case <-ctx.Done():
-				return
-			case <-r.inspectWake:
-				continue
-			}
-		}
-
-		ve := r.inspects[0]
-		r.inspects = r.inspects[1:]
+		batch := r.inspects
+		r.inspects = nil
 		r.mu.Unlock()
 
-		r.inspectVolumes(ctx, ve)
+		if len(batch) > 0 {
+			r.inspectVolumes(ctx, batch)
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.inspectWake:
+		}
 	}
 }
 
-// inspectVolumes looks up the container of ve in a listing and queues the
-// paths its mounts make. A container that is gone has nothing more to
-// queue; if Docker fails, a full reconcile finds the paths, though without
-// the event.
-func (r *Reconciler) inspectVolumes(ctx context.Context, ve volumeEvent) {
+// inspectVolumes looks up the containers of the events in one listing and
+// queues the paths their mounts make, in the order of the events. A
+// container that is gone has nothing more to queue; if Docker fails, a full
+// reconcile finds the paths, though without the events.
+func (r *Reconciler) inspectVolumes(ctx context.Context, batch []volumeEvent) {
 	containers, err := r.containers(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
-			r.log.Warn("cannot list the containers for the paths of a container's volumes; reconciling everything",
-				"container", ve.ev.Name, "error", err.Error())
+			r.log.Warn("cannot list the containers for the paths of their volumes; reconciling everything",
+				"containers", len(batch), "error", err.Error())
 			r.ReconcileAll()
 		}
 
 		return
 	}
 
-	i := slices.IndexFunc(containers, func(c docker.Container) bool { return c.ID == ve.ev.ContainerID })
-	if i < 0 {
-		return
+	parsedByID := map[string]parsed{}
+
+	for _, ve := range batch {
+		id := ve.ev.ContainerID
+
+		pc, ok := parsedByID[id]
+		if !ok {
+			i := slices.IndexFunc(containers, func(c docker.Container) bool { return c.ID == id })
+			if i < 0 {
+				continue
+			}
+
+			pc = r.parse(containers[i])
+			parsedByID[id] = pc
+			r.reportLabels(pc)
+
+			r.mu.Lock()
+			if !r.removed[id] {
+				r.noteMounts(pc)
+			}
+			r.mu.Unlock()
+		}
+
+		r.queueEvent(ve.ev, pc.volumePaths, ve.queued)
 	}
-
-	pc := r.parse(containers[i])
-	r.reportLabels(pc)
-
-	r.mu.Lock()
-	r.noteMounts(pc)
-	r.mu.Unlock()
-
-	r.queueEvent(ve.ev, pc.volumePaths, ve.queued)
 }
 
 // eventOwner parses the labels of the container of an event that queued

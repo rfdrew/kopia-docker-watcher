@@ -232,13 +232,23 @@ func TestVolumeEventsOfNewContainer(t *testing.T) {
 	h.engine.setState(id, docker.StateExited)
 	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
 
-	waitPass(t, passes, shopData, succeeded)
+	waitPasses(t, passes, shopData, shopConfig)
 	eventually(t, "the stop snapshot and the pause", func() bool {
-		return h.paused(shopData) && len(h.fake.CallsFor(h.src(shopData), backendtest.TriggerSnapshot)) == 1
+		return h.paused(shopData) && h.paused(shopConfig) && len(h.fake.CallsFor(h.src(shopData), backendtest.TriggerSnapshot)) == 1
 	})
 
+	// The removal queues both sources from the cached mounts: their owner
+	// is gone.
 	h.r.HandleEvent(h.engine.remove(id))
-	waitPass(t, passes, shopConfig, succeeded)
+	eventually(t, "the owners are gone", func() bool {
+		for _, p := range []string{shopData, shopConfig} {
+			if o := h.record(p).Owners; len(o) != 1 || o[0].Gone.IsZero() {
+				return false
+			}
+		}
+
+		return true
+	})
 
 	h.r.mu.Lock()
 	_, cached := h.r.mounts[id]
