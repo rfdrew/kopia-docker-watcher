@@ -1,9 +1,9 @@
-// Package metrics serves the watcher's HTTP endpoints on LISTEN_ADDR.
+// Package metrics serves the watcher's HTTP endpoints on LISTEN_ADDR:
 //
-// For now only /healthz exists, answering 200 while the process serves
-// HTTP; it backs the image's HEALTHCHECK through the healthcheck
-// subcommand. Checks of Docker, kopia server and the reconcile loop, and
-// /metrics, come later.
+//   - /healthz answers 200 while the process serves HTTP; it backs the
+//     image's HEALTHCHECK through the healthcheck subcommand. Checks of
+//     Docker, kopia server and the reconcile loop come later;
+//   - /metrics serves Metrics in the Prometheus text format.
 package metrics
 
 import (
@@ -15,19 +15,25 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// HealthzPath is the health endpoint.
-const HealthzPath = "/healthz"
+// The endpoints.
+const (
+	HealthzPath = "/healthz"
+	MetricsPath = "/metrics"
+)
 
-// Handler returns the HTTP handler with all endpoints.
-func Handler() http.Handler {
+// Handler returns the HTTP handler with all endpoints; /metrics serves m.
+func Handler(m *Metrics) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+HealthzPath, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = io.WriteString(w, `{"status":"ok"}`+"\n")
 	})
+	mux.Handle("GET "+MetricsPath, promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{}))
 
 	return mux
 }
@@ -38,11 +44,11 @@ type Server struct {
 	ln  net.Listener
 }
 
-// NewServer serves on ln until Shutdown.
-func NewServer(ln net.Listener, log *slog.Logger) *Server {
+// NewServer serves Handler(m) on ln until Shutdown.
+func NewServer(ln net.Listener, log *slog.Logger, m *Metrics) *Server {
 	return &Server{
 		srv: &http.Server{
-			Handler:           Handler(),
+			Handler:           Handler(m),
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       10 * time.Second,
 			WriteTimeout:      10 * time.Second,

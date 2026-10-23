@@ -159,6 +159,23 @@
 // again. A path with a restarting owner is looked at again after
 // RestartRecheck, since a restarting container can end up exited without
 // any event.
+//
+// # Metrics
+//
+// Besides the errors, the reconciler reports to Metrics the sources it
+// manages. A pass whose policy step succeeded reports its source: paused
+// or not, its owners, and the start of its last complete snapshot. That is
+// kopia server's last snapshot unless it is a checkpoint of an upload or
+// incomplete otherwise, when the source's snapshots are listed, once for
+// each such last snapshot; so the snapshots kopia server takes on schedule
+// count too, which are most of them. A pass after which the state has no
+// record of the source, or kopia server does not know it and the pass did
+// not register it, or whose path is outside WATCHER_PATH_PREFIX, drops
+// what was reported about the path; a pass that fails before its policy
+// step leaves it as it was. The snapshot waiters report how each snapshot
+// the watcher queued ended, and the passes the runs kopia server lost
+// track of that saved no snapshot. A dry run reports nothing but the
+// errors.
 package reconcile
 
 import (
@@ -242,19 +259,11 @@ const (
 	ReasonState Reason = "state"
 )
 
-// Metrics counts what goes wrong. The no-op default stands in until the
-// watcher serves /metrics.
-type Metrics interface {
-	// ReconcileError counts one problem with a path. The path is empty for
-	// a problem that is not about one source: the label errors of a
-	// container, counted once per container and set of labels, and a full
-	// reconcile that cannot list the containers.
-	ReconcileError(path string, reason Reason)
+// Reasons returns every Reason, in the order above.
+func Reasons() []Reason {
+	return []Reason{ReasonLabels, ReasonOwnersDisagree, ReasonConfig, ReasonTemporary, ReasonUnavailable,
+		ReasonFailed, ReasonDocker, ReasonState}
 }
-
-type noMetrics struct{}
-
-func (noMetrics) ReconcileError(string, Reason) {}
 
 // Options configure a Reconciler.
 type Options struct {
@@ -264,7 +273,7 @@ type Options struct {
 
 	// Logger receives the log; nil discards it.
 	Logger *slog.Logger
-	// Metrics counts problems; nil counts nothing.
+	// Metrics receives the metrics; nil reports nothing.
 	Metrics Metrics
 
 	// HostPrefix is HOST_PREFIX: empty or a clean absolute path.
@@ -382,6 +391,12 @@ type Reconciler struct {
 	sweepDue map[string]bool
 	// warned holds the keys of the warnings logged once per process.
 	warned map[string]bool
+	// lastComplete holds per path the last complete snapshot found while
+	// the source's last snapshot is incomplete. reportedLost holds the
+	// waits whose lost run was reported to Metrics: one entry for each
+	// run kopia server lost, which is rare.
+	lastComplete map[string]lastComplete
+	reportedLost map[waitKey]bool
 
 	// dockerTimeout bounds every container listing.
 	dockerTimeout time.Duration
@@ -464,6 +479,8 @@ func New(opts Options) (*Reconciler, error) {
 		dockerTimeout:  dockerTimeout,
 		waiting:        map[waitKey]bool{},
 		warned:         map[string]bool{},
+		lastComplete:   map[string]lastComplete{},
+		reportedLost:   map[waitKey]bool{},
 		deferred:       map[string]bool{},
 		sweepDue:       map[string]bool{},
 

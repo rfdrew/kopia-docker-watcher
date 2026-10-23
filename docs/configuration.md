@@ -211,9 +211,14 @@ cleans them up.
 
 ### `LISTEN_ADDR`
 
-The address of the watcher's HTTP server. Default `:8080`. In v0.1.0 it serves only `GET /healthz`, which
-answers `{"status":"ok"}` while the process serves HTTP. It does not check Docker, kopia server or the
-reconcile loop yet, and there is no `/metrics` yet.
+The address of the watcher's HTTP server. Default `:8080`. It serves:
+
+- `GET /healthz`, which answers `{"status":"ok"}` while the process serves HTTP. It does not check Docker,
+  kopia server or the reconcile loop yet.
+- `GET /metrics`, the Prometheus metrics: see [metrics.md](metrics.md).
+
+Neither has authentication or TLS, and the metrics name your source paths and containers: keep the address on a
+network you trust, and do not publish the port beyond it.
 
 The image's `HEALTHCHECK` runs `kopia-docker-watcher healthcheck`, which reads `LISTEN_ADDR` and requests
 `/healthz` there, on the loopback address when `LISTEN_ADDR` listens on all interfaces (`:port`, `0.0.0.0`,

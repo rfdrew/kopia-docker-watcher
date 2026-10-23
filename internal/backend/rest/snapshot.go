@@ -193,6 +193,7 @@ func taskNumber(id string) (uint64, bool) {
 // and the outcome is SnapshotUnknown. A canceled task's snapshot is looked
 // up the same way. The error message of a failed task comes with the error
 // lines of its log (GET /api/v1/tasks/{id}/logs), if the log can be read.
+// A result told from the run's task carries the task's start and end.
 //
 // A request that fails ends the wait with its error, of the kinds of a
 // read; the caller waits again with the last ticket save received.
@@ -258,7 +259,16 @@ func (b *Backend) WaitSnapshot(ctx context.Context, ticket backend.SnapshotTicke
 
 		if task != nil {
 			if res, done, err := b.outcome(ctx, src, task); done {
-				return res, err
+				if err != nil {
+					return backend.SnapshotResult{}, err
+				}
+
+				res.TaskStart = task.StartTime
+				if task.EndTime != nil {
+					res.TaskEnd = *task.EndTime
+				}
+
+				return res, nil
 			}
 		}
 

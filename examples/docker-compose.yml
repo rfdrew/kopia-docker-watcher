@@ -96,6 +96,9 @@ services:
     # The watcher finishes its policy writes and saves the state in about
     # 8 s after SIGTERM; give it more than that before Docker kills it.
     stop_grace_period: 15s
+    # /healthz and the Prometheus metrics, /metrics, are on LISTEN_ADDR
+    # (:8080). The port is not published: a Prometheus in this network
+    # scrapes watcher:8080 (see ../docs/metrics.md).
 
   # Least-privilege access to Docker: only GET requests to containers and
   # events (the proxy also allows /_ping and /version, which the Docker

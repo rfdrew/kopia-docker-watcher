@@ -5,11 +5,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/rfdrew/kopia-docker-watcher/internal/reconcile"
 )
 
 func TestHealthz(t *testing.T) {
 	rec := httptest.NewRecorder()
-	Handler().ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", http.NoBody))
+	Handler(New()).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", http.NoBody))
 
 	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != `{"status":"ok"}` {
 		t.Fatalf("GET /healthz = %d %q", rec.Code, rec.Body.String())
@@ -20,17 +23,64 @@ func TestHealthz(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	Handler().ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/healthz", http.NoBody))
+	Handler(New()).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/healthz", http.NoBody))
 
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("POST /healthz = %d", rec.Code)
 	}
 
 	rec = httptest.NewRecorder()
-	Handler().ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", http.NoBody))
+	Handler(New()).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", http.NoBody))
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("GET / = %d", rec.Code)
+	}
+}
+
+// /metrics serves the metrics in the Prometheus text format, to GET only.
+func TestMetricsEndpoint(t *testing.T) {
+	m := New()
+	m.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"app"}})
+	m.LastSuccess("/data/app", time.Unix(1792731600, 0))
+
+	rec := httptest.NewRecorder()
+	Handler(m).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", http.NoBody))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /metrics = %d %q", rec.Code, rec.Body.String())
+	}
+
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain; version=0.0.4") {
+		t.Errorf("Content-Type = %q", ct)
+	}
+
+	body := rec.Body.String()
+
+	for _, want := range []string{
+		"# HELP kopia_watcher_last_success_timestamp_seconds Start of the last complete snapshot",
+		"# TYPE kopia_watcher_last_success_timestamp_seconds gauge",
+		"# TYPE kopia_watcher_snapshot_duration_seconds histogram",
+		"# TYPE kopia_watcher_snapshot_failures_total counter",
+		"# TYPE kopia_watcher_reconcile_errors_total counter",
+		"# TYPE kopia_watcher_managed_sources gauge",
+		"# TYPE kopia_watcher_source_paused gauge",
+		"# TYPE kopia_watcher_source_owner gauge",
+		"\nkopia_watcher_last_success_timestamp_seconds{path=\"/data/app\"} 1.7927316e+09\n",
+		"\nkopia_watcher_managed_sources{state=\"active\"} 1\n",
+		"\nkopia_watcher_source_owner{container=\"app\",path=\"/data/app\"} 1\n",
+		"\nkopia_watcher_snapshot_failures_total{path=\"/data/app\"} 0\n",
+		"\ngo_goroutines ",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("no %q in\n%s", want, body)
+		}
+	}
+
+	rec = httptest.NewRecorder()
+	Handler(m).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/metrics", http.NoBody))
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /metrics = %d", rec.Code)
 	}
 }
 
@@ -63,7 +113,7 @@ func (t handlerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func TestProbe(t *testing.T) {
-	ok := &http.Client{Transport: handlerTransport{Handler()}}
+	ok := &http.Client{Transport: handlerTransport{Handler(New())}}
 	if err := Probe(t.Context(), ok, "http://127.0.0.1:8080/healthz"); err != nil {
 		t.Fatal(err)
 	}
