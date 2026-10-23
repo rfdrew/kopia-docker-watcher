@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -268,10 +269,39 @@ func assertJSON(t *testing.T, what string, got json.RawMessage, want string) {
 	}
 }
 
-// recordedMetrics records ReconcileError calls.
+// recordedMetrics records what the reconciler reports.
 type recordedMetrics struct {
 	mu     sync.Mutex
 	counts map[string]int
+	// sources and last hold what was reported about the paths reported
+	// as managed and not forgotten since; reports counts the Source
+	// calls per path.
+	sources map[string]SourceMetrics
+	last    map[string]time.Time
+	reports map[string]int
+	// finished holds the snapshot results reported per path.
+	finished map[string][]backend.SnapshotResult
+	// calls are all calls but ReconcileError, as "Method path", in order.
+	calls []string
+}
+
+func (m *recordedMetrics) call(method, path string) {
+	m.calls = append(m.calls, method+" "+path)
+}
+
+// recorded returns the calls but ReconcileError since the last reset.
+func (m *recordedMetrics) recorded() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return slices.Clone(m.calls)
+}
+
+func (m *recordedMetrics) resetCalls() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.calls = nil
 }
 
 func (m *recordedMetrics) ReconcileError(path string, reason Reason) {
@@ -290,6 +320,93 @@ func (m *recordedMetrics) count(path string, reason Reason) int {
 	defer m.mu.Unlock()
 
 	return m.counts[path+" "+string(reason)]
+}
+
+func (m *recordedMetrics) Source(path string, s SourceMetrics) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.sources == nil {
+		m.sources, m.reports = map[string]SourceMetrics{}, map[string]int{}
+	}
+
+	s.Owners = slices.Clone(s.Owners)
+	m.sources[path] = s
+	m.reports[path]++
+	m.call("Source", path)
+}
+
+func (m *recordedMetrics) LastSuccess(path string, start time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.sources[path]; !ok {
+		panic("LastSuccess before Source: " + path)
+	}
+
+	if m.last == nil {
+		m.last = map[string]time.Time{}
+	}
+
+	m.last[path] = start
+	m.call("LastSuccess", path)
+}
+
+func (m *recordedMetrics) ForgetSource(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.sources, path)
+	delete(m.last, path)
+	m.call("ForgetSource", path)
+}
+
+func (m *recordedMetrics) SnapshotFinished(path string, res backend.SnapshotResult) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.finished == nil {
+		m.finished = map[string][]backend.SnapshotResult{}
+	}
+
+	m.finished[path] = append(m.finished[path], res)
+	m.call("SnapshotFinished", path)
+}
+
+// source returns what was last reported about p, if it counts as managed.
+func (m *recordedMetrics) source(p string) (SourceMetrics, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sources[p]
+
+	return s, ok
+}
+
+// lastSuccess returns the last success reported for p, if any.
+func (m *recordedMetrics) lastSuccess(p string) (time.Time, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	t, ok := m.last[p]
+
+	return t, ok
+}
+
+// sourceReports returns how many times p was reported as managed.
+func (m *recordedMetrics) sourceReports(p string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.reports[p]
+}
+
+// results returns the snapshot results reported for p.
+func (m *recordedMetrics) results(p string) []backend.SnapshotResult {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return slices.Clone(m.finished[p])
 }
 
 // syncBuffer is a bytes.Buffer safe for concurrent writes.

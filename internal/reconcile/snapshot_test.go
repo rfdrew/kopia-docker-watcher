@@ -986,11 +986,12 @@ func TestSweep(t *testing.T) {
 	h.fake.AddSnapshot(src, backend.SnapshotInfo{StartTime: t0.Add(90 * time.Minute), Description: "by hand"})
 	h.fake.AddSnapshot(src, backend.SnapshotInfo{StartTime: t0.Add(2 * time.Hour), Incomplete: "checkpoint"})
 
-	// An event's pass does not sweep.
+	// An event's pass does not sweep. It lists the snapshots only to find
+	// the last complete one for the metrics, as the last is a checkpoint.
 	h.mustPass(app)
 
-	if calls := h.fake.CallsFor(src, backendtest.ListSnapshots); len(calls) != 0 {
-		t.Fatalf("an event's pass listed snapshots")
+	if calls := h.fake.CallsFor(src, backendtest.AnnotateSnapshot); len(calls) != 0 {
+		t.Fatalf("an event's pass described snapshots: %+v", calls)
 	}
 
 	h.fullPass(app)

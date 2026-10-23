@@ -233,6 +233,11 @@ func TestWaitSnapshotSucceeded(t *testing.T) {
 		t.Errorf("Error = %q", res.Error)
 	}
 
+	// The task's times, which f.finish puts a minute apart.
+	if !res.TaskStart.Equal(t0.Add(time.Second)) || !res.TaskEnd.Equal(t0.Add(time.Second+time.Minute)) {
+		t.Errorf("task times = %v, %v", res.TaskStart, res.TaskEnd)
+	}
+
 	want := ticket
 	want.TaskID, want.TaskDescription = "6", taskDesc("/data/app", t0.Add(time.Second))
 
@@ -304,6 +309,10 @@ func TestWaitSnapshotFailedBetweenPolls(t *testing.T) {
 		}
 
 		assertResult(t, res, backend.SnapshotResult{Outcome: backend.SnapshotFailed, TaskID: "7"})
+
+		if !res.TaskStart.Equal(t0) || !res.TaskEnd.Equal(t0.Add(time.Minute)) {
+			t.Errorf("task times = %v, %v", res.TaskStart, res.TaskEnd)
+		}
 
 		want := `upload error: boom; task log: Error when processing "db": permission denied; upload error: boom`
 		if logFails {

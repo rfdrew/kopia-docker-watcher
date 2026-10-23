@@ -885,6 +885,56 @@ func TestRunReconcilesPeriodically(t *testing.T) {
 	}
 }
 
+// The watcher serves what its reconciler reports on /metrics, on the
+// address of /healthz: the source of the container, active, then paused
+// after the container stopped.
+func TestRunServesMetrics(t *testing.T) {
+	k := newRunKopia(t)
+	e := newWatchEngine(appContainer())
+
+	wr := startWatcher(t, k, e, watcherOptions{})
+
+	scrape := func() string {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://127.0.0.1:8080/metrics", http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := wr.td.httpClient.Do(req)
+		if err != nil {
+			return ""
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /metrics = %s: %s", resp.Status, body)
+		}
+
+		return string(body)
+	}
+
+	waitFor(t, "the metrics of the source", func() bool {
+		body := scrape()
+		return strings.Contains(body, "\nkopia_watcher_managed_sources{state=\"active\"} 1\n") &&
+			strings.Contains(body, "\nkopia_watcher_source_owner{container=\"app\",path=\"/srv/app\"} 1\n")
+	})
+
+	e.setState("c0ffee", docker.StateExited)
+	e.events <- docker.Event{Kind: docker.KindDied, Action: "die", ContainerID: "c0ffee", Name: "app",
+		Labels: appContainer().Labels, Time: time.Now()}
+
+	waitFor(t, "the paused source", func() bool {
+		return strings.Contains(scrape(), "\nkopia_watcher_managed_sources{state=\"paused\"} 1\n")
+	})
+
+	wr.cancel()
+
+	if code := wr.wait(t, 10*time.Second); code != 0 {
+		t.Fatalf("exit code = %d; log:\n%s", code, wr.td.stderr)
+	}
+}
+
 // A container that stops pauses its source on its event, without a full
 // reconcile.
 func TestRunPausesOnEvent(t *testing.T) {

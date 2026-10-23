@@ -1033,7 +1033,8 @@ func (f *Fake) TriggerSnapshot(ctx context.Context, src backend.Source) (backend
 // WaitSnapshot implements backend.Backend. It returns the next result
 // queued for the ticket's source, saving its snapshot if it has one, or
 // else saves a complete snapshot started when the ticket was triggered and
-// reports success, with the ticket's task ID if it has one. The task ID
+// reports success, with the ticket's task ID if it has one and a task that
+// started and ended when the ticket was triggered. The task ID
 // of a result is saved first if the ticket does not have it yet. The snapshot of a source kopia server
 // does not know is SnapshotUnknown. See HoldSnapshots for a call that
 // waits.
@@ -1111,9 +1112,11 @@ func (f *Fake) finishSnapshot(t backend.SnapshotTicket) (backend.SnapshotResult,
 		}
 
 		r = backend.SnapshotResult{
-			Outcome:  backend.SnapshotSucceeded,
-			TaskID:   id,
-			Snapshot: &backend.SnapshotInfo{StartTime: t.TriggeredAt, EndTime: t.TriggeredAt},
+			Outcome:   backend.SnapshotSucceeded,
+			TaskID:    id,
+			Snapshot:  &backend.SnapshotInfo{StartTime: t.TriggeredAt, EndTime: t.TriggeredAt},
+			TaskStart: t.TriggeredAt,
+			TaskEnd:   t.TriggeredAt,
 		}
 	}
 

@@ -401,4 +401,8 @@ type SnapshotResult struct {
 	// SnapshotIdentical, such as the task's error message for a failed
 	// snapshot; empty for those two.
 	Error string
+	// TaskStart and TaskEnd are when the task of the run started and
+	// ended; each is zero when it is not known, as for an outcome told
+	// without the task, which most SnapshotUnknown results are.
+	TaskStart, TaskEnd time.Time
 }

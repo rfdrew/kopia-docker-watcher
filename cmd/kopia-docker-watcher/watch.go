@@ -116,10 +116,13 @@ type watcher struct {
 	log    *slog.Logger
 	dryRun bool
 	strict bool
+	// metrics receives what the reconciler reports; nil in a dry run,
+	// which serves no HTTP.
+	metrics *metrics.Metrics
 }
 
-// run serves /healthz, waits for kopia server and reconciles until ctx is
-// done or the HTTP server fails.
+// run serves /healthz and /metrics, waits for kopia server and reconciles
+// until ctx is done or the HTTP server fails.
 func (w *watcher) run(ctx context.Context) int {
 	ln, err := w.d.listen("tcp", w.cfg.ListenAddr)
 	if err != nil {
@@ -127,7 +130,8 @@ func (w *watcher) run(ctx context.Context) int {
 		return 1
 	}
 
-	srv := metrics.NewServer(ln, w.log)
+	w.metrics = metrics.New()
+	srv := metrics.NewServer(ln, w.log, w.metrics)
 	serveErr := make(chan error, 1)
 
 	w.log.Info("serving HTTP", "addr", ln.Addr().String())
@@ -344,11 +348,17 @@ func (w *watcher) kopiaClient() (*kopiaclient.Client, error) {
 }
 
 func (w *watcher) reconciler(kopia *kopiaclient.Client, store *state.Store, engine docker.Engine) (*reconcile.Reconciler, error) {
+	var m reconcile.Metrics
+	if w.metrics != nil {
+		m = w.metrics
+	}
+
 	return reconcile.New(reconcile.Options{
 		Backend:       rest.New(kopia, w.log),
 		Docker:        engine,
 		Store:         store,
 		Logger:        w.log,
+		Metrics:       m,
 		HostPrefix:    w.cfg.HostPrefix,
 		LabelPrefix:   w.cfg.LabelPrefix,
 		Strict:        w.strict,

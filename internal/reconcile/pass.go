@@ -94,9 +94,13 @@ type pass struct {
 	fallback bool
 
 	// plan is the plan the pass got to; outcome says why it stopped
-	// without one, or without applying it.
-	plan    *backend.Plan
-	outcome string
+	// without one, or without applying it. unknown reports that kopia
+	// server did not know the source when the pass planned it; policyDone
+	// that the plan was applied, or needed nothing.
+	plan       *backend.Plan
+	outcome    string
+	unknown    bool
+	policyDone bool
 
 	problems []error
 	// reported are the keys of the errors this pass reported.
@@ -125,6 +129,8 @@ func (r *Reconciler) reconcile(ctx context.Context, p string) passResult {
 		res.err = err
 		res.retry = ps.fail(err)
 	}
+
+	ps.reportMetrics(err)
 
 	if err != nil {
 		r.restorePending(p, ps.events)
@@ -283,6 +289,8 @@ func (ps *pass) run() error {
 		return err
 	}
 
+	ps.unknown = !plan.Known
+
 	if plan.Action == backend.ActionRegister {
 		switch {
 		case ps.fallback:
@@ -317,6 +325,8 @@ func (ps *pass) run() error {
 	if err := ps.apply(plan); err != nil {
 		return err
 	}
+
+	ps.policyDone = true
 
 	// A record the policy step made has them already.
 	ps.trackOwners()

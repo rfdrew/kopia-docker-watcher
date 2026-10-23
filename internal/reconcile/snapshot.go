@@ -277,6 +277,8 @@ func (ps *pass) handleFinished(finished, waits []state.SnapshotWait, status *bac
 					ps.logResult(w)
 				}
 
+				ps.reportLost(w)
+
 				if !w.Retried {
 					// The first trigger passed the minimum interval, and no
 					// snapshot came of it.
@@ -336,6 +338,23 @@ func (ps *pass) handleFinished(finished, waits []state.SnapshotWait, status *bac
 	}
 
 	return reqs, identical
+}
+
+// reportLost reports to Metrics a run kopia server lost track of that saved
+// no snapshot, once per wait in this process: a pass that cannot settle
+// the wait, as when queuing the snapshot again fails, meets it again.
+func (ps *pass) reportLost(w state.SnapshotWait) {
+	key := waitKey{src: ps.src, id: w.ID}
+
+	ps.mu.Lock()
+	seen := ps.reportedLost[key]
+	ps.reportedLost[key] = true
+	ps.mu.Unlock()
+
+	if !seen {
+		ps.metrics.SnapshotFinished(ps.path, backend.SnapshotResult{Outcome: backend.SnapshotUnknown, TaskID: w.Result.TaskID,
+			Error: w.Result.Error})
+	}
 }
 
 // lostRun looks for the snapshot of a run kopia server lost track of: the
@@ -1361,12 +1380,14 @@ func (r *Reconciler) startWait(w state.SnapshotWait) {
 }
 
 // wait follows the snapshot of w until it ends, keeping the ticket in the
-// state up to date, then stores the result with the wait and queues the
-// path, whose next pass acts on it. A temporary error is retried with a
-// growing delay. When ctx is done, kopia server's identity changed, or
-// the backend fails otherwise, the wait stays in the state and a later
-// pass follows it again. Only a backend that cannot follow snapshots
-// drops it.
+// state up to date, then stores the result with the wait, reports it to
+// Metrics, unless it is SnapshotUnknown, and queues the path, whose next
+// pass acts on it. A result whose wait is gone from the state is neither
+// stored nor reported. A temporary
+// error is retried with a growing delay. When ctx is done, kopia server's
+// identity changed, or the backend fails otherwise, the wait stays in the
+// state and a later pass follows it again. Only a backend that cannot
+// follow snapshots drops it.
 func (r *Reconciler) wait(ctx context.Context, w state.SnapshotWait) {
 	src := w.Ticket.Source
 	log := r.log.With("path", src.Path, "source", src.String(), "reason", w.Reason)
@@ -1401,7 +1422,17 @@ func (r *Reconciler) wait(ctx context.Context, w state.SnapshotWait) {
 				result.SnapshotStart = res.Snapshot.StartTime
 			}
 
-			if r.updateWait(src, w.ID, func(x *state.SnapshotWait) { x.Result = result }) {
+			// Reported along with the result, with the store locked: no pass
+			// can act on the result, and forget the source, before. A run
+			// kopia server lost track of may have saved its snapshot all the
+			// same; the pass that looks for it reports it if not.
+			if r.updateWait(src, w.ID, func(x *state.SnapshotWait) {
+				x.Result = result
+
+				if res.Outcome != backend.SnapshotUnknown {
+					r.metrics.SnapshotFinished(src.Path, res)
+				}
+			}) {
 				r.queue.addUnlessRetrying(src.Path)
 			}
 

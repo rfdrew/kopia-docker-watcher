@@ -49,11 +49,14 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
 - Verifies kopia server's TLS certificate by its SHA-256 fingerprint, a CA file or the system roots.
 - `validate` checks labels before you deploy them; `run --dry-run` prints what the watcher would do without
   changing anything.
+- Serves Prometheus metrics on `/metrics`: when each source last had a complete snapshot (scheduled ones
+  included), failures and durations of the watcher's own snapshots, reconcile errors, and the managed sources
+  with their containers. See [docs/metrics.md](docs/metrics.md).
 
 Not in v0.1.0:
 
-- **No `/metrics`.** `LISTEN_ADDR` serves only `/healthz`, which answers 200 while the process serves HTTP; it
-  does not check Docker, kopia server or the reconcile loop.
+- **No full health check.** `/healthz` answers 200 while the process serves HTTP; it does not check Docker,
+  kopia server or the reconcile loop.
 - **No webhook.** `NOTIFY_WEBHOOK_URL` is read and validated, but nothing is sent to it yet.
 - No policy labels beyond the schedule (retention, compression, ignore rules, …), no `kopia.volumes`, no hooks
   (`pre-exec`, `stop-during-backup`, …). These label names are reserved: the watcher warns that they are not
@@ -154,6 +157,7 @@ Logs are JSON lines on stderr.
 
 - [docs/configuration.md](docs/configuration.md): environment variables.
 - [docs/labels.md](docs/labels.md): container labels.
+- [docs/metrics.md](docs/metrics.md): Prometheus metrics, a scrape configuration and example alerts.
 - [docs/migration.md](docs/migration.md): moving from the Python `kopia-docker-operator`.
 - [examples/](examples/): a compose file with kopia server, the watcher and a labeled container.
 
