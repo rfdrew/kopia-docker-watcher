@@ -463,7 +463,7 @@ func TestParseUnknownKeys(t *testing.T) {
 		{"kopia.path.extra", "unknown label, ignored"},
 		{"kopia.Enable", "unknown label, ignored; did you mean kopia.enable?"},
 		{"kopia.snapshot_on_stop", "unknown label, ignored; did you mean kopia.snapshot-on-stop?"},
-		{"kopia.stop-during-backup", "not supported by this version, ignored"},
+		{"kopia.pin-on-stop", "not supported by this version, ignored"},
 		{"kopia.Retention.Daily", "unknown label, ignored; did you mean kopia.retention.daily?"},
 		{"kopia.compression", "unknown label, ignored; it is a group of labels such as kopia.compression.algorithm"},
 		{"kopia.retention", "unknown label, ignored; it is a group of labels such as kopia.retention.latest"},

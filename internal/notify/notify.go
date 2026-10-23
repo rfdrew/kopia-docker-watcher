@@ -17,6 +17,9 @@
 //     that succeeds makes it fine again. Each hook of each container is
 //     followed apart, and forgotten when the container no longer backs the
 //     path up or has no hooks;
+//   - a container the watcher stopped or paused for a snapshot and cannot
+//     bring back makes that container failing; once it runs again it is
+//     fine again;
 //   - a pass that ends with an error, or with a problem with the labels,
 //     makes the path failing: at once for an error the watcher does not
 //     retry, such as a policy kopia server rejects, and for an error it
@@ -141,8 +144,12 @@ type Notifier struct {
 	snapshots map[string]*track
 	passes    map[string]*track
 	hooks     map[hookKey]*track
+	returns   map[returnKey]*track
 	reasons   map[string][]reconcile.Reason
 }
+
+// returnKey is a container the watcher took down for a snapshot of a path.
+type returnKey struct{ path, container string }
 
 // hookKey is a hook of a container of a path.
 type hookKey struct{ path, hook, container string }
@@ -213,6 +220,7 @@ func New(opts Options) (*Notifier, error) {
 		snapshots: map[string]*track{},
 		passes:    map[string]*track{},
 		hooks:     map[hookKey]*track{},
+		returns:   map[returnKey]*track{},
 		reasons:   map[string][]reconcile.Reason{},
 	}
 	n.log = opts.Logger.With("webhook", n.safe, "format", opts.Format)
@@ -290,6 +298,44 @@ func (n *Notifier) ForgetSource(path string) {
 		if k.path == path {
 			delete(n.hooks, k)
 		}
+	}
+
+	for k := range n.returns {
+		if k.path == path {
+			delete(n.returns, k)
+		}
+	}
+}
+
+// ContainerReturned implements reconcile.Metrics: a container the watcher
+// cannot bring back after a snapshot of a path makes it failing, its
+// return fine again.
+func (n *Notifier) ContainerReturned(path string, res reconcile.ReturnResult) {
+	now := n.opts.Now()
+	key := returnKey{path: path, container: res.Container}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	t := n.returns[key]
+
+	switch {
+	case res.Error != "":
+		if t != nil {
+			return
+		}
+
+		n.returns[key] = &track{since: now, notified: true}
+
+		e := n.event(ReturnFailed, path, now, now, res.Mode, res.Error)
+		e.Container = res.Container
+		n.enqueue(e)
+	case t != nil:
+		delete(n.returns, key)
+
+		e := n.event(ReturnRecovered, path, now, t.since, res.Mode, "")
+		e.Container = res.Container
+		n.enqueue(e)
 	}
 }
 

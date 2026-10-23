@@ -157,6 +157,8 @@ func (r *Reconciler) listPaths(ctx context.Context) ([]string, []docker.Containe
 		}
 	}
 
+	r.reportDependsOn(containers)
+
 	r.mu.Lock()
 	for id, rep := range r.reported {
 		if !seen[id] && rep.seq <= listed {

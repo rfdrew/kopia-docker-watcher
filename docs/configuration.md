@@ -294,6 +294,9 @@ reports what only it sees:
 - **a [hook](labels.md#hooks) that failed**: a `kopia.pre-exec` command, after which no snapshot was taken, or a
   `kopia.post-exec` command. Each hook of each container is followed apart; its next run that succeeds sends
   "works again". A container that no longer backs the path up, or no longer has hooks, is forgotten;
+- **a container the watcher [stopped or paused](labels.md#stopping-and-pausing) for a snapshot and cannot bring
+  back**. The watcher keeps trying; once the container runs again, because the watcher started it or someone
+  else did, it sends "works again";
 - **labels that cannot be applied** to a path: kopia server rejects the schedule, the policy or the path,
   containers that share the path disagree, a container's labels have errors, or `STATE_FILE` refuses a change.
   The first pass that applies the labels sends "works again".
@@ -360,14 +363,14 @@ The `json` format posts:
 
 | Field | Meaning |
 |---|---|
-| `event` | `snapshot_failed`, `snapshot_recovered`, `hook_failed`, `hook_recovered`, `reconcile_failed` or `reconcile_recovered` |
+| `event` | `snapshot_failed`, `snapshot_recovered`, `hook_failed`, `hook_recovered`, `return_failed`, `return_recovered`, `reconcile_failed` or `reconcile_recovered` |
 | `status` | `failing` or `resolved` |
 | `title`, `message` | the text the other formats send |
 | `path` | the source path |
 | `containers` | the containers that back the path up, if the watcher manages it; may be empty |
 | `host` | kopia server's host name, the one its sources carry |
-| `reason` | for a snapshot its outcome (`failed`, `unknown`, `succeeded`, `identical`); for a hook `pre-exec` or `post-exec`; for the labels the kind of error, as the `kind` of [`kopia_watcher_reconcile_errors_total`](metrics.md#kopia_watcher_reconcile_errors_total); empty for `reconcile_recovered` |
-| `container` | for a hook, the container it ran in; left out for the other events |
+| `reason` | for a snapshot its outcome (`failed`, `unknown`, `succeeded`, `identical`); for a hook `pre-exec` or `post-exec`; for a container brought back `stop` or `pause`; for the labels the kind of error, as the `kind` of [`kopia_watcher_reconcile_errors_total`](metrics.md#kopia_watcher_reconcile_errors_total); empty for `reconcile_recovered` |
+| `container` | for a hook, the container it ran in; for `return_failed` and `return_recovered`, the container; left out for the other events |
 | `error` | what went wrong, at most 1000 characters; empty for a recovery |
 | `since` | when the path started failing |
 | `time` | when the notification was made |
@@ -423,11 +426,13 @@ What the watcher asks of Docker:
 | `GET /events` | the container events | `EVENTS=1` |
 | `GET /_ping`, `GET /version` | the health check and the API version | allowed by default |
 | `POST /containers/{id}/exec`, `POST /exec/{id}/start`, `GET /exec/{id}/json` | [hooks](labels.md#hooks) only | `EXEC=1` and `POST=1` |
+| `POST /containers/{id}/stop`, `/start`, `/pause`, `/unpause` | [stopping and pausing](labels.md#stopping-and-pausing) only | `CONTAINERS=1` and `POST=1` |
 
-Without hooks the watcher only reads, and the proxy can keep `POST=0`. With hooks it needs `POST=1`, which the
-proxy does not narrow down further: it then lets through every `POST` to the sections it allows, so with
-`CONTAINERS=1` also starting, stopping and removing containers. That is still less than the socket itself, which
-allows everything.
+Without hooks, `kopia.stop-during-backup` and `kopia.pause-during-backup`, the watcher only reads, and the proxy
+can keep `POST=0`. With them it needs `POST=1`, which the proxy does not narrow down further: it then lets through
+every `POST` to the sections it allows, so with `CONTAINERS=1` also creating and removing containers. That is
+still less than the socket itself, which allows everything. A watcher that gets 403 for a stop takes no snapshot
+and logs the error; one that gets it for a start keeps trying until the proxy allows it.
 
 A hook's output comes over the upgraded connection of `POST /exec/{id}/start`, which docker-socket-proxy passes
 through, but closes once nothing has gone over it for 10 minutes (HAProxy's `timeout client` and `timeout

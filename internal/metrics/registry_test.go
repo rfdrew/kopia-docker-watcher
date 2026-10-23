@@ -362,3 +362,34 @@ func TestHookFinished(t *testing.T) {
 		}
 	}
 }
+
+func TestContainerReturned(t *testing.T) {
+	m := New()
+
+	assertSamples(t, scrape(t, m), map[string]float64{
+		`kopia_watcher_backup_downtime_seconds_count{mode="stop"}`:  0,
+		`kopia_watcher_backup_downtime_seconds_count{mode="pause"}`: 0,
+	})
+
+	m.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"db"}, Hooks: true})
+	m.ContainerReturned("/data/app", reconcile.ReturnResult{Container: "db", Mode: reconcile.ModeStop, Downtime: 90 * time.Second})
+	m.ContainerReturned("/data/app", reconcile.ReturnResult{Container: "api", Mode: reconcile.ModeStop, Error: "port is already allocated"})
+	m.ContainerReturned("/data/app", reconcile.ReturnResult{Container: "api", Mode: reconcile.ModeStop, Error: "port is already allocated"})
+	// Back without the watcher: no downtime.
+	m.ContainerReturned("/data/app", reconcile.ReturnResult{Container: "api", Mode: reconcile.ModeStop})
+
+	assertSamples(t, scrape(t, m), map[string]float64{
+		`kopia_watcher_backup_downtime_seconds_count{mode="stop"}`:              1,
+		`kopia_watcher_backup_downtime_seconds_sum{mode="stop"}`:                90,
+		`kopia_watcher_backup_downtime_seconds_count{mode="pause"}`:             0,
+		`kopia_watcher_return_failures_total{container="api",path="/data/app"}`: 2,
+	})
+
+	m.ForgetSource("/data/app")
+
+	for s := range scrape(t, m) {
+		if strings.HasPrefix(s, "kopia_watcher_return_failures_total") {
+			t.Errorf("return failures of a forgotten source: %s", s)
+		}
+	}
+}

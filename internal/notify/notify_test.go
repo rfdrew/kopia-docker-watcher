@@ -739,3 +739,55 @@ func TestHookNotifications(t *testing.T) {
 	f.n.HookFinished("/data/app", pre("api", ""))
 	mustKinds(t, f)
 }
+
+func TestReturnNotifications(t *testing.T) {
+	f := newFixture(t, config.WebhookJSON, "https://hooks.example.com/x")
+	f.n.SetHost("nas")
+	f.n.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"db"}, Hooks: true})
+
+	back := func(container, mode, err string) reconcile.ReturnResult {
+		return reconcile.ReturnResult{Container: container, Mode: mode, Error: err}
+	}
+
+	f.n.ContainerReturned("/data/app", back("db", reconcile.ModeStop, ""))
+	mustKinds(t, f)
+
+	f.n.ContainerReturned("/data/app", back("api", reconcile.ModeStop, "port is already allocated"))
+	f.n.ContainerReturned("/data/app", back("api", reconcile.ModeStop, "port is already allocated"))
+	evs := mustKinds(t, f, ReturnFailed)
+
+	e := evs[0]
+	if e.Reason != reconcile.ModeStop || e.Container != "api" || !e.Failing() {
+		t.Errorf("event = %+v", e)
+	}
+
+	want := "kopia-docker-watcher cannot start api again after the snapshot of /data/app on nas (db); it keeps trying: " +
+		"port is already allocated."
+	if e.Message() != want {
+		t.Errorf("message = %q, want %q", e.Message(), want)
+	}
+
+	if e.Title() != "Container left down after a backup: api" {
+		t.Errorf("title = %q", e.Title())
+	}
+
+	f.n.ContainerReturned("/data/app", back("cache", reconcile.ModePause, "conflict"))
+
+	if evs := mustKinds(t, f, ReturnFailed); !strings.HasPrefix(evs[0].Message(), "kopia-docker-watcher cannot unpause cache again") {
+		t.Errorf("message = %q", evs[0].Message())
+	}
+
+	f.clock.advance(time.Hour)
+	f.n.ContainerReturned("/data/app", back("api", reconcile.ModeStop, ""))
+	evs = mustKinds(t, f, ReturnRecovered)
+
+	if evs[0].Container != "api" || evs[0].Failing() || !evs[0].Since.Equal(e.Time) ||
+		evs[0].Title() != "Container runs again after a backup: api" {
+		t.Errorf("recovered = %+v", evs[0])
+	}
+
+	// A forgotten source forgets its containers.
+	f.n.ForgetSource("/data/app")
+	f.n.ContainerReturned("/data/app", back("cache", reconcile.ModePause, ""))
+	mustKinds(t, f)
+}

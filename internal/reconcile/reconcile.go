@@ -140,6 +140,35 @@
 // taken without hooks; while pre-exec hooks run, it waits until their
 // snapshot is queued, so that it does not read a dump half written.
 //
+// # Downtime
+//
+// A container can also be stopped or paused around the snapshots of its
+// sources, with its stop-during-backup or pause-during-backup label, which
+// puts the sources on the watcher's schedule as a hook does. Once the
+// pre-exec hooks have succeeded, a snapshot with hooks stops the running
+// owners that ask for it, each with every running container that depends
+// on it by the depends-on labels, a container before those it depends on,
+// then pauses those that ask for that. It queues the snapshot once they are
+// down, and once the snapshot has ended, however it ended, it brings them
+// back in the reverse order, before the post-exec hooks. A failure to take
+// one down, or a depends-on label that names no container or goes round in
+// a circle, takes no snapshot. The containers come back max-downtime after
+// they went down at the latest, the snapshot done or not; when the watcher
+// stops, at once, within ShutdownGrace; and after a crash, at the next
+// start, before any other work.
+//
+// The state lists every container held down, stored before it goes down,
+// with the time Docker last started it: a container someone else started
+// since, or that is gone, is not brought back. A container is held for one
+// snapshot at a time; a snapshot with hooks that needs a container held for
+// another waits until it is back. One that cannot be brought back is tried
+// again with a growing delay, logged, counted and notified.
+//
+// While it is held, a stopped container counts as a running owner: its
+// sources are not paused, and no snapshot at a stop is taken. The events
+// the watcher's own stops and starts cause, die, stop and start, are
+// dropped, so they take no snapshot at a start or a stop either.
+//
 // # Cleanup
 //
 // The state remembers the owners of each source the watcher manages, with
@@ -262,16 +291,27 @@ const (
 // Docker lists the containers; docker.Engine implements it.
 type Docker interface {
 	Containers(ctx context.Context) ([]docker.Container, error)
+	// Inspect returns one container, with the time it last started.
+	Inspect(ctx context.Context, id string) (docker.Container, error)
 	// Exec runs a hook command in a running container.
 	Exec(ctx context.Context, id string, cmd []string) (docker.ExecResult, error)
+	// Stop, Start, Pause and Unpause take a container down around a
+	// snapshot and bring it back.
+	Stop(ctx context.Context, id string) error
+	Start(ctx context.Context, id string) error
+	Pause(ctx context.Context, id string) error
+	Unpause(ctx context.Context, id string) error
 }
 
-// Store keeps what was applied to each source; *state.Store implements it.
+// Store keeps what was applied to each source, and the containers the
+// watcher holds down; *state.Store implements it.
 type Store interface {
 	Get(src backend.Source) (state.Record, bool)
 	Update(src backend.Source, fn func(r *state.Record) error) error
 	Delete(src backend.Source) error
 	Sources() []backend.Source
+	Held() []state.Held
+	UpdateHeld(fn func(held []state.Held) ([]state.Held, error)) error
 }
 
 // Reason says why a reconcile did not go as the labels ask.
@@ -466,6 +506,20 @@ type Reconciler struct {
 	// one that passed before is a missed one.
 	armed map[string]time.Time
 
+	// expected holds by container ID the events that the watcher's own
+	// stops and starts of the container cause, which HandleEvent drops;
+	// heldWaiters holds by container ID the paths whose snapshot with hooks
+	// waits for the container to come back. returnMu lets one goroutine at
+	// a time bring containers back; returnWake wakes the loop that tries
+	// again those it could not. See downtime.go.
+	expected    map[string][]expectation
+	heldWaiters map[string][]string
+	returnMu    sync.Mutex
+	returnWake  chan struct{}
+	// dependsLogged holds by container ID the problems of its depends-on
+	// label last reported.
+	dependsLogged map[string]string
+
 	// dockerTimeout bounds every container listing.
 	dockerTimeout time.Duration
 
@@ -567,6 +621,10 @@ func New(opts Options) (*Reconciler, error) {
 		inspectWake:    make(chan struct{}, 1),
 		hooksRunning:   map[backend.Source]string{},
 		armed:          map[string]time.Time{},
+		expected:       map[string][]expectation{},
+		heldWaiters:    map[string][]string{},
+		dependsLogged:  map[string]string{},
+		returnWake:     make(chan struct{}, 1),
 		passStarts:     map[string]time.Time{},
 
 		snapshotOnWatcherStart: opts.SnapshotOnWatcherStart,
@@ -608,13 +666,20 @@ func orDefault[T int | time.Duration](v, def T) T {
 // scan by itself: docker.Watcher sends KindResync first, which HandleEvent
 // turns into ReconcileAll.
 //
+// Before anything else, Run brings back the containers the state lists as
+// held down for a snapshot, as after a stop or a crash of the watcher
+// while they were down; it tries each once, and those it cannot bring back
+// are tried again in the background.
+//
 // When ctx is done, Run takes no more paths and starts no more hooks, and
 // gives the passes and hooks that are running ShutdownGrace to finish. The
-// snapshot waiters stop at once; their waits stay in the state for the
-// next start. Run returns once every goroutine it started has returned,
-// the waiters and the hooks after the passes; after that it calls neither
-// the store, nor the backend, nor Docker, so the caller may close them.
-// Run must be called once.
+// containers held down for a snapshot are brought back at once, the
+// snapshot done or not, within ShutdownGrace too; those it cannot bring
+// back stay in the state for the next start. The snapshot waiters stop at
+// once; their waits stay in the state for the next start. Run returns once
+// every goroutine it started has returned, the waiters and the hooks after
+// the passes; after that it calls neither the store, nor the backend, nor
+// Docker, so the caller may close them. Run must be called once.
 func (r *Reconciler) Run(ctx context.Context) {
 	if !r.running.CompareAndSwap(false, true) {
 		panic("reconcile: Run called twice or along with RunOnce")
@@ -634,6 +699,9 @@ func (r *Reconciler) Run(ctx context.Context) {
 	r.runStart = time.Now()
 	r.progressMu.Unlock()
 
+	// The containers a watcher left down come back before any other work.
+	r.returnLeftDown(ctx)
+
 	var wg sync.WaitGroup
 
 	for range r.workers {
@@ -642,12 +710,17 @@ func (r *Reconciler) Run(ctx context.Context) {
 
 	wg.Go(func() { r.scanLoop(ctx) })
 	wg.Go(func() { r.inspectLoop(ctx) })
+	wg.Go(func() { r.returnLoop(ctx) })
 
 	<-ctx.Done()
 	r.queue.close()
 
 	grace := time.AfterFunc(r.shutdownGrace, cancelPasses)
 	defer grace.Stop()
+
+	// The containers held down for a snapshot come back at once, but for
+	// those a goroutine of their run brings back itself.
+	wg.Go(func() { r.returnHeld(passCtx, true) })
 
 	wg.Wait()
 
@@ -656,6 +729,9 @@ func (r *Reconciler) Run(ctx context.Context) {
 	// a hook run cut short is taken up after the next start.
 	r.waiters.Wait()
 	r.hookers.Wait()
+
+	// What the goroutines of the runs left down, within ShutdownGrace.
+	r.returnHeld(passCtx, false)
 }
 
 // work takes paths until ctx is done and runs their passes with passCtx.
@@ -713,6 +789,10 @@ func (r *Reconciler) schedule(ctx context.Context, p string, res passResult) {
 		r.queue.addAfter(p, res.nextRun.Sub(r.now()))
 	}
 
+	if !res.wake.IsZero() {
+		r.queue.addAfter(p, res.wake.Sub(r.now()))
+	}
+
 	// A pending retry comes first; it looks at the restarting owner too.
 	if res.restarting {
 		r.queue.addAfter(p, r.restartRecheck)
@@ -750,13 +830,20 @@ func (r *Reconciler) Enqueue(paths ...string) {
 //
 // The paths come from the labels in the event, the only ones left after a
 // destroy. They are queued whether or not the labels enable the backup, so
-// a container recreated without it frees its paths. The event is kept with
+// a container recreated without it frees its paths. An event the watcher
+// caused itself, by stopping or starting a container around a snapshot, is
+// dropped: it asks for no snapshot and changes no pause. The event is kept with
 // each path until a pass over it ends without an error, and that pass logs
 // it. Problems with the labels of a container that is not gone are logged
 // here already, once per set of labels.
 func (r *Reconciler) HandleEvent(ev docker.Event) {
 	if ev.Kind == docker.KindResync {
 		r.ReconcileAll()
+		return
+	}
+
+	if r.ownEvent(ev) {
+		r.log.Debug("ignoring an event the watcher caused itself", "container", ev.Name, "event", ev.Action)
 		return
 	}
 

@@ -115,7 +115,7 @@ func (f *fakeDocker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 	f.mu.Unlock()
 
-	if f.serveExec(w, r, path) {
+	if f.serveExec(w, r, path) || f.serveLifecycle(w, r, path) {
 		return
 	}
 

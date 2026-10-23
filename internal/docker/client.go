@@ -97,6 +97,12 @@ func (c *Client) Inspect(ctx context.Context, id string) (Container, error) {
 
 	if r.State != nil {
 		ctr.State = State(r.State.Status)
+
+		// Docker reports a container that never ran as started at the
+		// zero time, 0001-01-01T00:00:00Z.
+		if t, err := time.Parse(time.RFC3339Nano, r.State.StartedAt); err == nil {
+			ctr.StartedAt = t
+		}
 	}
 
 	if r.Config != nil {

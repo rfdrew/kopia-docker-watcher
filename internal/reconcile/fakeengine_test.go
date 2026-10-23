@@ -20,11 +20,18 @@ type fakeEngine struct {
 	containers map[string]docker.Container
 	fail       []error
 	nextID     int
+	starts     int
 
 	// exec runs the commands of Exec; nil succeeds at once with no
 	// output. execs records them as "container: arg arg".
 	exec  func(ctx context.Context, c docker.Container, cmd []string) (docker.ExecResult, error)
 	execs []string
+
+	// lifecycle, if set, runs before Stop, Start, Pause and Unpause change
+	// a container, and an error it returns fails the call. actions records
+	// them as "stop db".
+	lifecycle func(ctx context.Context, action string, c docker.Container) error
+	actions   []string
 }
 
 var _ docker.Engine = (*fakeEngine)(nil)
@@ -111,6 +118,132 @@ func (f *fakeEngine) Exec(ctx context.Context, id string, cmd []string) (docker.
 	return res, err
 }
 
+// Stop implements docker.Engine: a running, paused or restarting
+// container exits; any other is left as it is.
+func (f *fakeEngine) Stop(ctx context.Context, id string) error {
+	return f.change(ctx, "stop", id, func(c *docker.Container) error {
+		switch c.State {
+		case docker.StateRunning, docker.StatePaused, docker.StateRestarting:
+			c.State = docker.StateExited
+		}
+
+		return nil
+	})
+}
+
+// Start implements docker.Engine: a container that is not running starts,
+// with a new start time.
+func (f *fakeEngine) Start(ctx context.Context, id string) error {
+	return f.change(ctx, "start", id, func(c *docker.Container) error {
+		if c.State != docker.StateRunning {
+			c.State, c.StartedAt = docker.StateRunning, f.nextStart()
+		}
+
+		return nil
+	})
+}
+
+// Pause implements docker.Engine.
+func (f *fakeEngine) Pause(ctx context.Context, id string) error {
+	return f.change(ctx, "pause", id, func(c *docker.Container) error {
+		if c.State != docker.StateRunning {
+			return fmt.Errorf("pause container %s: %w", id, docker.ErrNotRunning)
+		}
+
+		c.State = docker.StatePaused
+
+		return nil
+	})
+}
+
+// Unpause implements docker.Engine.
+func (f *fakeEngine) Unpause(ctx context.Context, id string) error {
+	return f.change(ctx, "unpause", id, func(c *docker.Container) error {
+		if c.State != docker.StatePaused {
+			return fmt.Errorf("unpause container %s: %w", id, docker.ErrNotPaused)
+		}
+
+		c.State = docker.StateRunning
+
+		return nil
+	})
+}
+
+// change records the action on the container, runs f.lifecycle and then
+// fn on it.
+func (f *fakeEngine) change(ctx context.Context, action, id string, fn func(c *docker.Container) error) error {
+	f.mu.Lock()
+	c, ok := f.containers[id]
+
+	if ok {
+		f.actions = append(f.actions, action+" "+c.Name)
+	}
+
+	hook := f.lifecycle
+	f.mu.Unlock()
+
+	if !ok {
+		return fmt.Errorf("%s container %s: %w", action, id, docker.ErrNotFound)
+	}
+
+	if hook != nil {
+		if err := hook(ctx, action, cloneContainer(c)); err != nil {
+			return err
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	c, ok = f.containers[id]
+	if !ok {
+		return fmt.Errorf("%s container %s: %w", action, id, docker.ErrNotFound)
+	}
+
+	if err := fn(&c); err != nil {
+		return err
+	}
+
+	f.containers[id] = c
+
+	return nil
+}
+
+// nextStart returns a start time later than any before; f.mu is held.
+func (f *fakeEngine) nextStart() time.Time {
+	f.starts++
+	return time.Date(2026, 10, 1, 0, 0, f.starts, 0, time.UTC)
+}
+
+// actionLog returns the stops, starts, pauses and unpauses so far, as
+// "stop db".
+func (f *fakeEngine) actionLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return slices.Clone(f.actions)
+}
+
+// setLifecycle sets what runs before each stop, start, pause and unpause.
+func (f *fakeEngine) setLifecycle(fn func(ctx context.Context, action string, c docker.Container) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.lifecycle = fn
+}
+
+// container returns a container by ID.
+func (f *fakeEngine) container(id string) docker.Container {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return cloneContainer(f.containers[id])
+}
+
 // containerID returns the ID of the container with the name.
 func (f *fakeEngine) containerID(name string) string {
 	f.mu.Lock()
@@ -176,7 +309,12 @@ func (f *fakeEngine) create(name string, st docker.State, labels ...string) stri
 	f.nextID++
 	id := fmt.Sprintf("%s-%d", name, f.nextID)
 
-	f.containers[id] = docker.Container{ID: id, Name: name, Labels: labelMap(labels...), State: st}
+	c := docker.Container{ID: id, Name: name, Labels: labelMap(labels...), State: st}
+	if st.Running() {
+		c.StartedAt = f.nextStart()
+	}
+
+	f.containers[id] = c
 
 	return id
 }

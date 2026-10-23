@@ -116,9 +116,13 @@ type owner struct {
 	patch  backend.PolicyPatch
 	issues labels.Issues
 	// snap is what its labels say about snapshots, hooks about the hooks
-	// around them.
+	// around them, down about taking it down around them.
 	snap  snapLabels
 	hooks hookLabels
+	down  downLabels
+	// held reports that the watcher holds the container down for a
+	// snapshot: stopped, it still counts as running.
+	held bool
 	// cleanup and deletePinned are what its labels ask of the cleanup of
 	// the path's source once no container backs it up: the most cautious
 	// values when the label in question has an error.
@@ -131,6 +135,8 @@ type owner struct {
 func (r *Reconciler) owners(p string, containers []docker.Container) []owner {
 	var out []owner
 
+	held := r.heldByID()
+
 	for _, c := range containers {
 		pc := r.parse(c)
 		if !pc.spec.Enable || !slices.Contains(pc.paths, p) {
@@ -138,7 +144,8 @@ func (r *Reconciler) owners(p string, containers []docker.Container) []owner {
 		}
 
 		o := owner{id: c.ID, name: c.Name, state: c.State, labels: c.Labels, valid: pc.valid(), issues: pc.issues,
-			snap: r.snapshotLabels(pc), hooks: r.hookLabels(pc), cleanup: labels.CleanupPause}
+			snap: r.snapshotLabels(pc), hooks: r.hookLabels(pc), down: r.downLabels(pc), cleanup: labels.CleanupPause}
+		_, o.held = held[c.ID]
 		if o.valid {
 			o.patch = pc.patch()
 		}
@@ -167,10 +174,15 @@ func ownerNames(owners []owner) []string {
 	return names
 }
 
+// running reports whether the owner counts as running: as its state says,
+// or held down by the watcher for a snapshot.
+func (o owner) running() bool { return o.state.Running() || o.held }
+
 // anyRunning reports whether an owner counts as running: a crash-looping
-// owner, restarting between its runs, does.
+// owner, restarting between its runs, does, and so does one the watcher
+// stopped for a snapshot.
 func anyRunning(owners []owner) bool {
-	return slices.ContainsFunc(owners, func(o owner) bool { return o.state.Running() })
+	return slices.ContainsFunc(owners, owner.running)
 }
 
 // anyRestarting reports whether an owner is restarting, which can end in
@@ -188,7 +200,7 @@ func policyOwners(owners []owner) []owner {
 	var running []owner
 
 	for _, o := range owners {
-		if o.state.Running() {
+		if o.running() {
 			running = append(running, o)
 		}
 	}

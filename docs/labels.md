@@ -49,6 +49,10 @@ kopia-docker-watcher validate --all
 | [`kopia.pre-exec`](#kopiapre-exec) | — | [command](#commands): JSON array or shell command |
 | [`kopia.post-exec`](#kopiapost-exec) | — | command |
 | [`kopia.hook-timeout`](#kopiahook-timeout) | `10m` | Go duration |
+| [`kopia.stop-during-backup`](#kopiastop-during-backup) | `false` | boolean |
+| [`kopia.pause-during-backup`](#kopiapause-during-backup) | `false` | boolean |
+| [`kopia.max-downtime`](#kopiamax-downtime) | `1h` | Go duration |
+| [`kopia.depends-on`](#kopiadepends-on) | — | container or compose service names, separated by `,` |
 
 The [policy labels](#policy-labels) set fields of the path's Kopia policy. Each is unset by default: the path
 inherits the field from its parent policies.
@@ -83,7 +87,8 @@ inherits the field from its parent policies.
 
 The names, defaults and boolean values of the Python version's labels (`enable`, `path`, `schedule`,
 `snapshot-on-start`, `snapshot-on-stop`, `description`, `tags`) are kept. `volumes`, `exclude-volumes`,
-`min-interval`, `cleanup-on-remove`, `cleanup-delete-pinned`, the policy labels and the [hooks](#hooks) are new.
+`min-interval`, `cleanup-on-remove`, `cleanup-delete-pinned`, the policy labels, the [hooks](#hooks) and
+[stopping and pausing](#stopping-and-pausing) are new.
 
 ## Warnings, errors and strict mode
 
@@ -97,7 +102,9 @@ warning or an error.
   `true` and `kopia.volumes` is not set, a volume or mount destination in `kopia.volumes` that the container does
   not have, a policy label whose value cannot be read (`kopia.retention.daily=7d`, `kopia.interval=30s`, a
   `kopia.policy-json` that is not a JSON object), a compression algorithm kopia server does not have, a hook
-  command or `kopia.hook-timeout` that cannot be read, or, in strict mode, any warning.
+  command or `kopia.hook-timeout` that cannot be read, `kopia.stop-during-backup` together with
+  `kopia.pause-during-backup`, a `kopia.max-downtime` that cannot be read, a name in `kopia.depends-on` that is not
+  a container name, or, in strict mode, any warning.
 
 What happens to a container with an error:
 
@@ -110,6 +117,8 @@ What happens to a container with an error:
   error counts as `pause`.
 - A hook whose label, or `kopia.hook-timeout`, has an error does not run: a `kopia.pre-exec` with an error takes
   no snapshot instead of one without it, a `kopia.post-exec` with an error fails after the snapshot.
+- A container whose `kopia.stop-during-backup`, `kopia.pause-during-backup` or `kopia.max-downtime` has an error
+  is not stopped or paused, and no snapshot of its sources is taken instead of one with it running.
 
 The problems of a container are logged once, as "container labels have errors" at error level or "container
 labels have warnings" at warning level, and again only when they change.
@@ -123,8 +132,8 @@ lies outside `WATCHER_PATH_PREFIX`. The same holds for the source of a mount tha
 
 **Unknown labels** under the prefix are a warning with a hint where there is one: `kopia.snapshot_on_stop` gets
 "did you mean kopia.snapshot-on-stop?", and `kopia.compression` gets "it is a group of labels such as
-kopia.compression.algorithm". Labels planned for later releases are a warning "not supported by this version" and
-ignored: `kopia.stop-during-backup`, `kopia.pause-during-backup`, `kopia.pin-on-stop` and `kopia.depends-on`.
+kopia.compression.algorithm". A label planned for a later release is a warning "not supported by this version" and
+ignored: `kopia.pin-on-stop`.
 
 ### Booleans
 
@@ -580,10 +589,14 @@ does), `kopia.pre-exec: '["redis-cli", "save"]'`.
 2. When one fails, no snapshot is taken. A hook fails when it exits with a code other than 0, does not finish
    within its timeout, or cannot run: the container is paused or restarting, the command does not exist, or the
    hook labels have an error. The hooks left are not run.
-3. Otherwise the watcher queues the snapshot and follows it to its end, as any other. When kopia server refuses
-   to queue it for a reason that does not pass, such as a read-only repository, no snapshot is taken.
-4. `kopia.post-exec` runs in every running container of the path that has one, once the snapshot has ended,
-   however it ended, and also when no snapshot was taken. All of them run, also when one fails.
+3. Otherwise the containers with [`kopia.stop-during-backup`](#kopiastop-during-backup) are stopped, with the
+   containers that depend on them, and those with [`kopia.pause-during-backup`](#kopiapause-during-backup) are
+   paused. When one cannot be, no snapshot is taken.
+4. The watcher queues the snapshot and follows it to its end, as any other. When kopia server refuses to queue
+   it for a reason that does not pass, such as a read-only repository, no snapshot is taken.
+5. Once the snapshot has ended, however it ended, and also when no snapshot was taken, the stopped containers are
+   started and the paused ones unpaused, then `kopia.post-exec` runs in every running container of the path that
+   has one. All of them run, also when one fails.
 
 A label error of a hook makes that hook fail when it is due: a broken `kopia.pre-exec` (or `kopia.hook-timeout`
 next to it) takes no snapshot, a broken `kopia.post-exec` fails after the snapshot. Such a hook is logged as
@@ -676,6 +689,103 @@ watcher then goes on asking Docker whether the command has ended, until the time
 is lost. See [Docker](configuration.md#docker).
 
 Without `kopia.pre-exec` and `kopia.post-exec` the label has no effect, with a warning.
+
+## Stopping and pausing
+
+Some data can only be copied consistently while nothing writes to it: the data files of a database that has no
+dump command, an application that keeps its state in files it rewrites. With `kopia.stop-during-backup` the
+watcher stops the container for each snapshot it takes of the container's sources, and starts it again after;
+with `kopia.pause-during-backup` it freezes the container's processes instead (`docker pause`), which is quicker
+but leaves what the processes hold in memory unwritten.
+
+```yaml
+services:
+  app:
+    image: example/app
+    volumes:
+      - /srv/app/data:/data
+    labels:
+      kopia.enable: "true"
+      kopia.path: "/srv/app/data"
+      kopia.schedule: "30 3 * * *"
+      kopia.snapshot-on-start: "false"
+      kopia.stop-during-backup: "true"
+      kopia.max-downtime: "20m"
+  worker:
+    image: example/worker
+    depends_on: [app]
+    labels:
+      # Stopped before app, started after it.
+      kopia.depends-on: "app"
+```
+
+Like a hook, either label puts the container's sources on [the watcher's schedule](#the-watchers-schedule): the
+scheduled snapshots, and those at a start, are taken by the watcher, which runs the [steps](#a-snapshot-with-hooks)
+around them. A snapshot at a stop is taken without stopping anything: the container has stopped.
+
+- **Order.** The pre-exec hooks run first, while the containers run, so a dump can be written. Then the
+  containers that depend on a container to stop go down, then the container itself, then the containers to pause.
+  After the snapshot they come back the other way round, before the post-exec hooks.
+- **The stop** is `docker stop`: the container's stop signal, then `SIGKILL` after its stop timeout,
+  `stop_grace_period` in compose, 10 seconds unless set. Only a running container is stopped or paused; one that
+  is stopped, paused or restarting is left as it is.
+- **The return.** The containers come back once the snapshot has ended, failed or not; when no snapshot could be
+  taken; at the latest `kopia.max-downtime` after the watcher began to take them down, with a warning: the snapshot
+  then goes on with them running, and may read files they change. When the watcher stops (`docker stop`, `SIGTERM`)
+  it brings them back at once, within the few seconds it has for its shutdown. After a crash of the watcher, or a
+  stop that left no time, it brings them back when it starts again, before anything else.
+- **What it remembers.** `STATE_FILE` lists every container the watcher holds down, written before the container
+  goes down, with when Docker last started it. So the watcher does not start a container that someone else
+  started and stopped meanwhile, nor one that is gone, and one it paused that someone else stopped stays stopped.
+- **Failures.** A container that cannot be stopped or paused takes no snapshot; those already down come back. A
+  container that cannot be started again, say because its port is taken, is tried again with a growing delay, up
+  to 5 minutes, until it runs or someone else starts or removes it. Each failure is logged at error level and
+  counts in [`kopia_watcher_return_failures_total`](metrics.md#kopia_watcher_return_failures_total); with
+  `NOTIFY_WEBHOOK_URL` the first one is [notified](configuration.md#notifications), and so is its return.
+- **Its own events.** The stop and start of a container by the watcher are not starts and stops of the container
+  for the rest of the labels: they take no `kopia.snapshot-on-stop` or `kopia.snapshot-on-start` snapshot, and while
+  it is down the container still counts as running, so its sources are not paused. The same holds for every
+  container that goes down with it. A paused container counts as running anyway.
+- **One snapshot at a time.** A container is held down for one snapshot at a time. A snapshot of another source
+  that needs it, because the container backs that source up too or goes down with it, waits until it is back.
+
+`kopia.max-downtime` should be longer than the stop timeout of the containers and than a snapshot usually takes:
+[`kopia_watcher_backup_downtime_seconds`](metrics.md#kopia_watcher_backup_downtime_seconds) shows how long they
+are down. With a docker-socket-proxy, stopping and pausing needs `CONTAINERS=1` and `POST=1` (see
+[Docker](configuration.md#docker)).
+
+### `kopia.stop-during-backup`
+
+`true` stops the container, and every running container that depends on it by [`kopia.depends-on`](#kopiadepends-on),
+for each snapshot the watcher takes of its sources. See [stopping and pausing](#stopping-and-pausing). A
+[boolean](#booleans); in strict mode a value that is not one is an error, and the sources' snapshots are not
+taken.
+
+### `kopia.pause-during-backup`
+
+`true` pauses the container for each snapshot the watcher takes of its sources. The containers that depend on it
+stay as they are. Cannot be used with `kopia.stop-during-backup`: the two together are an error, and no snapshot of
+the container's sources is taken.
+
+### `kopia.max-downtime`
+
+How long the watcher keeps the containers down for one snapshot at most, from when it begins to stop or pause
+them: a Go duration greater than zero, such as `15m`, `1h` or `6h`. Default `1h`. When several containers of a
+path ask for downtime, the shortest applies. A value that cannot be read is an error of the labels; without
+`kopia.stop-during-backup` or `kopia.pause-during-backup` the label has no effect, with a warning.
+
+### `kopia.depends-on`
+
+The containers this container depends on, separated by `,`: when the watcher stops one of them for a snapshot,
+it stops this container first and starts it after, and does the same for the containers that depend on this one.
+A name matches a container of that name and, for a container of a docker compose project, the containers of that
+compose service in the same project, so `kopia.depends-on: "db"` names `shop-db-1` in project `shop`. The
+container needs no other label.
+
+A name that matches no container, or containers that depend on each other in a circle, are errors: no container
+of the group is stopped and no snapshot is taken. The watcher reports them at every full reconcile while they
+last; `validate --container` checks the names against the containers. Compose's own `depends_on` is not read:
+write `kopia.depends-on` where a container should go down with another.
 
 ## Cleanup
 

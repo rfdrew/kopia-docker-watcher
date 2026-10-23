@@ -92,16 +92,35 @@ type ContainerSpec struct {
 	PreExec, PostExec []string
 
 	// Hooks reports that the pre-exec or post-exec label is set, also
-	// when its value has an error. The watcher then takes the scheduled
-	// snapshots of the container's sources itself, so that the hooks run
-	// around them; a hook with an error fails when it is due, so a
-	// pre-exec hook with an error takes no snapshot rather than one
-	// without it.
+	// when its value has an error, or that the container is stopped or
+	// paused around the snapshots, or a label that asks for that has an
+	// error. The watcher then takes the scheduled snapshots of the
+	// container's sources itself, so that the hooks run around them; a
+	// hook with an error fails when it is due, so a pre-exec hook with an
+	// error takes no snapshot rather than one without it, and so does a
+	// stop or pause label with an error.
 	Hooks bool
 
 	// HookTimeout bounds each hook command; zero means
 	// DefaultHookTimeout.
 	HookTimeout time.Duration
+
+	// StopDuringBackup and PauseDuringBackup take the container down
+	// around each snapshot the watcher takes of its sources: it is stopped,
+	// with the containers that depend on it, or paused after the pre-exec
+	// hooks, and started or unpaused before the post-exec hooks. At most one
+	// of them is set; either sets Hooks.
+	StopDuringBackup, PauseDuringBackup bool
+
+	// MaxDowntime bounds how long the container stays down for one
+	// snapshot; zero means DefaultMaxDowntime.
+	MaxDowntime time.Duration
+
+	// DependsOn are the containers this one depends on, by container name
+	// or, in the same compose project, by service name, in label order and
+	// without duplicates. When the watcher stops one of them for a
+	// snapshot, it stops this container first and starts it after.
+	DependsOn []string
 }
 
 // CleanupMode is what becomes of a source once no container backs it up
@@ -247,6 +266,7 @@ func Parse(labels map[string]string, opts Options) (ContainerSpec, Issues) {
 
 	p.checkPolicy()
 	p.checkHooks()
+	p.checkDowntime()
 
 	if p.spec.Enable && len(p.spec.Paths) == 0 && len(p.spec.Volumes) == 0 {
 		p.label = Name(p.prefix, KeyPath)
@@ -283,8 +303,9 @@ type parser struct {
 	// interval, times of day, or one of them or cron in policy-json.
 	scheduleLabel, setsSchedule bool
 
-	// hookTimeoutLabel reports that the hook-timeout label is set.
-	hookTimeoutLabel bool
+	// hookTimeoutLabel and maxDowntimeLabel report that the hook-timeout
+	// and the max-downtime label are set.
+	hookTimeoutLabel, maxDowntimeLabel bool
 }
 
 func (p *parser) errorf(format string, args ...any) {

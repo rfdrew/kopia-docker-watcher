@@ -38,6 +38,11 @@ func (*fakeEngine) Exec(context.Context, string, []string) (ExecResult, error) {
 	return ExecResult{}, errors.New("not implemented")
 }
 
+func (*fakeEngine) Stop(context.Context, string) error    { return errors.New("not implemented") }
+func (*fakeEngine) Start(context.Context, string) error   { return errors.New("not implemented") }
+func (*fakeEngine) Pause(context.Context, string) error   { return errors.New("not implemented") }
+func (*fakeEngine) Unpause(context.Context, string) error { return errors.New("not implemented") }
+
 func (f *fakeEngine) Events(ctx context.Context, since time.Time) (<-chan Event, <-chan error) {
 	s := &fakeSub{ctx: ctx, since: since, events: make(chan Event), errs: make(chan error, 1)}
 

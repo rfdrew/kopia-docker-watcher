@@ -139,6 +139,14 @@ func (ps *pass) writePlan(b *strings.Builder) {
 		fmt.Fprintf(b, "  hooks: the watcher takes the scheduled snapshots, with pre-exec in %s and post-exec in %s; "+
 			"kopia server's schedule stays off\n", namesOrNone(hookTargets(ps.owners, HookPreExec)),
 			namesOrNone(hookTargets(ps.owners, HookPostExec)))
+
+		switch down := ps.downPlan(); {
+		case down.err != nil:
+			fmt.Fprintf(b, "  downtime: no snapshot can be taken: %s\n", down.err)
+		case len(down.items) > 0:
+			fmt.Fprintf(b, "  downtime: %s, for at most %s per snapshot\n", strings.Join(downNames(down.items), ", "),
+				down.maxDowntime)
+		}
 	}
 
 	if ps.preview != nil && !ps.want.Paused && len(ps.preview.Times) > 0 {

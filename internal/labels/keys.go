@@ -34,7 +34,7 @@ type key struct {
 // keys are the supported labels. A nested key such as retention.daily is
 // one more entry with a dotted name; its value goes to a nested field of
 // ContainerSpec.Policy.
-var keys = slices.Concat(coreKeys, policyKeys, hookKeys)
+var keys = slices.Concat(coreKeys, policyKeys, hookKeys, downtimeKeys)
 
 // coreKeys are the labels of everything but the policy fields.
 var coreKeys = []key{
@@ -57,11 +57,8 @@ var coreKeys = []key{
 // the schema tests check them together with keys, so that a key added now
 // cannot clash with one of them later.
 var plannedKeys = []string{
-	// Hooks around a snapshot.
-	"stop-during-backup",
-	"pause-during-backup",
+	// A pin on the snapshot at a stop.
 	"pin-on-stop",
-	"depends-on",
 }
 
 var (

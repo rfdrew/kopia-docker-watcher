@@ -679,6 +679,11 @@ func (t teeMetrics) HookFinished(path string, res reconcile.HookResult) {
 	t.n.HookFinished(path, res)
 }
 
+func (t teeMetrics) ContainerReturned(path string, res reconcile.ReturnResult) {
+	t.m.ContainerReturned(path, res)
+	t.n.ContainerReturned(path, res)
+}
+
 // logKopiaError explains an error of kopia server that retrying cannot fix.
 func (w *watcher) logKopiaError(err error) {
 	var msg string

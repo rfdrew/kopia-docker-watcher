@@ -216,6 +216,13 @@ func (e *fakeEngine) Exec(context.Context, string, []string) (docker.ExecResult,
 	panic("validate must not run hooks")
 }
 
+func (e *fakeEngine) Stop(context.Context, string) error    { panic(noLifecycle) }
+func (e *fakeEngine) Start(context.Context, string) error   { panic(noLifecycle) }
+func (e *fakeEngine) Pause(context.Context, string) error   { panic(noLifecycle) }
+func (e *fakeEngine) Unpause(context.Context, string) error { panic(noLifecycle) }
+
+const noLifecycle = "validate must not stop, start, pause or unpause containers"
+
 func (e *fakeEngine) Close() error {
 	e.closed = true
 	return nil
@@ -578,6 +585,27 @@ func TestValidateContainers(t *testing.T) {
 			env:    kopiaEnv(),
 			args:   []string{"--container", "web"},
 			stdout: []string{"/srv/web -> root@nas:/srv/web", "whether the paths exist is not checked: kopia server checks that only when it registers a source"},
+		},
+		{
+			name: "depends on",
+			engine: &fakeEngine{containers: append(testContainers(),
+				docker.Container{ID: "abcabcabcabc", Name: "api", State: docker.StateRunning, Labels: map[string]string{
+					"kopia.depends-on": "web,ghost",
+				}})},
+			args:   []string{"--container", "api", "--container", "web"},
+			code:   1,
+			stdout: []string{"kopia.depends-on web, ghost", `error: kopia.depends-on: "ghost" names no container`},
+			absent: []string{`error: kopia.depends-on: "web" names no container`},
+		},
+		{
+			name: "depends on in a circle",
+			engine: &fakeEngine{containers: []docker.Container{
+				{ID: "a1", Name: "a", Labels: map[string]string{"kopia.depends-on": "b"}},
+				{ID: "b1", Name: "b", Labels: map[string]string{"kopia.depends-on": "a"}},
+			}},
+			args:   []string{"--container", "a"},
+			code:   1,
+			stdout: []string{"error: kopia.depends-on: the container depends on itself through kopia.depends-on"},
 		},
 		{
 			name:   "Docker unreachable",

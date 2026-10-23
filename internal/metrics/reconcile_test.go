@@ -38,6 +38,15 @@ func (d *fakeDocker) Exec(context.Context, string, []string) (docker.ExecResult,
 	return docker.ExecResult{}, nil
 }
 
+func (d *fakeDocker) Inspect(context.Context, string) (docker.Container, error) {
+	return docker.Container{}, docker.ErrNotFound
+}
+
+func (d *fakeDocker) Stop(context.Context, string) error    { return nil }
+func (d *fakeDocker) Start(context.Context, string) error   { return nil }
+func (d *fakeDocker) Pause(context.Context, string) error   { return nil }
+func (d *fakeDocker) Unpause(context.Context, string) error { return nil }
+
 func (d *fakeDocker) set(cs ...docker.Container) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

@@ -10,12 +10,16 @@
 // lifecycle needs across restarts: the snapshots the watcher queued and
 // still waits for, when it last queued one, the mark after which
 // snapshots get a description, and for a source whose containers run
-// hooks, the watcher's own schedule and the snapshot with hooks under way. And it holds who owns the source: the
-// containers that back it up, with what their labels ask for once they are
-// gone (Docker forgets the labels of a container it removes), and since
-// when the source has had none. A record stays until it is deleted, also
-// when it holds nothing else, so the store lists every source the watcher
-// manages.
+// hooks, the watcher's own schedule and the snapshot with hooks under way.
+// And it holds who owns the source: the containers that back it up, with
+// what their labels ask for once they are gone (Docker forgets the labels
+// of a container it removes), and since when the source has had none. A
+// record stays until it is deleted, also when it holds nothing else, so the
+// store lists every source the watcher manages.
+//
+// Besides the records, the store keeps the containers the watcher stopped
+// or paused for a snapshot and has not started again (Held), so that a
+// watcher that stops meanwhile, or crashes, starts them when it comes back.
 //
 // # Using the store
 //
@@ -35,11 +39,13 @@
 //
 // # File
 //
-// The file is a JSON object with a schema version and one entry per
-// source, sorted by source:
+// The file is a JSON object with a schema version, the held containers,
+// if any, and one entry per source, sorted by source:
 //
 //	{
 //	  "version": 1,
+//	  "held": [{"id": "9b1d…", "name": "db", "mode": "stop", "source": {…}, "run": "2026-10-19T08:00:00Z",
+//	    "at": "2026-10-19T08:00:02Z", "startedAt": "2026-10-18T22:14:07.5Z"}],
 //	  "sources": [
 //	    {
 //	      "source": {"host": "kopia", "userName": "root", "path": "/data/app"},
@@ -90,12 +96,11 @@
 //
 // New per-source data goes into Record as an optional field with omitempty
 // or omitzero, so files without it still load. Data that is not per source
-// goes into a new top-level field of the file. Fields are never renamed or
-// given a new meaning in place; Version is raised, with a migration in
-// load, only for a change an older watcher would misread. Planned
-// addition: containers the watcher stopped itself. Records of another
-// kopia server identity than the current one must never be cleaned up
-// automatically.
+// goes into a new top-level field of the file, as the held containers do.
+// Fields are never renamed or given a new meaning in place; Version is
+// raised, with a migration in load, only for a change an older watcher
+// would misread. Records of another kopia server identity than the
+// current one must never be cleaned up automatically.
 package state
 
 import (
@@ -252,6 +257,9 @@ type Schedule struct {
 const (
 	// HookPre: the pre-exec hooks run, or have run when PreDone is set.
 	HookPre = "pre"
+	// HookDown: the containers the run stops or pauses are taken down, or
+	// have been when DownDone is set.
+	HookDown = "down"
 	// HookSnapshot: the snapshot is queued; WaitID names its wait.
 	HookSnapshot = "snapshot"
 	// HookPost: the post-exec hooks run.
@@ -259,9 +267,11 @@ const (
 )
 
 // HookRun is a snapshot the watcher takes with hooks: the pre-exec hooks of
-// the running containers, the snapshot, then their post-exec hooks, which
-// run whatever became of the rest. A run ends when its post-exec hooks have
-// run, and the record then loses it.
+// the running containers, the stop or pause of those that ask for it, the
+// snapshot, then the start or unpause of those containers and the
+// post-exec hooks, which run whatever became of the rest. A run ends when
+// its post-exec hooks have run, and the record then loses it. The
+// containers it holds down are listed among the store's Held.
 //
 // Its fields are closed, like those of a wait.
 type HookRun struct {
@@ -285,6 +295,14 @@ type HookRun struct {
 	PreError string `json:"preError,omitempty"`
 	// WaitID is the ID of the snapshot's wait, once it is queued.
 	WaitID string `json:"waitID,omitempty"`
+	// DownDone reports that the containers have been taken down; DownError
+	// says why that failed, empty when it succeeded. A run whose containers
+	// could not all be taken down takes no snapshot.
+	DownDone  bool   `json:"downDone,omitempty"`
+	DownError string `json:"downError,omitempty"`
+	// ReturnBy is when the containers the run takes down are brought back
+	// at the latest, the snapshot done or not.
+	ReturnBy time.Time `json:"returnBy,omitzero"`
 }
 
 // Owner is a container that backs a source up, as the state remembers it.
@@ -311,6 +329,62 @@ type Owner struct {
 	// removed, or its labels no longer name the path; zero while it backs
 	// it up.
 	Gone time.Time `json:"gone,omitzero"`
+}
+
+// Held container modes.
+const (
+	// HeldStop: the watcher stopped the container.
+	HeldStop = "stop"
+	// HeldPause: the watcher paused the container.
+	HeldPause = "pause"
+)
+
+// Held is a container the watcher stopped or paused for a snapshot with
+// hooks and has not started or unpaused again. It is stored before the
+// watcher takes the container down, so that a crash in between does not
+// leave a container down for good, and goes once the container is back,
+// or once it is gone or someone else has started it.
+//
+// Its fields are closed, like those of a wait.
+type Held struct {
+	// ID and Name identify the container.
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Mode is HeldStop or HeldPause.
+	Mode string `json:"mode"`
+	// Source and Run are the source and the ID of the snapshot with hooks
+	// the container is held for. A container is held for one run at a
+	// time.
+	Source backend.Source `json:"source"`
+	Run    string         `json:"run"`
+	// Order is the place of the container among those held for the run:
+	// they are taken down in this order and brought back the other way
+	// round, so that a container comes back after those it depends on.
+	Order int `json:"order,omitempty"`
+	// At is when the watcher set out to take the container down, by the
+	// watcher's clock.
+	At time.Time `json:"at"`
+	// StartedAt is when Docker last started the container before the
+	// watcher took it down, by Docker's clock: a container that Docker
+	// started later was started by someone else, and is left as it is.
+	// Zero until the watcher has looked, just before it takes the
+	// container down: such a container was not touched.
+	StartedAt time.Time `json:"startedAt,omitzero"`
+	// Released marks a container its run is done with, which the watcher
+	// has failed to bring back so far and keeps trying to.
+	Released bool `json:"released,omitempty"`
+}
+
+// validate reports whether h can be stored.
+func (h Held) validate() error {
+	switch {
+	case h.ID == "":
+		return errors.New("no ID")
+	case h.Mode != HeldStop && h.Mode != HeldPause:
+		return fmt.Errorf("unknown mode %q", h.Mode)
+	}
+
+	return h.Source.Validate()
 }
 
 // Equal reports whether o and p hold the same, times compared as
@@ -395,6 +469,8 @@ type Store struct {
 	// returns a deep copy and an unchanged record is found by comparing
 	// bytes.
 	records map[backend.Source]entry
+	// held are the held containers, in the order they were added.
+	held []Held
 	// extra holds the top-level fields of the file this version does not
 	// know.
 	extra map[string]json.RawMessage
@@ -624,6 +700,65 @@ func (s *Store) Update(src backend.Source, fn func(r *Record) error) error {
 	return s.writeLocked()
 }
 
+// Held returns the held containers, in the order they were added.
+func (s *Store) Held() []Held {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.held)
+}
+
+// UpdateHeld changes the held containers and writes the file. fn gets a
+// copy of them and returns what they are to be; if it returns an error,
+// nothing is changed and the error is returned. The file is not written
+// when nothing changes and the file is up to date.
+//
+// fn runs with the store locked: it must not call the store, and should
+// not wait for anything.
+func (s *Store) UpdateHeld(fn func(held []Held) ([]Held, error)) error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrClosed
+	}
+
+	next, err := fn(slices.Clone(s.held))
+	if err != nil {
+		return err
+	}
+
+	ids := map[string]bool{}
+
+	for _, h := range next {
+		if err := h.validate(); err != nil {
+			return fmt.Errorf("state: held container %s: %w", h.ID, err)
+		}
+
+		if ids[h.ID] {
+			return fmt.Errorf("state: container %s is held twice", h.ID)
+		}
+
+		ids[h.ID] = true
+	}
+
+	if len(next) == 0 {
+		next = nil
+	}
+
+	if bytes.Equal(mustEncode(next), mustEncode(s.held)) && s.writeErr == nil {
+		return nil
+	}
+
+	s.held = next
+
+	return s.writeLocked()
+}
+
 // Delete removes the record of src and writes the file.
 func (s *Store) Delete(src backend.Source) error {
 	if s.readOnly {
@@ -715,7 +850,7 @@ func (s *Store) load() error {
 		return nil
 	}
 
-	records, extra, problems, err := decode(data)
+	records, held, extra, problems, err := decode(data)
 
 	switch {
 	case errors.Is(err, ErrNewerVersion):
@@ -724,7 +859,7 @@ func (s *Store) load() error {
 		return s.keepCorrupt(data, "state file is corrupt, starting with an empty state", []string{err.Error()})
 	}
 
-	s.records, s.extra = records, extra
+	s.records, s.held, s.extra = records, held, extra
 
 	if len(problems) > 0 {
 		return s.keepCorrupt(data, "state file has entries that cannot be read in full; what cannot be read is dropped", problems)
@@ -827,37 +962,43 @@ func jsonKeys(t reflect.Type) map[string]bool {
 }
 
 // decode parses a state file. An error means the file cannot be used at
-// all; problems are entries that were dropped.
-func decode(data []byte) (records map[backend.Source]entry, extra map[string]json.RawMessage, problems []string, err error) {
+// all; problems are entries and held containers that were dropped.
+func decode(data []byte) (records map[backend.Source]entry, held []Held, extra map[string]json.RawMessage, problems []string,
+	err error,
+) {
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(data, &top); err != nil {
-		return nil, nil, nil, fmt.Errorf("not a JSON object: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("not a JSON object: %w", err)
 	}
 
 	if top == nil {
-		return nil, nil, nil, errors.New("not a JSON object: null")
+		return nil, nil, nil, nil, errors.New("not a JSON object: null")
 	}
 
 	var version int
 	if raw, ok := top["version"]; !ok || json.Unmarshal(raw, &version) != nil || version <= 0 {
-		return nil, nil, nil, errors.New("no valid schema version")
+		return nil, nil, nil, nil, errors.New("no valid schema version")
 	}
 
 	if version > Version {
-		return nil, nil, nil, fmt.Errorf("%w: version %d, this watcher reads up to %d", ErrNewerVersion, version, Version)
+		return nil, nil, nil, nil, fmt.Errorf("%w: version %d, this watcher reads up to %d", ErrNewerVersion, version, Version)
 	}
 
 	var raws []json.RawMessage
 	if err := json.Unmarshal(cmpRaw(top["sources"]), &raws); err != nil {
-		return nil, nil, nil, fmt.Errorf("sources: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("sources: %w", err)
 	}
 
 	extra = map[string]json.RawMessage{}
 
 	for k, v := range top {
-		if k != "version" && k != "sources" {
+		if k != "version" && k != "sources" && k != "held" {
 			extra[k] = v
 		}
+	}
+
+	if raw, ok := top["held"]; ok {
+		held, problems = decodeHeld(raw)
 	}
 
 	records = make(map[backend.Source]entry, len(raws))
@@ -883,7 +1024,37 @@ func decode(data []byte) (records map[backend.Source]entry, extra map[string]jso
 		records[src] = e
 	}
 
-	return records, extra, problems, nil
+	return records, held, extra, problems, nil
+}
+
+// decodeHeld decodes the held containers; problems are those that were
+// dropped: they do not decode, cannot be stored, or name a container
+// listed before.
+func decodeHeld(raw json.RawMessage) (held []Held, problems []string) {
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, []string{"held containers: " + err.Error()}
+	}
+
+	ids := map[string]bool{}
+
+	for i, item := range items {
+		var h Held
+
+		switch err := json.Unmarshal(item, &h); {
+		case err != nil:
+			problems = append(problems, fmt.Sprintf("held container %d: %v", i, err))
+		case h.validate() != nil:
+			problems = append(problems, fmt.Sprintf("held container %d: %v", i, h.validate()))
+		case ids[h.ID]:
+			problems = append(problems, fmt.Sprintf("held container %d: %s is listed again", i, h.ID))
+		default:
+			ids[h.ID] = true
+			held = append(held, h)
+		}
+	}
+
+	return held, problems
 }
 
 // cmpRaw returns raw, or null for a missing value.
@@ -1106,7 +1277,15 @@ func (s *Store) writeLocked() error {
 func (s *Store) encodeLocked() []byte {
 	var b bytes.Buffer
 
-	fmt.Fprintf(&b, `{"version":%d,"sources":[`, Version)
+	fmt.Fprintf(&b, `{"version":%d,`, Version)
+
+	if len(s.held) > 0 {
+		b.WriteString(`"held":`)
+		b.Write(mustEncode(s.held))
+		b.WriteByte(',')
+	}
+
+	b.WriteString(`"sources":[`)
 
 	for i, src := range slices.SortedFunc(maps.Keys(s.records), backend.Source.Compare) {
 		if i > 0 {
@@ -1166,7 +1345,8 @@ func encodeRecord(r Record) (json.RawMessage, error) {
 	return bytes.TrimRight(b.Bytes(), "\n"), nil
 }
 
-// mustEncode encodes a value that always encodes: a source or a string.
+// mustEncode encodes a value that always encodes: a source, a string, the
+// held containers.
 func mustEncode(v any) []byte {
 	var b bytes.Buffer
 
