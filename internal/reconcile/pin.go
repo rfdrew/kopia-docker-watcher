@@ -83,6 +83,16 @@ func prunePins(r *state.Record) {
 	}
 }
 
+// absorbedPins returns the pins of the absorbed stop of rec, unless they
+// belong to another stop.
+func absorbedPins(rec state.Record) []string {
+	if rec.StopAbsorbedAt.IsZero() || !rec.StopAbsorbedPinsAt.Equal(rec.StopAbsorbedAt) {
+		return nil
+	}
+
+	return slices.Clone(rec.StopAbsorbedPins)
+}
+
 // waitPins returns the pins of the wait with the given ID.
 func (ps *pass) waitPins(id string) []string {
 	rec, _ := ps.store.Get(ps.src)
@@ -156,10 +166,14 @@ func (ps *pass) annotateFinished(w state.SnapshotWait, start time.Time, waits []
 }
 
 // lastIdentical returns the start of the last complete snapshot of the
-// source that started before the next run the watcher queued after w: the
-// one that w's run, which saved nothing because nothing had changed, found
-// the same. found is false if there is none; decided is false when listing
-// failed for a passing reason.
+// source that started before w's run was queued: the one that run, which
+// saved nothing because nothing had changed, found the same. A snapshot
+// saved between the trigger and the run is one that was uploading then,
+// which started before. The bound allows kopia server's clock to be ahead
+// by clockSkew, and stops at the next run the watcher queued, so a
+// snapshot taken after the stop, as after an update, is never the one. found
+// is false if there is none; decided is false when listing failed for a
+// passing reason.
 func (ps *pass) lastIdentical(w state.SnapshotWait, waits []state.SnapshotWait) (last time.Time, found, decided bool) {
 	if ps.cannotDescribe() {
 		return time.Time{}, false, true
@@ -179,10 +193,13 @@ func (ps *pass) lastIdentical(w state.SnapshotWait, waits []state.SnapshotWait) 
 		return time.Time{}, false, false
 	}
 
-	until := ps.nextTrigger(w, waits)
+	until := w.Ticket.TriggeredAt.Add(clockSkew)
+	if next := ps.nextTrigger(w, waits); !next.IsZero() && next.Before(until) {
+		until = next
+	}
 
 	for _, sn := range snaps {
-		if sn.Incomplete == "" && (until.IsZero() || sn.StartTime.Before(until)) && sn.StartTime.After(last) {
+		if sn.Incomplete == "" && sn.StartTime.Before(until) && sn.StartTime.After(last) {
 			last = sn.StartTime
 		}
 	}

@@ -190,8 +190,11 @@ type Record struct {
 	StopAbsorbedLastStart   time.Time `json:"stopAbsorbedLastStart,omitzero"`
 
 	// StopAbsorbedPins are the pins the absorbed stop asks for, added to
-	// the snapshot that gets StopAbsorbedDescription.
-	StopAbsorbedPins []string `json:"stopAbsorbedPins,omitempty"`
+	// the snapshot that gets StopAbsorbedDescription. StopAbsorbedPinsAt
+	// is the StopAbsorbedAt they belong to: an older watcher clears an
+	// absorbed stop without them, so pins of another stop are stale.
+	StopAbsorbedPins   []string  `json:"stopAbsorbedPins,omitempty"`
+	StopAbsorbedPinsAt time.Time `json:"stopAbsorbedPinsAt,omitzero"`
 
 	// WaitPins are the pins to add to the snapshot of a wait, by the
 	// wait's ID: the pin-on-stop labels of the containers whose stops the

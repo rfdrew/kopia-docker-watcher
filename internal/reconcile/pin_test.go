@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
+	"github.com/rfdrew/kopia-docker-watcher/internal/backend/backendtest"
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
 	"github.com/rfdrew/kopia-docker-watcher/internal/state"
 )
@@ -318,5 +319,159 @@ func TestPinOnStopLabelProblems(t *testing.T) {
 				t.Errorf("no warning %q in the log:\n%s", tt.warning, h.logs)
 			}
 		})
+	}
+}
+
+// A run that saved nothing pins the last snapshot from before it was
+// queued, not one taken after the stop, as of the updated service, when
+// the pin comes late.
+func TestPinOnStopIdenticalIgnoresLaterSnapshots(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	src := h.src(app)
+	id := h.engine.run("app", enable, pathLabel(app), onStop, pinLabel)
+	h.mustPass(app)
+
+	before := t0.Add(-time.Hour)
+	h.fake.AddSnapshot(src, backend.SnapshotInfo{StartTime: before, EndTime: before})
+
+	c.add(time.Minute)
+	h.stop(c, id, app)
+	h.fake.QueueSnapshotResult(src, backend.SnapshotResult{Outcome: backend.SnapshotIdentical, TaskID: "1"})
+	h.r.wait(t.Context(), h.onlyWait(app))
+
+	// Listing fails at the pass that would pin; a scheduled snapshot of
+	// the updated service comes before the next.
+	h.fake.FailNext(backendtest.ListSnapshots, temporary("ListSnapshots"))
+	h.mustPass(app)
+
+	if len(h.waits(app)) != 1 {
+		t.Fatalf("the wait is not kept after a passing failure: %+v", h.waits(app))
+	}
+
+	after := c.now().Add(5 * time.Minute)
+	h.fake.AddSnapshot(src, backend.SnapshotInfo{StartTime: after, EndTime: after})
+	c.add(10 * time.Minute)
+	h.mustPass(app)
+
+	if p := h.pins(app, before); len(p) != 1 {
+		t.Errorf("pins of the snapshot before = %v\nlog:\n%s", p, h.logs)
+	}
+
+	if p := h.pins(app, after); len(p) != 0 {
+		t.Errorf("pins of the later snapshot = %v", p)
+	}
+}
+
+// When the snapshot of an earlier absorbed stop is saved but cannot be
+// pinned yet, a new stop neither clears it nor merges into it: the earlier
+// snapshot gets the earlier pin, and the new stop is decided at a later
+// pass, with its own.
+func TestPinOnStopEarlierAbsorbedHeld(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	src := h.src(app)
+	a := h.engine.run("a", enable, pathLabel(app), onStop, "kopia.pin-on-stop=a-{time}")
+	b := h.engine.run("b", enable, pathLabel(app), onStop, "kopia.pin-on-stop=b-{time}")
+	h.mustPass(app)
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusPending})
+
+	c.add(time.Minute)
+	h.stop(c, a, app)
+
+	// The pending run saves S1, and another one is pending when b stops;
+	// describing S1 fails then.
+	s1 := c.now().Add(time.Second)
+	h.fake.AddSnapshot(src, backend.SnapshotInfo{StartTime: s1, EndTime: s1})
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusPending, LastSnapshot: &backend.SnapshotInfo{StartTime: s1}})
+	h.fake.FailNext(backendtest.ListSnapshots, temporary("ListSnapshots"))
+
+	c.add(time.Minute)
+	h.stop(c, b, app)
+
+	if rec := h.record(app); !slices.Equal(rec.StopAbsorbedPins, []string{"a-12-01-00"}) {
+		t.Fatalf("absorbed pins after the failure = %v", rec.StopAbsorbedPins)
+	}
+
+	// The kept stop of b: S1 gets a's pin, and b's stop is absorbed by the
+	// run pending now.
+	h.mustPass(app)
+
+	if p := h.pins(app, s1); !slices.Equal(p, []string{"a-12-01-00"}) {
+		t.Errorf("pins of S1 = %v\nlog:\n%s", p, h.logs)
+	}
+
+	if rec := h.record(app); !slices.Equal(rec.StopAbsorbedPins, []string{"b-12-02-00"}) || !rec.StopAbsorbedPinsAt.Equal(rec.StopAbsorbedAt) {
+		t.Errorf("absorbed stop = %v %v %v", rec.StopAbsorbedAt, rec.StopAbsorbedPins, rec.StopAbsorbedPinsAt)
+	}
+}
+
+// A new stop snapshot queued while the saved snapshot of an absorbed stop
+// cannot be pinned yet leaves the absorbed stop for a later pass.
+func TestPinOnStopAbsorbedKeptForNewStop(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	src := h.src(app)
+	a := h.engine.run("a", enable, pathLabel(app), onStop, "kopia.pin-on-stop=a")
+	b := h.engine.run("b", enable, pathLabel(app), onStop, "kopia.pin-on-stop=b")
+	h.mustPass(app)
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusPending})
+
+	c.add(time.Minute)
+	h.stop(c, a, app)
+
+	s1 := c.now().Add(time.Second)
+	h.fake.AddSnapshot(src, backend.SnapshotInfo{StartTime: s1, EndTime: s1})
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusIdle, LastSnapshot: &backend.SnapshotInfo{StartTime: s1}})
+	h.fake.FailNext(backendtest.ListSnapshots, temporary("ListSnapshots"))
+
+	c.add(time.Minute)
+	h.stop(c, b, app)
+
+	w := h.onlyWait(app)
+	if rec := h.record(app); rec.StopAbsorbedAt.IsZero() || !slices.Equal(rec.WaitPins[w.ID], []string{"b"}) {
+		t.Fatalf("record = %+v", rec)
+	}
+
+	h.mustPass(app)
+
+	if p := h.pins(app, s1); !slices.Equal(p, []string{"a"}) {
+		t.Errorf("pins of S1 = %v\nlog:\n%s", p, h.logs)
+	}
+
+	if rec := h.record(app); !rec.StopAbsorbedAt.IsZero() {
+		t.Errorf("absorbed stop left: %+v", rec)
+	}
+}
+
+// Pins of an absorbed stop that belong to another stop, as an older
+// watcher leaves them, are not used.
+func TestPinOnStopStaleAbsorbedPins(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	src := h.src(app)
+	h.engine.run("app", enable, pathLabel(app), onStop)
+	h.mustPass(app)
+
+	at := c.now()
+	if err := h.store.Update(src, func(r *state.Record) error {
+		r.StopAbsorbedAt = at
+		r.StopAbsorbedDescription = "app"
+		r.StopAbsorbedPins = []string{"stale"}
+		r.StopAbsorbedPinsAt = at.Add(-time.Hour)
+
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	start := at.Add(time.Second)
+	h.fake.AddSnapshot(src, backend.SnapshotInfo{StartTime: start, EndTime: start})
+	h.fake.SetStatus(src, backend.SourceStatus{Status: backend.StatusIdle, LastSnapshot: &backend.SnapshotInfo{StartTime: start}})
+	c.add(time.Minute)
+	h.mustPass(app)
+
+	if p := h.pins(app, start); len(p) != 0 {
+		t.Errorf("pins = %v", p)
 	}
 }

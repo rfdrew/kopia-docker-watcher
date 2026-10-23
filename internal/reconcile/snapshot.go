@@ -59,8 +59,8 @@ type snapRequest struct {
 	// container is the container that asks, for the description: it may
 	// be gone already.
 	container describedContainer
-	// event is the start event to keep when the decision is put off to a
-	// later pass.
+	// event is the start or stop event to keep when the decision is put
+	// off to a later pass.
 	event *docker.Event
 
 	// retry marks a snapshot taken once more because the first was lost.
@@ -511,13 +511,15 @@ func (ps *pass) absorbedRetry(rec state.Record, status *backend.SourceStatus, ma
 	case savedAfter(status, at, rec.StopAbsorbedLastStart):
 		if ps.describeAbsorbed(rec, mark) {
 			ps.clearAbsorbed(at)
+		} else {
+			ps.absorbedHeld = true
 		}
 
 		return nil
 	}
 
 	return []snapRequest{{stop: true, reason: "again: the stop at " + at.Format(timeFormat) + ", whose pending snapshot saved nothing",
-		retry: true, absorbed: true, description: rec.StopAbsorbedDescription, pins: rec.StopAbsorbedPins}}
+		retry: true, absorbed: true, description: rec.StopAbsorbedDescription, pins: absorbedPins(rec)}}
 }
 
 // describeAbsorbed gives the first complete snapshot after an absorbed
@@ -525,7 +527,7 @@ func (ps *pass) absorbedRetry(rec state.Record, status *backend.SourceStatus, ma
 // stop and the pins the stop asked for. It reports whether the stop is done
 // with; after a passing failure it is kept for a later pass.
 func (ps *pass) describeAbsorbed(rec state.Record, mark *time.Time) bool {
-	desc, pins := rec.StopAbsorbedDescription, rec.StopAbsorbedPins
+	desc, pins := rec.StopAbsorbedDescription, absorbedPins(rec)
 	if desc == "" && len(pins) == 0 || ps.cannotDescribe() {
 		return true
 	}
@@ -589,6 +591,7 @@ func clearAbsorbedFields(r *state.Record) {
 	r.StopAbsorbedDescription = ""
 	r.StopAbsorbedLastStart = time.Time{}
 	r.StopAbsorbedPins = nil
+	r.StopAbsorbedPinsAt = time.Time{}
 }
 
 // removeWaits removes the waits with the given IDs from the record.
@@ -709,7 +712,8 @@ func (ps *pass) requests() []snapRequest {
 				reason += " without an event"
 			}
 
-			reqs = append(reqs, snapRequest{stop: true, reason: reason, container: sl.described, pins: stopPins(sl, s.died.Time, ps.started)})
+			reqs = append(reqs, snapRequest{stop: true, reason: reason, container: sl.described, event: s.died,
+				pins: stopPins(sl, s.died.Time, ps.started)})
 		}
 	}
 
@@ -735,10 +739,11 @@ func (ps *pass) unseenRequests(startAsked, stopAsked bool) []snapRequest {
 		switch {
 		case o.snap.oneOff:
 		case !wasPaused && ps.want.Paused && !stopAsked && o.snap.onStop:
-			ps.events = append(ps.events, docker.Event{Kind: docker.KindDied, Action: unseenStopAction, ContainerID: o.id,
-				Name: o.name, Labels: o.labels, Time: ps.started})
+			ev := docker.Event{Kind: docker.KindDied, Action: unseenStopAction, ContainerID: o.id, Name: o.name, Labels: o.labels,
+				Time: ps.started}
+			ps.events = append(ps.events, ev)
 			reqs = append(reqs, snapRequest{stop: true, reason: "stop of " + o.name + " without an event", container: o.snap.described,
-				pins: stopPins(o.snap, ps.started, ps.started)})
+				event: &ev, pins: stopPins(o.snap, ps.started, ps.started)})
 		case wasPaused && !ps.want.Paused && !startAsked && o.snap.onStart && o.state.Running():
 			ev := docker.Event{Kind: docker.KindStarted, Action: unseenStartAction, ContainerID: o.id, Name: o.name,
 				Labels: o.labels, Time: ps.started}
@@ -924,7 +929,10 @@ func (ps *pass) minIntervalPassed(reqs []snapRequest, status *backend.SourceStat
 // is added with the time of the trigger.
 func (ps *pass) settle(reqs []snapRequest, w *state.SnapshotWait) {
 	replaced := map[string]bool{}
-	clearAbsorbed := w != nil && w.Stop
+	// An absorbed stop whose snapshot is saved but not described yet stays
+	// for its description and pins; a new stop snapshot does not stand in
+	// for it.
+	clearAbsorbed := w != nil && w.Stop && !ps.absorbedHeld
 
 	for _, r := range reqs {
 		if r.replaces != "" {
@@ -1019,9 +1027,21 @@ func (ps *pass) absorbStop(reqs []snapRequest, id string, status *backend.Source
 	if id != "" || earlier.IsZero() || !savedAfter(status, earlier, rec.StopAbsorbedLastStart) {
 		earlier = time.Time{}
 	} else if !ps.describeAbsorbed(rec, ps.annotateAfter) {
-		// Kept for a later pass, which describes it and then sees the
-		// source idle or this stop's run pending.
-		earlier = time.Time{}
+		// The earlier stop keeps its slot until its snapshot is described
+		// and pinned, and this one would have none: the stop events are
+		// kept for a pass soon after, which describes the earlier stop
+		// first and then sees this stop's run pending, or uploading.
+		for _, r := range reqs {
+			if r.event != nil {
+				ps.keep = append(ps.keep, *r.event)
+			}
+		}
+
+		ps.recheckSoon = true
+		ps.log.Debug("deciding on the stop snapshot once the snapshot of the earlier absorbed stop is described",
+			"source", ps.src.String())
+
+		return
 	}
 
 	ps.updateRecord(ps.src, func(r *state.Record) bool {
@@ -1055,14 +1075,19 @@ func (ps *pass) absorbStop(reqs []snapRequest, id string, status *backend.Source
 			r.StopAbsorbedAt = ps.started
 			r.StopAbsorbedDescription = desc
 			r.StopAbsorbedLastStart = time.Time{}
-			r.StopAbsorbedPins = pins
+			r.StopAbsorbedPins, r.StopAbsorbedPinsAt = pins, time.Time{}
+
+			if len(pins) > 0 {
+				r.StopAbsorbedPinsAt = ps.started
+			}
 
 			if status != nil && status.LastSnapshot != nil {
 				r.StopAbsorbedLastStart = status.LastSnapshot.StartTime
 			}
 		default:
-			// The stop absorbed earlier waits for the same pending run.
-			r.StopAbsorbedPins = unionPins(r.StopAbsorbedPins, pins)
+			// The stop absorbed earlier waits for the same pending run: its
+			// run has not saved, or the stop would have given way above.
+			r.StopAbsorbedPins, r.StopAbsorbedPinsAt = unionPins(absorbedPins(*r), pins), r.StopAbsorbedAt
 		}
 
 		prunePins(r)

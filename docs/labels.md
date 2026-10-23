@@ -328,7 +328,8 @@ snapshot each time.
 - when kopia server lost the run and the watcher takes the snapshot again, the one taken again;
 - **when the run saved no snapshot because nothing changed since the last one**
   ([`kopia.retention.ignore-identical`](#kopiaretentionignore-identical)), the last complete snapshot of the
-  source, which holds the same files. That is the point of the pin: the state before the update is kept,
+  source taken before the stop snapshot was queued, which holds the same files. A snapshot taken later, such as
+  one of the updated service, is never pinned for the stop. That is the point of the pin: the state before the update is kept,
   whether or not it changed since the last snapshot. Its description is left as it is.
 
 A stop snapshot that fails or is canceled gets no pin, and the watcher logs a warning. A snapshot saved with
@@ -340,8 +341,9 @@ file errors (`incomplete`) is pinned all the same, like it is described.
   if it has one, to its own stop snapshot.
 - The pin is worked out at the stop and kept in `STATE_FILE` until the snapshot is pinned, so a restart of the
   watcher in between, or a container removed meanwhile, loses nothing.
-- kopia server lists the pins of identical snapshots also on the oldest of them, so the watcher does not pin a
-  snapshot again when an identical older copy already shows the pin.
+- kopia server (0.23) lists the pins of identical snapshots also on the oldest of them, even with `all=1`. So the
+  watcher does not add a pin to that oldest snapshot when a newer identical copy already carries it: the files
+  are kept either way.
 - [`kopia.cleanup-on-remove=all`](#kopiacleanup-on-remove) keeps pinned snapshots, the source and its paused
   policy, unless [`kopia.cleanup-delete-pinned`](#kopiacleanup-delete-pinned) is `true`.
 
