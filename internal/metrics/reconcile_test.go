@@ -143,7 +143,7 @@ func TestReconcilerMetrics(t *testing.T) {
 		_ = st.Close()
 	})
 
-	h := metrics.Handler(m)
+	h := metrics.Handler(m, nil)
 
 	r.ReconcileAll()
 	waitMetrics(t, h, nil, map[string]float64{

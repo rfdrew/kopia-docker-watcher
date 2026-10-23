@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"os"
 	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -36,7 +38,19 @@ const (
 	EnvStateFile                     = "STATE_FILE"
 	EnvListenAddr                    = "LISTEN_ADDR"
 	EnvNotifyWebhookURL              = "NOTIFY_WEBHOOK_URL"
+	EnvNotifyWebhookFormat           = "NOTIFY_WEBHOOK_FORMAT"
+	EnvNotifyErrorAfter              = "NOTIFY_ERROR_AFTER"
 	EnvLabelPrefix                   = "LABEL_PREFIX"
+
+	// Limits of kopia server's repository storage, for PUT
+	// /api/v1/repo/throttle.
+	EnvThrottleUploadBytesPerSecond   = "KOPIA_THROTTLE_UPLOAD_BYTES_PER_SECOND"
+	EnvThrottleDownloadBytesPerSecond = "KOPIA_THROTTLE_DOWNLOAD_BYTES_PER_SECOND"
+	EnvThrottleReadsPerSecond         = "KOPIA_THROTTLE_READS_PER_SECOND"
+	EnvThrottleWritesPerSecond        = "KOPIA_THROTTLE_WRITES_PER_SECOND"
+	EnvThrottleListsPerSecond         = "KOPIA_THROTTLE_LISTS_PER_SECOND"
+	EnvThrottleConcurrentReads        = "KOPIA_THROTTLE_CONCURRENT_READS"
+	EnvThrottleConcurrentWrites       = "KOPIA_THROTTLE_CONCURRENT_WRITES"
 
 	// Variables of the Python version that are no longer used.
 	EnvKopiaExecContainer = "KOPIA_EXEC_CONTAINER"
@@ -52,6 +66,8 @@ const (
 	DefaultListenAddr          = ":8080"
 	DefaultLabelPrefix         = "kopia"
 	DefaultCleanupGrace        = 24 * time.Hour
+	DefaultNotifyWebhookFormat = WebhookJSON
+	DefaultNotifyErrorAfter    = 15 * time.Minute
 
 	// MinReconcileInterval keeps a typo such as "5s" from turning every full
 	// reconcile into a burst of policy writes, each of which makes kopia
@@ -62,7 +78,24 @@ const (
 	// of a source moments after docker compose down, the stop snapshot
 	// included, when the containers may well come back.
 	MinCleanupGrace = 10 * time.Minute
+
+	// MinNotifyErrorAfter keeps a retried error from being notified before
+	// the first retries had a chance.
+	MinNotifyErrorAfter = time.Minute
 )
+
+// Webhook formats of NOTIFY_WEBHOOK_FORMAT.
+const (
+	WebhookJSON     = "json"
+	WebhookNtfy     = "ntfy"
+	WebhookSlack    = "slack"
+	WebhookTelegram = "telegram"
+)
+
+// WebhookFormats returns every webhook format.
+func WebhookFormats() []string {
+	return []string{WebhookJSON, WebhookNtfy, WebhookSlack, WebhookTelegram}
+}
 
 // MigrationGuideURL points to the guide for users of the Python version.
 const MigrationGuideURL = "https://github.com/rfdrew/kopia-docker-watcher/blob/main/docs/migration.md"
@@ -88,14 +121,46 @@ type Config struct {
 	// before the cleanup-on-remove label deletes anything of it.
 	CleanupGrace time.Duration
 
-	StateFile        string
-	ListenAddr       string
+	StateFile  string
+	ListenAddr string
+
+	// NotifyWebhookURL is where notifications go; empty sends none. It may
+	// carry a token, so it is never logged as a whole.
 	NotifyWebhookURL string
-	LabelPrefix      string
+	// NotifyWebhookFormat is one of WebhookFormats.
+	NotifyWebhookFormat string
+	// NotifyErrorAfter is how long an error the watcher retries must last
+	// before it is notified.
+	NotifyErrorAfter time.Duration
+
+	LabelPrefix string
+
+	// Throttle holds the limits the watcher sets on kopia server's
+	// repository storage; none set leaves them to kopia server, or to
+	// Terraform.
+	Throttle Throttle
 
 	// Warnings lists non-fatal problems found while loading. They are
 	// logged once the logger is set up.
 	Warnings []string
+}
+
+// Throttle holds the limits of the KOPIA_THROTTLE_ variables; nil is
+// unset, zero is no limit.
+type Throttle struct {
+	UploadBytesPerSecond   *float64
+	DownloadBytesPerSecond *float64
+	ReadsPerSecond         *float64
+	WritesPerSecond        *float64
+	ListsPerSecond         *float64
+	ConcurrentReads        *int
+	ConcurrentWrites       *int
+}
+
+// Set reports whether any limit is set.
+func (t Throttle) Set() bool {
+	return t.UploadBytesPerSecond != nil || t.DownloadBytesPerSecond != nil || t.ReadsPerSecond != nil ||
+		t.WritesPerSecond != nil || t.ListsPerSecond != nil || t.ConcurrentReads != nil || t.ConcurrentWrites != nil
 }
 
 // KopiaServer describes how to reach kopia server.
@@ -131,6 +196,9 @@ func Load(getenv func(string) string) (*Config, error) {
 		StateFile:         DefaultStateFile,
 		ListenAddr:        DefaultListenAddr,
 		LabelPrefix:       DefaultLabelPrefix,
+
+		NotifyWebhookFormat: DefaultNotifyWebhookFormat,
+		NotifyErrorAfter:    DefaultNotifyErrorAfter,
 	}
 
 	if v := l.get(EnvKopiaExecContainer); v != "" {
@@ -211,17 +279,8 @@ func Load(getenv func(string) string) (*Config, error) {
 		cfg.ListenAddr = v
 	}
 
-	if v := l.get(EnvNotifyWebhookURL); v != "" {
-		if _, err := parseHTTPURL(v, true); err != nil {
-			l.errorf("%s: %v", EnvNotifyWebhookURL, err)
-		}
-
-		cfg.NotifyWebhookURL = v
-
-		// Read and checked now so that a configuration written for a later
-		// version keeps working, but nothing sends to it yet.
-		l.warnf("%s is set, but this version sends no webhooks: nothing will be sent to it", EnvNotifyWebhookURL)
-	}
+	l.loadNotify(cfg)
+	l.loadThrottle(&cfg.Throttle)
 
 	if v := l.get(EnvLabelPrefix); v != "" {
 		p, err := ParseLabelPrefix(v)
@@ -241,6 +300,162 @@ func Load(getenv func(string) string) (*Config, error) {
 
 	return cfg, nil
 }
+
+func (l *loader) loadNotify(cfg *Config) {
+	if v := l.get(EnvNotifyWebhookFormat); v != "" {
+		f := strings.ToLower(v)
+		if !slices.Contains(WebhookFormats(), f) {
+			l.errorf("%s: unknown format %q, use %s", EnvNotifyWebhookFormat, v, strings.Join(WebhookFormats(), ", "))
+		}
+
+		cfg.NotifyWebhookFormat = f
+	}
+
+	if v := l.get(EnvNotifyErrorAfter); v != "" {
+		d, err := time.ParseDuration(v)
+
+		switch {
+		case err != nil:
+			l.errorf("%s: invalid duration %q, use a Go duration such as 15m or 1h", EnvNotifyErrorAfter, v)
+		case d < MinNotifyErrorAfter:
+			l.errorf("%s: %v is shorter than the minimum %v", EnvNotifyErrorAfter, d, MinNotifyErrorAfter)
+		default:
+			cfg.NotifyErrorAfter = d
+		}
+	}
+
+	v := l.get(EnvNotifyWebhookURL)
+	if v == "" {
+		if l.get(EnvNotifyWebhookFormat) != "" {
+			l.warnf("%s is set but %s is not: no notifications are sent", EnvNotifyWebhookFormat, EnvNotifyWebhookURL)
+		}
+
+		return
+	}
+
+	u, err := parseHTTPURL(v, true)
+	if err != nil {
+		l.errorf("%s: %v", EnvNotifyWebhookURL, err)
+		return
+	}
+
+	cfg.NotifyWebhookURL = v
+
+	if cfg.NotifyWebhookFormat == WebhookTelegram {
+		if err := checkTelegramURL(u); err != nil {
+			l.errorf("%s: %v", EnvNotifyWebhookURL, err)
+		}
+	}
+}
+
+// checkTelegramURL checks the URL of the Bot API's sendMessage method with
+// the chat in its query. Errors do not echo the URL, which holds the bot
+// token.
+func checkTelegramURL(u *url.URL) error {
+	if !telegramPathRE.MatchString(u.Path) {
+		return errors.New("with the telegram format the URL must be https://api.telegram.org/bot<token>/sendMessage?chat_id=<chat>")
+	}
+
+	if u.Query().Get("chat_id") == "" {
+		return errors.New("with the telegram format the URL needs the chat in its query: ?chat_id=<chat>")
+	}
+
+	return nil
+}
+
+var telegramPathRE = regexp.MustCompile(`^(/.*)?/bot[^/]+/sendMessage$`)
+
+func (l *loader) loadThrottle(t *Throttle) {
+	t.UploadBytesPerSecond = l.byteRate(EnvThrottleUploadBytesPerSecond)
+	t.DownloadBytesPerSecond = l.byteRate(EnvThrottleDownloadBytesPerSecond)
+	t.ReadsPerSecond = l.rate(EnvThrottleReadsPerSecond)
+	t.WritesPerSecond = l.rate(EnvThrottleWritesPerSecond)
+	t.ListsPerSecond = l.rate(EnvThrottleListsPerSecond)
+	t.ConcurrentReads = l.count(EnvThrottleConcurrentReads)
+	t.ConcurrentWrites = l.count(EnvThrottleConcurrentWrites)
+}
+
+// rate reads a non-negative number of operations per second; nil when
+// unset.
+func (l *loader) rate(name string) *float64 {
+	v := l.get(name)
+	if v == "" {
+		return nil
+	}
+
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) {
+		l.errorf("%s: invalid rate %q, use a number of operations per second, 0 for no limit", name, v)
+		return nil
+	}
+
+	return &f
+}
+
+// byteRate reads a non-negative number of bytes per second; nil when
+// unset.
+func (l *loader) byteRate(name string) *float64 {
+	v := l.get(name)
+	if v == "" {
+		return nil
+	}
+
+	f, err := ParseByteSize(v)
+	if err != nil {
+		l.errorf("%s: %v", name, err)
+		return nil
+	}
+
+	return &f
+}
+
+// count reads a non-negative integer; nil when unset.
+func (l *loader) count(name string) *int {
+	v := l.get(name)
+	if v == "" {
+		return nil
+	}
+
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		l.errorf("%s: invalid count %q, use a whole number, 0 for no limit", name, v)
+		return nil
+	}
+
+	return &n
+}
+
+// ParseByteSize parses a number of bytes with an optional unit: k, M, G or
+// T for powers of 1000, Ki, Mi, Gi or Ti for powers of 1024, each with an
+// optional B, in any case. "10MiB" is 10485760. 0 means no limit.
+func ParseByteSize(s string) (float64, error) {
+	m := byteSizeRE.FindStringSubmatch(strings.TrimSpace(s))
+	if m == nil {
+		return 0, fmt.Errorf("invalid size %q, use a number of bytes with an optional unit such as 500k, 10MB or 10MiB", s)
+	}
+
+	f, err := strconv.ParseFloat(m[1], 64)
+	if err != nil || math.IsInf(f, 0) {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+
+	unit := strings.ToLower(m[2])
+
+	base := 1000.0
+	if strings.HasSuffix(unit, "i") {
+		base = 1024
+		unit = strings.TrimSuffix(unit, "i")
+	}
+
+	exp := 0
+	if unit != "" {
+		exp = strings.Index("kmgt", unit) + 1
+	}
+
+	return math.Round(f * math.Pow(base, float64(exp))), nil
+}
+
+var byteSizeRE = regexp.MustCompile(`^([0-9]+(?:\.[0-9]*)?|\.[0-9]+)\s*([kKmMgGtT][iI]?)?[bB]?$`)
 
 func (l *loader) loadKopia(k *KopiaServer) {
 	if v := l.get(EnvKopiaServerURL); v == "" {
@@ -399,7 +614,7 @@ func ParseWatcherPathPrefix(s string) (string, error) {
 // LogValue implements slog.LogValuer. Durations are logged as Go duration
 // strings (5m0s): the JSON handler would print slog.Duration as nanoseconds.
 // Secrets are never logged: only whether
-// the password is set and the webhook host.
+// the password is set and the webhook's scheme and host.
 func (c *Config) LogValue() slog.Value {
 	webhook := ""
 	if u, err := url.Parse(c.NotifyWebhookURL); err == nil && c.NotifyWebhookURL != "" {
@@ -424,8 +639,42 @@ func (c *Config) LogValue() slog.Value {
 		slog.String("state_file", c.StateFile),
 		slog.String("listen_addr", c.ListenAddr),
 		slog.String("notify_webhook", webhook),
+		slog.String("notify_webhook_format", c.NotifyWebhookFormat),
+		slog.String("notify_error_after", c.NotifyErrorAfter.String()),
+		slog.Any("throttle", c.Throttle),
 		slog.String("label_prefix", c.LabelPrefix),
 	)
+}
+
+// LogValue implements slog.LogValuer: the limits that are set, by the
+// names of kopia's throttle fields.
+func (t Throttle) LogValue() slog.Value {
+	var attrs []slog.Attr
+
+	for _, f := range []struct {
+		name string
+		v    *float64
+	}{
+		{"maxUploadSpeedBytesPerSecond", t.UploadBytesPerSecond},
+		{"maxDownloadSpeedBytesPerSecond", t.DownloadBytesPerSecond},
+		{"readsPerSecond", t.ReadsPerSecond},
+		{"writesPerSecond", t.WritesPerSecond},
+		{"listsPerSecond", t.ListsPerSecond},
+	} {
+		if f.v != nil {
+			attrs = append(attrs, slog.Float64(f.name, *f.v))
+		}
+	}
+
+	if t.ConcurrentReads != nil {
+		attrs = append(attrs, slog.Int("concurrentReads", *t.ConcurrentReads))
+	}
+
+	if t.ConcurrentWrites != nil {
+		attrs = append(attrs, slog.Int("concurrentWrites", *t.ConcurrentWrites))
+	}
+
+	return slog.GroupValue(attrs...)
 }
 
 var labelPrefixRE = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$`)

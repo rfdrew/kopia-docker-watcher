@@ -176,6 +176,10 @@
 // the watcher queued ended, and the passes the runs kopia server lost
 // track of that saved no snapshot. A dry run reports nothing but the
 // errors.
+//
+// The Observer is told how each pass of Run ended, after its calls to
+// Metrics, for the notifications; Progress and CheckProgress tell the
+// health check whether Run is stuck.
 package reconcile
 
 import (
@@ -275,6 +279,8 @@ type Options struct {
 	Logger *slog.Logger
 	// Metrics receives the metrics; nil reports nothing.
 	Metrics Metrics
+	// Observer is told how the passes of Run end; nil tells nothing.
+	Observer Observer
 
 	// HostPrefix is HOST_PREFIX: empty or a clean absolute path.
 	HostPrefix string
@@ -328,11 +334,12 @@ type Options struct {
 // Reconciler reconciles source paths. Create it with New, start it with
 // Run.
 type Reconciler struct {
-	backend backend.Backend
-	docker  Docker
-	store   Store
-	log     *slog.Logger
-	metrics Metrics
+	backend  backend.Backend
+	docker   Docker
+	store    Store
+	log      *slog.Logger
+	metrics  Metrics
+	observer Observer
 
 	hostPrefix    string
 	watcherPrefix string
@@ -412,6 +419,13 @@ type Reconciler struct {
 	// dockerTimeout bounds every container listing.
 	dockerTimeout time.Duration
 
+	// progressMu guards runStart, passStarts, the start of every running
+	// pass by path, and lastPassDone, for Progress.
+	progressMu   sync.Mutex
+	runStart     time.Time
+	passStarts   map[string]time.Time
+	lastPassDone time.Time
+
 	// afterPass, if set, is called after every pass of Run; for tests.
 	afterPass func(path string, res passResult)
 	// afterWait, if set, is called after every snapshot waiter; for tests.
@@ -468,6 +482,7 @@ func New(opts Options) (*Reconciler, error) {
 		store:          opts.Store,
 		log:            opts.Logger,
 		metrics:        opts.Metrics,
+		observer:       opts.Observer,
 		hostPrefix:     opts.HostPrefix,
 		watcherPrefix:  opts.WatcherPathPrefix,
 		labelPrefix:    opts.LabelPrefix,
@@ -496,6 +511,7 @@ func New(opts Options) (*Reconciler, error) {
 		sweepDue:       map[string]bool{},
 		mounts:         map[string][]string{},
 		inspectWake:    make(chan struct{}, 1),
+		passStarts:     map[string]time.Time{},
 
 		snapshotOnWatcherStart: opts.SnapshotOnWatcherStart,
 		cleanupGrace:           orDefault(opts.CleanupGrace, config.DefaultCleanupGrace),
@@ -511,6 +527,10 @@ func New(opts Options) (*Reconciler, error) {
 
 	if r.metrics == nil {
 		r.metrics = noMetrics{}
+	}
+
+	if r.observer == nil {
+		r.observer = noObserver{}
 	}
 
 	r.maxBackoff = max(r.maxBackoff, r.minBackoff)
@@ -547,6 +567,10 @@ func (r *Reconciler) Run(ctx context.Context) {
 	r.runCtx = ctx
 	r.mu.Unlock()
 
+	r.progressMu.Lock()
+	r.runStart = time.Now()
+	r.progressMu.Unlock()
+
 	// Passes run on their own context, canceled ShutdownGrace after ctx.
 	passCtx, cancelPasses := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelPasses()
@@ -581,7 +605,9 @@ func (r *Reconciler) work(ctx, passCtx context.Context) {
 			return
 		}
 
+		r.passStarted(p)
 		res := r.reconcile(passCtx, p)
+		r.passDone(passCtx, p, res)
 		r.schedule(ctx, p, res)
 		r.noteFirstScan(p, res)
 

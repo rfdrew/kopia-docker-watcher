@@ -120,6 +120,14 @@ func (q *queue) retryAfter(p string, d time.Duration) {
 	}
 }
 
+// readyLen returns the number of paths ready for a pass.
+func (q *queue) readyLen() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	return len(q.ready)
+}
+
 // arm sets the delayed add of p. q.mu is held.
 func (q *queue) arm(p string, d time.Duration, retry bool) {
 	if w, ok := q.waiting[p]; ok {

@@ -58,12 +58,19 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
 - Serves Prometheus metrics on `/metrics`: when each source last had a complete snapshot (scheduled ones
   included), failures and durations of the watcher's own snapshots, reconcile errors, and the managed sources
   with their containers. See [docs/metrics.md](docs/metrics.md).
+- Checks on `/healthz` that Docker answers, that kopia server answers with a repository connected, and that the
+  reconcile loop is not stuck, and answers 503 when one of them has failed for a while; the image's
+  `HEALTHCHECK` uses it. See [the health check](docs/configuration.md#health-check).
+- Posts a notification to `NOTIFY_WEBHOOK_URL` when a path starts failing (a failed snapshot of the watcher,
+  labels that cannot be applied, kopia server failing for a while) and when it works again, once each, as JSON or
+  for ntfy, Slack or Telegram. See [notifications](docs/configuration.md#notifications).
+- Sets kopia server's upload, download and storage operation limits from the `KOPIA_THROTTLE_` variables; unset,
+  it leaves them to kopia server or Terraform. See [throttle](docs/configuration.md#throttle).
+  [docs/terraform.md](docs/terraform.md) splits kopia server's configuration between the watcher and
+  terraform-provider-kopia.
 
 Not supported yet:
 
-- **No full health check.** `/healthz` answers 200 while the process serves HTTP; it does not check Docker,
-  kopia server or the reconcile loop.
-- **No webhook.** `NOTIFY_WEBHOOK_URL` is read and validated, but nothing is sent to it yet.
 - No hooks (`pre-exec`, `stop-during-backup`, …). These label names are reserved: the watcher warns that they
   are not supported by this version and ignores them.
 - No snapshot tags: kopia server cannot set them through its API yet, so `kopia.tags` go into the description.
@@ -73,7 +80,8 @@ Not supported yet:
 **Docker.** Any Docker Engine with API 1.40 (Docker 19.03) or later. The watcher needs read access to the
 container list, container inspect and the event stream: through `/var/run/docker.sock`, or through a
 [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) that allows `CONTAINERS` and `EVENTS`
-(see [examples/docker-compose.yml](examples/docker-compose.yml)).
+(see [examples/docker-compose.yml](examples/docker-compose.yml)). The health check pings the daemon (`/_ping`),
+which docker-socket-proxy allows by default.
 
 **kopia server.** The watcher is tested against the latest Kopia release, 0.23.1. kopia server must run with:
 
@@ -148,7 +156,7 @@ The image runs `kopia-docker-watcher run` by default.
 | `validate [--strict] label=value… \| -` | Check labels given as arguments, or one per line on stdin with `-`. |
 | `validate [--strict] --container NAME…` | Check the labels of containers. |
 | `validate [--strict] --all` | Check every container with `kopia.enable`, stopped ones included. |
-| `healthcheck` | Exit 0 if the watcher in the same container answers on `/healthz`; used by the image's `HEALTHCHECK`. |
+| `healthcheck` | Exit 0 if the watcher in the same container answers 200 on `/healthz`, that is, is not unhealthy; used by the image's `HEALTHCHECK`. |
 | `version` | Print the version. |
 
 `--strict` turns every label warning into an error. Without `KOPIA_SERVER_URL`, `validate` checks only the
@@ -165,6 +173,7 @@ Logs are JSON lines on stderr.
 - [docs/configuration.md](docs/configuration.md): environment variables.
 - [docs/labels.md](docs/labels.md): container labels.
 - [docs/metrics.md](docs/metrics.md): Prometheus metrics, a scrape configuration and example alerts.
+- [docs/terraform.md](docs/terraform.md): working with terraform-provider-kopia, who owns what.
 - [docs/migration.md](docs/migration.md): moving from the Python `kopia-docker-operator`.
 - [examples/](examples/): a compose file with kopia server, the watcher and a labeled container.
 

@@ -105,12 +105,17 @@ services:
       # Optional safety net: never touch sources outside this path.
       WATCHER_PATH_PREFIX: ${WATCHER_PATH_PREFIX:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Optional notifications when a path starts failing and when it works
+      # again (../docs/configuration.md#notifications).
+      NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
+      NOTIFY_WEBHOOK_FORMAT: ${NOTIFY_WEBHOOK_FORMAT:-}
       # With docker-socket-proxy:
       # DOCKER_HOST: tcp://docker-socket-proxy:2375
     # The watcher finishes its policy writes and saves the state in about
     # 8 s after SIGTERM; give it more than that before Docker kills it.
     stop_grace_period: 15s
-    # /healthz and the Prometheus metrics, /metrics, are on LISTEN_ADDR
+    # /healthz (Docker, kopia server and the reconcile loop) and the
+    # Prometheus metrics, /metrics, are on LISTEN_ADDR
     # (:8080). The port is not published: a Prometheus in this network
     # scrapes watcher:8080 (see ../docs/metrics.md).
 
