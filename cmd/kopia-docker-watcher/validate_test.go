@@ -49,7 +49,7 @@ sources:
 warning: kopia.bogus: unknown label, ignored
 warning: kopia.snapshot-on-stop: "yes" is not a boolean, treated as false; use true or false
 
-kopia server checks skipped: KOPIA_SERVER_URL is not set, so cron expressions and the paths as kopia server sees them were not checked
+kopia server checks skipped: KOPIA_SERVER_URL is not set, so schedules, the compression algorithm and the paths as kopia server sees them were not checked
 `
 	if stdout != want {
 		t.Errorf("stdout:\n%s\nwant:\n%s", stdout, want)
@@ -248,7 +248,7 @@ func TestValidate(t *testing.T) {
 		{
 			name:   "server checks skipped",
 			args:   []string{"kopia.enable=true", "kopia.path=/data"},
-			stdout: []string{"kopia server checks skipped: KOPIA_SERVER_URL is not set, so cron expressions and the paths as kopia server sees them were not checked"},
+			stdout: []string{"kopia server checks skipped: KOPIA_SERVER_URL is not set, so schedules, the compression algorithm and the paths as kopia server sees them were not checked"},
 		},
 		{name: "all and container", args: []string{"--all", "--container", "web"}, code: 2, stderr: []string{"--all and --container cannot be combined"}},
 		{name: "labels and container", args: []string{"--container", "web", "kopia.enable=true"}, code: 2, stderr: []string{"labels cannot be given together with --all or --container"}},

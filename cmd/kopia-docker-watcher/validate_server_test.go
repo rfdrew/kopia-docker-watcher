@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
 	"github.com/rfdrew/kopia-docker-watcher/internal/kopiaclient"
 )
@@ -30,6 +31,7 @@ type fakeKopia struct {
 	badCron      string            // a cron expression policy/resolve rejects
 	upcoming     []string          // RFC 3339 times policy/resolve returns
 	failResolve  bool              // paths/resolve answers 500
+	failAlgos    bool              // repo/algorithms answers 503
 	calls        []string          // "METHOD /path"
 	updates      []string          // the updates of every policy/resolve, compacted
 }
@@ -85,6 +87,15 @@ func (f *fakeKopia) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "POST /api/v1/policy/resolve":
 		f.checkSource(r)
 		f.resolvePolicy(w, body)
+	case "GET /api/v1/repo/algorithms":
+		if f.failAlgos {
+			writeKopiaError(w, http.StatusServiceUnavailable, "", "unavailable")
+			return
+		}
+
+		writeJSONResponse(w, map[string]any{"compression": []map[string]any{
+			{"id": "zstd", "deprecated": false}, {"id": "s2-default", "deprecated": false}, {"id": "deflate-default", "deprecated": true},
+		}})
 	default:
 		f.t.Errorf("unexpected request %s %s", r.Method, r.URL)
 		w.WriteHeader(http.StatusNotFound)
@@ -503,7 +514,7 @@ kopia.cleanup-delete-pinned  false
 sources:
   /srv/web -> /srv/web
 
-kopia server checks skipped: KOPIA_SERVER_URL is not set, so cron expressions and the paths as kopia server sees them were not checked
+kopia server checks skipped: KOPIA_SERVER_URL is not set, so schedules, the compression algorithm and the paths as kopia server sees them were not checked
 `
 	if stdout != want {
 		t.Errorf("stdout:\n%s\nwant:\n%s", stdout, want)
@@ -555,7 +566,7 @@ func TestValidateContainers(t *testing.T) {
 			engine: &fakeEngine{containers: testContainers()[2:3]},
 			args:   []string{"--all"},
 			stdout: []string{"no containers with the kopia.enable label"},
-			absent: []string{"kopia server checks skipped: KOPIA_SERVER_URL is not set, so cron expressions and the paths as kopia server sees them were not checked"},
+			absent: []string{"kopia server checks skipped: KOPIA_SERVER_URL is not set, so schedules, the compression algorithm and the paths as kopia server sees them were not checked"},
 		},
 		{
 			name:   "with kopia server",
@@ -624,18 +635,115 @@ func TestPreviewPolicy(t *testing.T) {
 		{`{"scheduling":{"cron":["1 1 * * *"],"runMissed":true}}`, nil, `{"scheduling":{"runMissed":true}}`},
 		{`{"retention":{"keepLatest":3},"scheduling":{"timeOfDay":[{"hour":1,"min":0}]}}`, []string{"5 4 * * *"},
 			`{"retention":{"keepLatest":3},"scheduling":{"cron":["5 4 * * *"],"timeOfDay":[{"hour":1,"min":0}]}}`},
+		{`{"scheduling":{"manual":true,"timeOfDay":[{"hour":1,"min":0}]}}`, nil, `{"scheduling":{"timeOfDay":[{"hour":1,"min":0}]}}`},
 	}
 
 	for _, tt := range tests {
-		got, err := previewPolicy(json.RawMessage(tt.stored), tt.cron)
+		got, err := previewPolicy(json.RawMessage(tt.stored), backend.PolicyPatch{Scheduling: backend.SchedulingPatch{Cron: tt.cron}})
 		if err != nil || string(got) != tt.want {
 			t.Errorf("previewPolicy(%s, %q) = %s, %v; want %s", tt.stored, tt.cron, got, err, tt.want)
 		}
 	}
 
 	for _, bad := range []string{`[]`, `"x"`, `{"scheduling":"x"}`} {
-		if _, err := previewPolicy(json.RawMessage(bad), nil); err == nil {
+		if _, err := previewPolicy(json.RawMessage(bad), backend.PolicyPatch{}); err == nil {
 			t.Errorf("previewPolicy(%s): expected an error", bad)
 		}
+	}
+}
+
+// The policy labels are listed, previewed with the stored policy, and the
+// compression algorithm is checked against kopia server's, which is asked
+// once.
+func TestValidatePolicyLabels(t *testing.T) {
+	k := newFakeKopia(t)
+	k.policies["/data"] = `{"retention":{"keepDaily":30,"keepWeekly":4},"scheduling":{"cron":["5 5 * * *"]}}`
+
+	code, stdout, stderr := validateRun{env: kopiaEnv(), kopia: k}.run(t,
+		"kopia.enable=true",
+		"kopia.path=/data,/logs",
+		"kopia.interval=6h",
+		"kopia.time-of-day=02:30",
+		"kopia.retention.daily=7",
+		"kopia.compression.algorithm=zstd",
+		"kopia.max-file-size=1GiB",
+	)
+
+	if code != 0 || stderr != "" {
+		t.Fatalf("exit code = %d, stderr: %s\nstdout: %s", code, stderr, stdout)
+	}
+
+	for _, line := range []string{
+		"kopia.schedule               (inherit from the parent policies)\n",
+		"\npolicy fields:\n" +
+			"  compression.compressorName = \"zstd\"\n" +
+			"  files.maxFileSize = 1073741824\n" +
+			"  retention.keepDaily = 7\n" +
+			"  scheduling.intervalSeconds = 21600\n" +
+			"  scheduling.timeOfDay = [{\"hour\":2,\"min\":30}]\n" +
+			"\nsources:\n",
+	} {
+		if !strings.Contains(stdout, line) {
+			t.Errorf("stdout lacks %q:\n%s", line, stdout)
+		}
+	}
+
+	calls, updates := k.recorded()
+
+	if n := slices.Index(calls, "GET /api/v1/repo/algorithms"); n < 0 || slices.Contains(calls[n+1:], "GET /api/v1/repo/algorithms") {
+		t.Errorf("calls = %q, want repo/algorithms once", calls)
+	}
+
+	wantUpdates := []string{
+		`{"compression":{"compressorName":"zstd"},"files":{"maxFileSize":1073741824},"retention":{"keepDaily":7,"keepWeekly":4},` +
+			`"scheduling":{"intervalSeconds":21600,"timeOfDay":[{"hour":2,"min":30}]}}`,
+		`{"compression":{"compressorName":"zstd"},"files":{"maxFileSize":1073741824},"retention":{"keepDaily":7},` +
+			`"scheduling":{"intervalSeconds":21600,"timeOfDay":[{"hour":2,"min":30}]}}`,
+	}
+	if !slices.Equal(updates, wantUpdates) {
+		t.Errorf("updates = %q, want %q", updates, wantUpdates)
+	}
+}
+
+func TestValidateCompressionAlgorithm(t *testing.T) {
+	tests := []struct {
+		name   string
+		label  string
+		fail   bool
+		code   int
+		stdout string
+	}{
+		{name: "unknown", label: "kopia.compression.algorithm=brotli", code: 1,
+			stdout: `error: kopia.compression.algorithm: kopia server does not support the compression algorithm "brotli"; use one of s2-default, zstd, none`},
+		{name: "case", label: `kopia.policy-json={"compression":{"compressorName":"ZSTD"}}`, code: 1,
+			stdout: `error: kopia.policy-json: kopia server does not support the compression algorithm "ZSTD"; did you mean zstd?`},
+		{name: "deprecated", label: "kopia.compression.algorithm=deflate-default", code: 0,
+			stdout: `warning: kopia.compression.algorithm: compression algorithm "deflate-default" is deprecated by kopia; it still works`},
+		{name: "kopia server fails", label: "kopia.compression.algorithm=zstd", fail: true, code: 1,
+			stdout: "error: kopia.compression.algorithm: cannot list the compression algorithms of kopia server: "},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			k := newFakeKopia(t)
+			k.failAlgos = tt.fail
+
+			code, stdout, stderr := validateRun{env: kopiaEnv(), kopia: k}.run(t, "kopia.enable=true", "kopia.path=/data", tt.label)
+			if code != tt.code || stderr != "" || !strings.Contains(stdout, tt.stdout) {
+				t.Errorf("exit code = %d, want %d; stderr: %s\nstdout:\n%s\nwant a line %q", code, tt.code, stderr, stdout, tt.stdout)
+			}
+		})
+	}
+
+	// none needs no answer of kopia server.
+	k := newFakeKopia(t)
+	k.failAlgos = true
+
+	if code, stdout, _ := (validateRun{env: kopiaEnv(), kopia: k}).run(t, "kopia.enable=true", "kopia.path=/data", "kopia.compression.algorithm=none"); code != 0 {
+		t.Errorf("exit code = %d\n%s", code, stdout)
+	}
+
+	if calls, _ := k.recorded(); slices.Contains(calls, "GET /api/v1/repo/algorithms") {
+		t.Errorf("calls = %q", calls)
 	}
 }

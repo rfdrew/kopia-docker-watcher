@@ -32,7 +32,10 @@ type key struct {
 // keys are the supported labels. A nested key such as retention.daily is
 // one more entry with a dotted name; its value goes to a nested field of
 // ContainerSpec.Policy.
-var keys = []key{
+var keys = slices.Concat(coreKeys, policyKeys)
+
+// coreKeys are the labels of everything but the policy fields.
+var coreKeys = []key{
 	{KeyEnable, func(p *parser, v string) { p.spec.Enable = p.bool(v) }},
 	{KeyPath, (*parser).paths},
 	{KeySchedule, (*parser).schedule},
@@ -50,33 +53,6 @@ var keys = []key{
 // the schema tests check them together with keys, so that a key added now
 // cannot clash with one of them later.
 var plannedKeys = []string{
-	// Policy of the path.
-	"interval",
-	"time-of-day",
-	"run-missed",
-	"retention.latest",
-	"retention.hourly",
-	"retention.daily",
-	"retention.weekly",
-	"retention.monthly",
-	"retention.annual",
-	"retention.ignore-identical",
-	"ignore",
-	"ignore-files",
-	"ignore-cache-dirs",
-	"max-file-size",
-	"one-file-system",
-	"ignore-file-errors",
-	"ignore-dir-errors",
-	"ignore-unknown-types",
-	"compression.algorithm",
-	"compression.min-size",
-	"compression.max-size",
-	"compression.only",
-	"compression.never",
-	"upload.parallel-files",
-	"policy-json",
-
 	// Paths from the container's mounts.
 	"volumes",
 	"exclude-volumes",

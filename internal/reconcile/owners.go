@@ -62,9 +62,7 @@ func (r *Reconciler) labelOK(pc parsed, key string) bool {
 
 // patch returns the policy fields the labels set.
 func (pc parsed) patch() backend.PolicyPatch {
-	return backend.PolicyPatch{
-		Scheduling: backend.SchedulingPatch{Cron: slices.Clone(pc.spec.Policy.Scheduling.Cron)},
-	}
+	return pc.spec.Policy.Clone()
 }
 
 // owner is a container that uses a path.

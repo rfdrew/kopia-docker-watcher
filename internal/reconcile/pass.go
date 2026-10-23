@@ -270,6 +270,10 @@ func (ps *pass) run() error {
 	ps.containers = containers
 	ps.owners = ps.Reconciler.owners(ps.path, containers)
 
+	if err := ps.checkCompression(); err != nil {
+		return err
+	}
+
 	rec, had := ps.store.Get(src)
 	ps.last, ps.had = rec.Applied, had
 	ps.owned = ownership{owners: rec.Owners, orphaned: rec.OrphanedSince}

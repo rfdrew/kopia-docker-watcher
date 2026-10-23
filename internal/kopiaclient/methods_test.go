@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"testing"
 	"time"
 )
@@ -572,4 +573,28 @@ func mustMarshal(t *testing.T, v any) string {
 	}
 
 	return string(b)
+}
+
+func TestSupportedAlgorithms(t *testing.T) {
+	f := newFakeKopia()
+	f.handle("GET repo/algorithms", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, map[string]any{
+			"defaultHash": "BLAKE2B-256-128", "hash": []map[string]any{{"id": "BLAKE2B-256-128", "deprecated": false}},
+			"compression": []map[string]any{{"id": "zstd", "deprecated": false}, {"id": "deflate-default", "deprecated": true}},
+		})
+	})
+
+	got, err := newTestClient(t, f).SupportedAlgorithms(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []AlgorithmInfo{{ID: "zstd"}, {ID: "deflate-default", Deprecated: true}}
+	if !slices.Equal(got.Compression, want) {
+		t.Errorf("compression = %+v, want %+v", got.Compression, want)
+	}
+
+	if call := f.lastCall(t); call.Method != http.MethodGet || call.Path != "/api/v1/repo/algorithms" {
+		t.Errorf("call = %s %s", call.Method, call.Path)
+	}
 }

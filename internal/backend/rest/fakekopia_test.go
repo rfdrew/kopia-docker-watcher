@@ -41,6 +41,8 @@ import (
 //   - POST /api/v1/policy/resolve puts updates in place of the stored
 //     policy, reports a scheduling error, and returns the upcoming times
 //     set with upcoming unless the effective scheduling is manual.
+//   - GET /api/v1/repo/algorithms lists four compression algorithms, one
+//     of them deprecated, unsorted.
 //   - POST /api/v1/paths/resolve expands ~, resolves a relative path
 //     against home and cleans it.
 //   - GET /api/v1/tasks lists tasks, GET /api/v1/tasks/{id} returns one
@@ -415,6 +417,12 @@ func (f *fakeKopia) serve(r fakeRequest) (int, string) {
 		return f.upload(r.Query)
 	case "GET tasks":
 		return ok(map[string]any{"tasks": f.tasks})
+	case "GET repo/algorithms":
+		return ok(map[string]any{"defaultHash": "BLAKE2B-256-128", "hash": []map[string]any{{"id": "BLAKE2B-256-128"}},
+			"compression": []map[string]any{
+				{"id": "zstd", "deprecated": false}, {"id": "s2-default", "deprecated": false},
+				{"id": "deflate-default", "deprecated": true}, {"id": "gzip", "deprecated": false},
+			}})
 	case "GET snapshots":
 		return f.listSnapshots(r.Query)
 	case "POST snapshots/edit":
