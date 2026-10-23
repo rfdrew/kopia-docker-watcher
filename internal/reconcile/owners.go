@@ -115,8 +115,10 @@ type owner struct {
 	valid  bool
 	patch  backend.PolicyPatch
 	issues labels.Issues
-	// snap is what its labels say about snapshots.
-	snap snapLabels
+	// snap is what its labels say about snapshots, hooks about the hooks
+	// around them.
+	snap  snapLabels
+	hooks hookLabels
 	// cleanup and deletePinned are what its labels ask of the cleanup of
 	// the path's source once no container backs it up: the most cautious
 	// values when the label in question has an error.
@@ -136,7 +138,7 @@ func (r *Reconciler) owners(p string, containers []docker.Container) []owner {
 		}
 
 		o := owner{id: c.ID, name: c.Name, state: c.State, labels: c.Labels, valid: pc.valid(), issues: pc.issues,
-			snap: r.snapshotLabels(pc), cleanup: labels.CleanupPause}
+			snap: r.snapshotLabels(pc), hooks: r.hookLabels(pc), cleanup: labels.CleanupPause}
 		if o.valid {
 			o.patch = pc.patch()
 		}

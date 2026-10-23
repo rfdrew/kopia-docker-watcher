@@ -769,3 +769,64 @@ func TestMergeIntentKeepsOldPatch(t *testing.T) {
 
 	assertJSON(t, "Policy", again.Policy, `{"scheduling":{"cron":["0 * * * *"]}}`)
 }
+
+// A source whose owners run hooks keeps kopia server's schedule off while
+// they run, as the pause does; Unpaused has the section the watcher's own
+// schedule is worked out from, and dropping the hooks puts it back.
+func TestMergeOwnSchedule(t *testing.T) {
+	patch := cronPatch("0 * * * *")
+	start := json.RawMessage(`{"scheduling":{"cron":["0 * * * *"],"runMissed":true},"retention":{"keepDaily":7}}`)
+
+	own, err := Merge(start, Desired{Source: testSource, Patch: patch, OwnSchedule: true}, Applied{Patch: patch})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertJSON(t, "policy", own.Policy, `{"scheduling":{"manual":true},"retention":{"keepDaily":7}}`)
+	assertJSON(t, "unpaused", own.Unpaused, string(start))
+	assertJSON(t, "saved", own.Applied.SavedScheduling, `{"cron":["0 * * * *"],"runMissed":true}`)
+
+	if !own.Changed {
+		t.Error("taking the schedule over writes nothing")
+	}
+
+	// The owners stop and start again: nothing changes in the policy.
+	for _, paused := range []bool{true, false} {
+		m, err := Merge(own.Policy, Desired{Source: testSource, Patch: patch, OwnSchedule: true, Paused: paused}, own.Applied)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if m.Changed {
+			t.Errorf("paused %v: the policy changes to %s", paused, m.Policy)
+		}
+
+		assertJSON(t, "unpaused", m.Unpaused, string(start))
+	}
+
+	back, err := Merge(own.Policy, Desired{Source: testSource, Patch: patch}, own.Applied)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertJSON(t, "policy without hooks", back.Policy, string(start))
+
+	if !back.Changed || back.Applied.SavedScheduling != nil {
+		t.Errorf("Changed = %v, saved %s", back.Changed, back.Applied.SavedScheduling)
+	}
+
+	// The fingerprint of kopia server's own form counts for the own
+	// schedule as for the pause.
+	stored := own.Applied
+	stored.StoredHash = mustFingerprint(t, `{"scheduling":{"manual":true},"retention":{"keepDaily":7},"files":{}}`)
+
+	m, err := Merge(json.RawMessage(`{"scheduling":{"manual":true},"retention":{"keepDaily":7},"files":{}}`),
+		Desired{Source: testSource, Patch: patch, OwnSchedule: true}, stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if m.Changed {
+		t.Errorf("kopia server's form of the policy is written again: %s", m.Policy)
+	}
+}

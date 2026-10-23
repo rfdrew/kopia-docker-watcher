@@ -8,8 +8,9 @@
 // applied, the scheduling section a pause replaced, an apply in progress,
 // the fingerprint of the stored policy. It also holds what the snapshot
 // lifecycle needs across restarts: the snapshots the watcher queued and
-// still waits for, when it last queued one, and the mark after which
-// snapshots get a description. And it holds who owns the source: the
+// still waits for, when it last queued one, the mark after which
+// snapshots get a description, and for a source whose containers run
+// hooks, the watcher's own schedule and the snapshot with hooks under way. And it holds who owns the source: the
 // containers that back it up, with what their labels ask for once they are
 // gone (Docker forgets the labels of a container it removes), and since
 // when the source has had none. A record stays until it is deleted, also
@@ -52,7 +53,10 @@
 //	      "owners": [{"id": "4f2c…", "name": "app", "composeProject": "shop", "labelsHash": "sha256:…",
 //	        "cleanup": "all", "gone": "2026-10-19T08:00:00Z"}],
 //	      "ownersUpdated": "2026-10-19T08:00:00Z",
-//	      "orphanedSince": "2026-10-19T08:00:00Z"
+//	      "orphanedSince": "2026-10-19T08:00:00Z",
+//	      "schedule": {"next": "2026-10-19T09:00:00Z", "basis": "{\"cron\":[\"0 * * * *\"]}", "runMissed": true},
+//	      "hookRun": {"id": "2026-10-19T08:00:00Z", "started": "2026-10-19T08:00:00Z", "phase": "snapshot",
+//	        "reason": "schedule", "preDone": true, "waitID": "2026-10-19T08:00:05Z"}
 //	    }
 //	  ]
 //	}
@@ -226,6 +230,77 @@ type Record struct {
 	// zero while it has one, and while a container on record still exists.
 	// CLEANUP_GRACE counts from it.
 	OrphanedSince time.Time `json:"orphanedSince,omitzero"`
+
+	// Schedule is the watcher's own schedule of a source whose containers
+	// run hooks around its snapshots; nil for a source kopia server
+	// schedules.
+	Schedule *Schedule `json:"schedule,omitempty"`
+
+	// HookRun is the snapshot with hooks the watcher is taking of the
+	// source; nil while it takes none. There is at most one at a time.
+	HookRun *HookRun `json:"hookRun,omitempty"`
+}
+
+// Schedule is the watcher's own schedule of a source, worked out with
+// kopia server's policy/resolve from the policy the source would have
+// without its hooks.
+//
+// Its fields are closed, like those of a wait.
+type Schedule struct {
+	// Next is when the next scheduled snapshot is due; zero when the
+	// schedule has none, as when the policy sets no schedule.
+	Next time.Time `json:"next,omitzero"`
+	// Basis is the scheduling section of the path's policy that Next was
+	// worked out from, as compact JSON; a change works Next out again.
+	Basis string `json:"basis,omitempty"`
+	// Interval and RunMissed say what the effective schedule had when Next
+	// was worked out: an interval, and runMissed. With either, a Next that
+	// passed while the watcher could not take it is taken late; without,
+	// it is skipped.
+	Interval  bool `json:"interval,omitempty"`
+	RunMissed bool `json:"runMissed,omitempty"`
+	// Paused reports that no container of the source ran at the last pass,
+	// so no scheduled snapshot is taken.
+	Paused bool `json:"paused,omitempty"`
+}
+
+// Hook run phases.
+const (
+	// HookPre: the pre-exec hooks run, or have run when PreDone is set.
+	HookPre = "pre"
+	// HookSnapshot: the snapshot is queued; WaitID names its wait.
+	HookSnapshot = "snapshot"
+	// HookPost: the post-exec hooks run.
+	HookPost = "post"
+)
+
+// HookRun is a snapshot the watcher takes with hooks: the pre-exec hooks of
+// the running containers, the snapshot, then their post-exec hooks, which
+// run whatever became of the rest. A run ends when its post-exec hooks have
+// run, and the record then loses it.
+//
+// Its fields are closed, like those of a wait.
+type HookRun struct {
+	// ID tells the runs of a source apart.
+	ID string `json:"id"`
+	// Started is when the run began.
+	Started time.Time `json:"started"`
+	// Phase is HookPre, HookSnapshot or HookPost.
+	Phase string `json:"phase"`
+	// Reason says for the log why, e.g. "schedule, start of app".
+	Reason string `json:"reason,omitempty"`
+	// Description is what the snapshot is described as, worked out when
+	// the run began.
+	Description string `json:"description,omitempty"`
+	// Retried marks a run that takes a lost snapshot once more.
+	Retried bool `json:"retried,omitempty"`
+	// PreDone reports that the pre-exec hooks have run; PreError says why
+	// they failed, empty when they succeeded. A run whose pre-exec hooks
+	// failed takes no snapshot.
+	PreDone  bool   `json:"preDone,omitempty"`
+	PreError string `json:"preError,omitempty"`
+	// WaitID is the ID of the snapshot's wait, once it is queued.
+	WaitID string `json:"waitID,omitempty"`
 }
 
 // Owner is a container that backs a source up, as the state remembers it.

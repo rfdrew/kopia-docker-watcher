@@ -31,6 +31,11 @@ type fakeDocker struct {
 	failEvents int // /events requests still to answer with 500
 	failPing   bool
 	requests   []recordedRequest
+
+	// execSpecs say how the commands run in each container end, by
+	// container ID; execs are the execs created, by exec ID.
+	execSpecs map[string]fakeExecSpec
+	execs     map[string]*fakeExec
 }
 
 type recordedRequest struct {
@@ -109,6 +114,10 @@ func (f *fakeDocker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Query:     r.URL.Query(),
 	})
 	f.mu.Unlock()
+
+	if f.serveExec(w, r, path) {
+		return
+	}
 
 	id, isContainer := strings.CutPrefix(path, "/containers/")
 	id, isJSON := strings.CutSuffix(id, "/json")

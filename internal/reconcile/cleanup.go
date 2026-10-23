@@ -287,11 +287,11 @@ type cleanupPlan struct {
 
 // planCleanup works out where the cleanup of the source of the pass stands
 // by its record. The cleanup waits for CLEANUP_GRACE, for the snapshots the
-// watcher queued, such as the one at the stop, for a snapshot that is
-// pending or uploading, and as long as a container it remembers as an owner
-// still exists: such a container no longer names the path only because the
-// watcher's configuration changed, say LABEL_PREFIX or HOST_PREFIX, and its
-// source is not abandoned.
+// watcher queued, such as the one at the stop, and their hooks, for a
+// snapshot that is pending or uploading, and as long as a container it
+// remembers as an owner still exists: such a container no longer names the
+// path only because the watcher's configuration changed, say LABEL_PREFIX
+// or HOST_PREFIX, and its source is not abandoned.
 func (ps *pass) planCleanup(rec state.Record) cleanupPlan {
 	cp := cleanupPlan{since: rec.OrphanedSince}
 	cp.mode, cp.pinned = cleanupOf(rec.Owners)
@@ -321,6 +321,8 @@ func (ps *pass) planCleanup(rec state.Record) cleanupPlan {
 		cp.wait = "CLEANUP_GRACE has not passed"
 	case len(rec.SnapshotWaits) > 0 || !rec.StopAbsorbedAt.IsZero():
 		cp.wait = "a snapshot the watcher queued, such as the one at the stop, has not finished"
+	case rec.HookRun != nil:
+		cp.wait = "a snapshot with hooks has not finished"
 	case status == backend.StatusPending || status == backend.StatusUploading:
 		cp.wait = "a snapshot is " + strings.ToLower(string(status))
 	}

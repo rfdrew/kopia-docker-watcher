@@ -123,6 +123,9 @@ services:
   # events (the proxy also allows /_ping and /version, which the Docker
   # client uses). To use it, uncomment this service and DOCKER_HOST above,
   # and remove group_add and the docker.sock mount from the watcher.
+  # Hooks (kopia.pre-exec, kopia.post-exec) run with docker exec: they need
+  # EXEC: 1 and POST: 1, which lets through every POST to containers too
+  # (../docs/configuration.md#docker).
   #
   # docker-socket-proxy:
   #   image: tecnativa/docker-socket-proxy:latest  # pin a version

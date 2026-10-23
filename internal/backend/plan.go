@@ -16,6 +16,13 @@ type Desired struct {
 	Patch PolicyPatch
 	// Paused is true when no owner is running.
 	Paused bool
+	// OwnSchedule is true when the watcher takes the scheduled snapshots of
+	// the source itself, because its owners run hooks around them. kopia
+	// server's schedule is then kept off as by the pause: the scheduling
+	// section is {"manual": true}, and the one it replaces is kept in
+	// Applied.SavedScheduling. Merged.Unpaused has that section, so the
+	// watcher works out its schedule with PreviewSchedule.
+	OwnSchedule bool
 	// Owners are the names of the containers that use the path, sorted.
 	// They are for logs and the plan; kopia server keeps nothing of them.
 	Owners []string
@@ -143,8 +150,13 @@ func (a Applied) Equal(b Applied) bool {
 	return err == nil && same
 }
 
-// paused reports whether the watcher paused the source with a.
+// paused reports whether the watcher turned kopia server's schedule of the
+// source off with a: paused it, or took its schedule over.
 func (a Applied) paused() bool { return a.SavedScheduling != nil }
+
+// manual reports whether the desired policy keeps kopia server's schedule
+// off: the source is paused, or the watcher takes its scheduled snapshots.
+func (d Desired) manual() bool { return d.Paused || d.OwnSchedule }
 
 // Action is what ApplyPlan does.
 type Action int

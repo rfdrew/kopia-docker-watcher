@@ -463,7 +463,7 @@ func TestParseUnknownKeys(t *testing.T) {
 		{"kopia.path.extra", "unknown label, ignored"},
 		{"kopia.Enable", "unknown label, ignored; did you mean kopia.enable?"},
 		{"kopia.snapshot_on_stop", "unknown label, ignored; did you mean kopia.snapshot-on-stop?"},
-		{"kopia.pre-exec", "not supported by this version, ignored"},
+		{"kopia.stop-during-backup", "not supported by this version, ignored"},
 		{"kopia.Retention.Daily", "unknown label, ignored; did you mean kopia.retention.daily?"},
 		{"kopia.compression", "unknown label, ignored; it is a group of labels such as kopia.compression.algorithm"},
 		{"kopia.retention", "unknown label, ignored; it is a group of labels such as kopia.retention.latest"},
@@ -488,7 +488,7 @@ func TestParseStrict(t *testing.T) {
 		"kopia.tags":             "standalone,env:dev,env:prod",
 		"kopia.bogus":            "1",
 		"kopia.Enable":           "true",
-		"kopia.pre-exec":         "pg_dump",
+		"kopia.depends-on":       "db",
 	}
 
 	want := spec(func(s *ContainerSpec) {
@@ -501,8 +501,8 @@ func TestParseStrict(t *testing.T) {
 		checkParse(t, labels, Options{}, want, []string{
 			"warning kopia.Enable: unknown label, ignored; did you mean kopia.enable?",
 			"warning kopia.bogus: unknown label, ignored",
+			"warning kopia.depends-on: not supported by this version, ignored",
 			`warning kopia.path: "/data" is listed more than once`,
-			"warning kopia.pre-exec: not supported by this version, ignored",
 			`warning kopia.snapshot-on-stop: "yes" is not a boolean, treated as false; use true or false`,
 			`warning kopia.tags: tag "standalone" is not key:value, ignored`,
 			`warning kopia.tags: tag key "env" is repeated, the last value is used`,
@@ -515,8 +515,8 @@ func TestParseStrict(t *testing.T) {
 		checkParse(t, labels, Options{Strict: true}, want, []string{
 			"error kopia.Enable: unknown label; did you mean kopia.enable?",
 			"error kopia.bogus: unknown label",
+			"error kopia.depends-on: not supported by this version",
 			`error kopia.path: "/data" is listed more than once`,
-			"error kopia.pre-exec: not supported by this version",
 			`error kopia.snapshot-on-stop: "yes" is not a boolean; use true or false`,
 			`error kopia.tags: tag "standalone" is not key:value`,
 			`error kopia.tags: tag key "env" is repeated`,
@@ -607,5 +607,116 @@ func TestParseLeavesInputAlone(t *testing.T) {
 
 	if !maps.Equal(in, before) {
 		t.Fatalf("input changed: %v", in)
+	}
+}
+
+func TestParseHooks(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels map[string]string
+		want   func(s *ContainerSpec)
+		issues []string
+	}{
+		{
+			name:   "shell command",
+			labels: map[string]string{"kopia.pre-exec": " redis-cli save && sync "},
+			want: func(s *ContainerSpec) {
+				s.PreExec = []string{"sh", "-c", "redis-cli save && sync"}
+				s.Hooks = true
+			},
+		},
+		{
+			name: "JSON array",
+			labels: map[string]string{
+				"kopia.pre-exec":  `["pg_dump", "-U", "app", "-f", "/backup/db.sql"]`,
+				"kopia.post-exec": `["rm","/backup/db.sql"]`,
+			},
+			want: func(s *ContainerSpec) {
+				s.PreExec = []string{"pg_dump", "-U", "app", "-f", "/backup/db.sql"}
+				s.PostExec = []string{"rm", "/backup/db.sql"}
+				s.Hooks = true
+			},
+		},
+		{
+			name:   "empty is no hook",
+			labels: map[string]string{"kopia.pre-exec": "  ", "kopia.post-exec": ""},
+		},
+		{
+			name:   "timeout",
+			labels: map[string]string{"kopia.post-exec": "sync", "kopia.hook-timeout": " 1h30m "},
+			want: func(s *ContainerSpec) {
+				s.PostExec = []string{"sh", "-c", "sync"}
+				s.Hooks = true
+				s.HookTimeout = 90 * time.Minute
+			},
+		},
+		{
+			name:   "invalid JSON",
+			labels: map[string]string{"kopia.pre-exec": `["pg_dump",`},
+			want:   func(s *ContainerSpec) { s.Hooks = true },
+			issues: []string{"error kopia.pre-exec: invalid JSON array: unexpected end of JSON input; " + commandHint},
+		},
+		{
+			name:   "not strings",
+			labels: map[string]string{"kopia.pre-exec": `["sleep", 5]`},
+			want:   func(s *ContainerSpec) { s.Hooks = true },
+			issues: []string{"error kopia.pre-exec: item 2 of the array is not a string; " + commandHint},
+		},
+		{
+			name:   "empty array",
+			labels: map[string]string{"kopia.post-exec": `[]`},
+			want:   func(s *ContainerSpec) { s.Hooks = true },
+			issues: []string{"error kopia.post-exec: empty command; " + commandHint},
+		},
+		{
+			name:   "empty command name",
+			labels: map[string]string{"kopia.post-exec": `[" ", "x"]`},
+			want:   func(s *ContainerSpec) { s.Hooks = true },
+			issues: []string{"error kopia.post-exec: the command name is empty; " + commandHint},
+		},
+		{
+			name:   "bad timeout",
+			labels: map[string]string{"kopia.pre-exec": "true", "kopia.hook-timeout": "10"},
+			want: func(s *ContainerSpec) {
+				s.PreExec = []string{"sh", "-c", "true"}
+				s.Hooks = true
+			},
+			issues: []string{`error kopia.hook-timeout: invalid duration "10"; ` + hookTimeoutHint},
+		},
+		{
+			name:   "zero timeout",
+			labels: map[string]string{"kopia.pre-exec": "true", "kopia.hook-timeout": "0s"},
+			want: func(s *ContainerSpec) {
+				s.PreExec = []string{"sh", "-c", "true"}
+				s.Hooks = true
+			},
+			issues: []string{`error kopia.hook-timeout: "0s" is not greater than zero; ` + hookTimeoutHint},
+		},
+		{
+			name:   "empty timeout",
+			labels: map[string]string{"kopia.pre-exec": "true", "kopia.hook-timeout": ""},
+			want: func(s *ContainerSpec) {
+				s.PreExec = []string{"sh", "-c", "true"}
+				s.Hooks = true
+			},
+			issues: []string{"error kopia.hook-timeout: empty value; " + hookTimeoutHint},
+		},
+		{
+			name:   "timeout without a hook",
+			labels: map[string]string{"kopia.hook-timeout": "5m"},
+			want:   func(s *ContainerSpec) { s.HookTimeout = 5 * time.Minute },
+			issues: []string{"warning kopia.hook-timeout: has no effect without kopia.pre-exec or kopia.post-exec"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := Default()
+			if tt.want != nil {
+				tt.want(&want)
+			}
+
+			checkParse(t, tt.labels, Options{}, want, tt.issues)
+		})
 	}
 }

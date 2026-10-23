@@ -36,6 +36,13 @@
 // keeps the replaced section in Applied.SavedScheduling and puts it back,
 // with the labels' fields on top, when the source is unpaused.
 //
+// A source whose owners run hooks around its snapshots
+// (Desired.OwnSchedule) keeps {"manual": true} while its owners run too:
+// the watcher takes its scheduled snapshots, at the times PreviewSchedule
+// gives for Merged.Unpaused, the policy as it would be without the pause,
+// and pauses them itself. Once no owner has hooks, the saved section comes
+// back as after a pause.
+//
 // # Reconciling a source
 //
 // One handler per source reconciles it; handlers of different sources run

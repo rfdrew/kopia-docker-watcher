@@ -475,3 +475,36 @@ func TestPinOnStopStaleAbsorbedPins(t *testing.T) {
 		t.Errorf("pins = %v", p)
 	}
 }
+
+// A source whose containers run hooks takes its stop snapshot without them,
+// and pins it all the same.
+func TestPinOnStopWithHooks(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	withHooks(h)
+	id := h.engine.run("db", enable, pathLabel(app), noOnStart, onStop, preExec, postExec, pinLabel)
+	h.passAndSettle(app)
+
+	c.add(time.Minute)
+	h.engine.setState(id, docker.StateExited)
+
+	ev := h.engine.event(docker.KindDied, id)
+	ev.Time = c.now()
+	h.r.HandleEvent(ev)
+	h.passAndSettle(app)
+
+	h.mustTriggers(app, 1)
+	h.mustExecs()
+
+	w := h.onlyWait(app)
+	if got := h.record(app).WaitPins[w.ID]; !w.Stop || !slices.Equal(got, []string{"before-update-2026-10-18-12-01-00"}) {
+		t.Fatalf("wait = %+v, pins %v", w, got)
+	}
+
+	h.r.wait(t.Context(), w)
+	h.passAndSettle(app)
+
+	if p := h.pins(app, w.Ticket.TriggeredAt); !slices.Equal(p, []string{"before-update-2026-10-18-12-01-00"}) {
+		t.Errorf("pins = %v\nlog:\n%s", p, h.logs)
+	}
+}

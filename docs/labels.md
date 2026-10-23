@@ -47,6 +47,9 @@ kopia-docker-watcher validate --all
 | [`kopia.pin-on-stop`](#kopiapin-on-stop) | — | pin name, with `{date}` and `{time}` |
 | [`kopia.cleanup-on-remove`](#kopiacleanup-on-remove) | `pause` | `pause`, `policy` or `all` |
 | [`kopia.cleanup-delete-pinned`](#kopiacleanup-delete-pinned) | `false` | boolean |
+| [`kopia.pre-exec`](#kopiapre-exec) | — | [command](#commands): JSON array or shell command |
+| [`kopia.post-exec`](#kopiapost-exec) | — | command |
+| [`kopia.hook-timeout`](#kopiahook-timeout) | `10m` | Go duration |
 
 The [policy labels](#policy-labels) set fields of the path's Kopia policy. Each is unset by default: the path
 inherits the field from its parent policies.
@@ -81,7 +84,8 @@ inherits the field from its parent policies.
 
 The names, defaults and boolean values of the Python version's labels (`enable`, `path`, `schedule`,
 `snapshot-on-start`, `snapshot-on-stop`, `description`, `tags`) are kept. `volumes`, `exclude-volumes`,
-`min-interval`, `pin-on-stop`, `cleanup-on-remove`, `cleanup-delete-pinned` and the policy labels are new.
+`min-interval`, `pin-on-stop`, `cleanup-on-remove`, `cleanup-delete-pinned`, the policy labels and the [hooks](#hooks) are
+new.
 
 ## Warnings, errors and strict mode
 
@@ -94,8 +98,8 @@ warning or an error.
 - **An error** means the labels of the container cannot be applied: `kopia.path` missing while `kopia.enable` is
   `true` and `kopia.volumes` is not set, a volume or mount destination in `kopia.volumes` that the container does
   not have, a policy label whose value cannot be read (`kopia.retention.daily=7d`, `kopia.interval=30s`, a
-  `kopia.policy-json` that is not a JSON object), a compression algorithm kopia server does not have, or, in
-  strict mode, any warning.
+  `kopia.policy-json` that is not a JSON object), a compression algorithm kopia server does not have, a hook
+  command or `kopia.hook-timeout` that cannot be read, or, in strict mode, any warning.
 
 What happens to a container with an error:
 
@@ -107,6 +111,8 @@ What happens to a container with an error:
   `kopia.cleanup-on-remove` and `kopia.cleanup-delete-pinned` still apply as long as that label itself has no
   error. A cleanup label with an
   error counts as `pause`.
+- A hook whose label, or `kopia.hook-timeout`, has an error does not run: a `kopia.pre-exec` with an error takes
+  no snapshot instead of one without it, a `kopia.post-exec` with an error fails after the snapshot.
 
 The problems of a container are logged once, as "container labels have errors" at error level or "container
 labels have warnings" at warning level, and again only when they change.
@@ -121,8 +127,7 @@ lies outside `WATCHER_PATH_PREFIX`. The same holds for the source of a mount tha
 **Unknown labels** under the prefix are a warning with a hint where there is one: `kopia.snapshot_on_stop` gets
 "did you mean kopia.snapshot-on-stop?", and `kopia.compression` gets "it is a group of labels such as
 kopia.compression.algorithm". Labels planned for later releases are a warning "not supported by this version" and
-ignored: `kopia.pre-exec`, `kopia.post-exec`,
-`kopia.stop-during-backup`, `kopia.pause-during-backup` and `kopia.depends-on`.
+ignored: `kopia.stop-during-backup`, `kopia.pause-during-backup` and `kopia.depends-on`.
 
 ### Booleans
 
@@ -271,6 +276,8 @@ handles the event.
 - One-off containers of `docker compose run` take none.
 - A start the watcher missed while it was down counts when the watcher sees that the source should no longer be
   paused.
+- With [hooks](#hooks), `kopia.pre-exec` runs before the snapshot, right after the container started. A database
+  may not take connections yet: make the hook wait for it, or set `kopia.snapshot-on-start=false`.
 
 ### `kopia.snapshot-on-stop`
 
@@ -286,6 +293,9 @@ does not wait for the snapshot.
 - `kopia.min-interval` does not hold back a stop snapshot. While a snapshot uploads, kopia server runs the stop
   snapshot after it; while one is pending, that one counts, as it reads the files after the stop.
 - A stop the watcher missed while it was down counts when the watcher sees that the source should be paused.
+- [Hooks](#hooks) do not run around a stop snapshot: they cannot run in a container that has stopped. The
+  watcher logs a warning and takes the snapshot without them. While the `kopia.pre-exec` hooks of another
+  container of the path run, the stop snapshot waits for them.
 
 The labels of the container whose event it is decide: with several owners, each container's own
 `snapshot-on-start` and `snapshot-on-stop` apply to its own starts and stops.
@@ -353,8 +363,9 @@ The shortest time between snapshots that a container start may ask for. Default 
 Go duration: `30m`, `1h`, `24h` (there is no `d` unit).
 
 It counts from the later of the start of the source's last snapshot and the last time the watcher queued one,
-which also counts a snapshot that failed. It does not apply to stop snapshots or to kopia server's scheduled
-snapshots.
+which also counts a snapshot that failed, and a snapshot with hooks whose `kopia.pre-exec` failed. It does not
+apply to stop snapshots or to scheduled snapshots, kopia server's or the watcher's own of a source with
+[hooks](#hooks).
 
 An empty, invalid or negative value keeps the default, with a warning.
 
@@ -450,6 +461,10 @@ kopia.time-of-day: "02:30,14:00"
 `true` takes a snapshot right away when a scheduled time of day or cron run was missed, for example because kopia
 server was down. Written to `scheduling.runMissed`. kopia's default is `true`.
 
+As in kopia server, a missed run is taken only when the next scheduled time is more than 30 minutes away, and an
+interval takes a missed run anyway. The watcher's own schedule of a source with [hooks](#hooks) follows the same
+rules for the times it missed.
+
 ### Schedule, pause and checks
 
 `kopia.schedule`, `kopia.interval`, `kopia.time-of-day` and `kopia.run-missed` all go into the `scheduling`
@@ -461,6 +476,9 @@ section.
 Before it writes a new schedule, the watcher asks kopia server for the next snapshot times of the policy as it
 would be (`policy/resolve`), also while the source is paused. `validate` with `KOPIA_SERVER_URL` shows those
 times.
+
+A source with [hooks](#hooks) keeps `{"manual": true}` while its containers run too: the watcher takes its
+scheduled snapshots itself, at the times of the kept section.
 
 ### `kopia.retention.*`
 
@@ -583,6 +601,141 @@ kopia server checks the policy when the watcher writes it and rejects some field
 `upload.maxParallelSnapshots`; then the source keeps the policy fields last applied, and the watcher logs the
 error. kopia server drops fields it does not know: such a field never shows in the policy, and the watcher does
 not write it again and again.
+
+## Hooks
+
+Commands the watcher runs inside the container around the snapshots of its sources, as `docker exec` does:
+`kopia.pre-exec` before a snapshot, `kopia.post-exec` after it. Use them to leave consistent files for kopia
+server to read: dump a database into the backed-up directory, make a cache write itself to disk.
+
+```yaml
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: example
+    volumes:
+      - /srv/db/data:/var/lib/postgresql/data
+      - /srv/db/dump:/dump
+    labels:
+      kopia.enable: "true"
+      # The dump, not the live data files.
+      kopia.path: "/srv/db/dump"
+      kopia.schedule: "0 3 * * *"
+      # Right after a start the database may not take connections yet.
+      kopia.snapshot-on-start: "false"
+      kopia.pre-exec: '["pg_dump", "-U", "postgres", "-f", "/dump/postgres.sql", "postgres"]'
+      kopia.post-exec: '["rm", "-f", "/dump/postgres.sql"]'
+      kopia.hook-timeout: "30m"
+```
+
+More examples: `kopia.pre-exec: "mysqldump --all-databases -uroot -p\"$$MYSQL_ROOT_PASSWORD\" > /dump/all.sql"`
+(a shell command; `$$` keeps docker compose from expanding the variable, so the container's own environment
+does), `kopia.pre-exec: '["redis-cli", "save"]'`.
+
+### A snapshot with hooks
+
+1. `kopia.pre-exec` runs in every running container of the path that has one, one after the other in the order
+   of the container names, each within its `kopia.hook-timeout`.
+2. When one fails, no snapshot is taken. A hook fails when it exits with a code other than 0, does not finish
+   within its timeout, or cannot run: the container is paused or restarting, the command does not exist, or the
+   hook labels have an error. The hooks left are not run.
+3. Otherwise the watcher queues the snapshot and follows it to its end, as any other. When kopia server refuses
+   to queue it for a reason that does not pass, such as a read-only repository, no snapshot is taken.
+4. `kopia.post-exec` runs in every running container of the path that has one, once the snapshot has ended,
+   however it ended, and also when no snapshot was taken. All of them run, also when one fails.
+
+A label error of a hook makes that hook fail when it is due: a broken `kopia.pre-exec` (or `kopia.hook-timeout`
+next to it) takes no snapshot, a broken `kopia.post-exec` fails after the snapshot. Such a hook is logged as
+"pre-exec hook not run" or "post-exec hook not run".
+
+Every hook that ran is logged when it ends, "pre-exec hook finished" at info level or "pre-exec hook failed" at
+error level, with the container, the duration and the last 4 KiB of what the command wrote to stdout and stderr,
+up to then for a hook that ran out of time. The command itself is not logged: it may hold a password. A failure
+counts in [`kopia_watcher_hook_failures_total`](metrics.md#kopia_watcher_hook_failures_total) and, with
+`NOTIFY_WEBHOOK_URL`, is [notified](configuration.md#notifications) once, as is the next success of that hook in
+that container.
+
+Hooks run around the snapshots the watcher takes: scheduled ones (below) and those at a container start
+(`kopia.snapshot-on-start`, `SNAPSHOT_ON_WATCHER_START`). They do not run around a snapshot at a stop, nor around
+one started in the Kopia web UI or with the kopia CLI, which the watcher does not see coming. A snapshot at a stop
+of one container that comes while the `kopia.pre-exec` hooks of another run waits until they are done and the
+snapshot with hooks is queued, so that it does not read a dump half written.
+
+There is one snapshot with hooks at a time per source. A container start during one waits until it ends and is
+then taken if `kopia.min-interval` allows. `STATE_FILE` keeps how far it got, so a restart of the watcher takes it
+up: when the watcher stopped while `kopia.pre-exec` ran, no snapshot is taken and `kopia.post-exec` runs; when it
+stopped while `kopia.post-exec` ran, that runs again. Write hooks that can run twice. When the watcher stops, it
+gives running hooks the same few seconds as its passes, and starts no new ones.
+
+### The watcher's schedule
+
+kopia server would take its scheduled snapshots without the hooks. So once a container of a path, running or
+stopped, has `kopia.pre-exec` or `kopia.post-exec`, even one with an error, the watcher takes the scheduled
+snapshots of the path's source itself:
+
+- The `scheduling` section of the path's policy stays `{"manual": true}`, also while the containers run; the
+  Kopia web UI shows the source as manual. The section it replaces, with the fields of `kopia.schedule`,
+  `kopia.interval`, `kopia.time-of-day` and `kopia.run-missed`, is kept in `STATE_FILE`, as during a pause. Change
+  the schedule of such a source with the labels or in its parent policies: a schedule set on the path in the web
+  UI is replaced by `manual` at the next full reconcile.
+- The watcher asks kopia server for the next time (`policy/resolve`) with the policy the path would have without
+  hooks, so cron expressions, intervals, times of day and inherited schedules mean what they mean to kopia
+  server, in its time zone. It keeps the next time in `STATE_FILE`, and works it out again after each scheduled
+  snapshot, when the labels change, which drops a time of the old schedule that is due, and at every full
+  reconcile, which also sees changes of the parent policies. A full reconcile keeps a time due within a minute,
+  in case kopia server's clock is a little ahead. When kopia server's clock is far behind the watcher's, the
+  watcher logs a warning and follows its own clock.
+- While all containers of the path are stopped, no scheduled snapshot is taken. Nothing is written to kopia
+  server for that: the policy is manual already. A source whose containers are all removed keeps the watcher's
+  schedule, paused, until a container comes back or the cleanup removes the source.
+- A time that passed while the watcher was not running, while all containers were stopped, or while a snapshot
+  with hooks ran, is a missed one. As kopia server does with `runMissed`, also for a time that came during an
+  upload, it is taken right away when the schedule has an interval, or when `runMissed` is on (kopia's default)
+  and the next time is more than 30 minutes away; otherwise it is skipped, with a line in the log.
+- `kopia.min-interval` does not hold back a scheduled snapshot, as it does not hold back kopia server's.
+- Once the containers of the path have no hooks, kopia server takes the schedule back: the kept section returns to
+  the policy, as after a pause.
+
+### Commands
+
+A hook is a command in one of two forms:
+
+- **a JSON array of strings**, run as it is, without a shell: `["pg_dump", "-U", "app", "-f", "/dump/app.sql"]`.
+  Use it for images without a shell.
+- **any other text**, run with `sh -c`: `pg_dump -U app > /dump/app.sql && sync`, with redirections, `&&` and
+  the variables of the container. The image must have `sh`: distroless and `scratch` images have none, and the
+  hook then fails as the command does not exist.
+
+A value that starts with `[` is always the JSON array; a mistake in it is an error of the labels. A shell
+command that starts with `[ … ]` can use `test …` instead. An empty value is no hook.
+
+The command runs as `docker exec` runs it without options: as the container's user, in its working directory,
+with its environment, without a terminal or input.
+
+### `kopia.pre-exec`
+
+The command to run before each snapshot the watcher takes. See [hooks](#hooks).
+
+### `kopia.post-exec`
+
+The command to run after each snapshot the watcher takes, whatever became of it. See [hooks](#hooks).
+
+### `kopia.hook-timeout`
+
+How long each hook command of the container may run: a Go duration greater than zero, such as `30s`, `10m` or
+`1h`. Default `10m`. A value that cannot be read is an error of the labels: a timeout far shorter than meant
+would fail every snapshot.
+
+Docker cannot stop a command started with `docker exec`. After the timeout the watcher stops waiting and counts
+the hook as failed, but the command may still run in the container. For a command that may hang, use a timeout
+of its own where the image has one, such as `timeout 600 pg_dump …`.
+
+A docker-socket-proxy may close a connection that is silent for long: Tecnativa's closes it after 10 minutes. The
+watcher then goes on asking Docker whether the command has ended, until the timeout; only the output after the cut
+is lost. See [Docker](configuration.md#docker).
+
+Without `kopia.pre-exec` and `kopia.post-exec` the label has no effect, with a warning.
 
 ## Cleanup
 

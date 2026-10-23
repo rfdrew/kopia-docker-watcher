@@ -34,6 +34,10 @@ func (*fakeEngine) Inspect(context.Context, string) (Container, error) {
 	return Container{}, errors.New("not implemented")
 }
 
+func (*fakeEngine) Exec(context.Context, string, []string) (ExecResult, error) {
+	return ExecResult{}, errors.New("not implemented")
+}
+
 func (f *fakeEngine) Events(ctx context.Context, since time.Time) (<-chan Event, <-chan error) {
 	s := &fakeSub{ctx: ctx, since: since, events: make(chan Event), errs: make(chan error, 1)}
 

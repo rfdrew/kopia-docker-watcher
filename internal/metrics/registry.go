@@ -27,6 +27,13 @@ const (
 // in seconds: from a second to eight hours.
 var durationBuckets = []float64{1, 5, 15, 30, 60, 300, 900, 1800, 3600, 7200, 14400, 28800}
 
+// hookBuckets are the upper bounds of the hook duration buckets, in
+// seconds: from a tenth of a second to two hours.
+var hookBuckets = []float64{0.1, 0.5, 1, 5, 15, 30, 60, 300, 900, 1800, 3600, 7200}
+
+// hooks are the values of the hook label.
+var hooks = []string{reconcile.HookPreExec, reconcile.HookPostExec}
+
 // Metrics holds the metrics the watcher serves on /metrics: its own, which
 // the reconciler reports through reconcile.Metrics, and those of the Go
 // runtime and the process. Create it with New; it is safe for concurrent
@@ -47,6 +54,8 @@ type Metrics struct {
 	paused          *prometheus.GaugeVec
 	owner           *prometheus.GaugeVec
 	notifications   *prometheus.CounterVec
+	hookFailures    *prometheus.CounterVec
+	hookDuration    *prometheus.HistogramVec
 
 	// mu guards sources, the sources reported as managed by path, and
 	// keeps the series of one source consistent with each other.
@@ -111,6 +120,19 @@ func New() *Metrics {
 			Help: "Notifications to NOTIFY_WEBHOOK_URL by result: sent, failed after every attempt or at once " +
 				"on an error that trying again cannot fix, or dropped as too many waited or the watcher stopped.",
 		}, []string{"result"}),
+		hookFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "hook_failures_total",
+			Help: "Hook commands that failed, by source and hook: pre-exec, after which no snapshot is taken, or " +
+				"post-exec. A hook fails when it exits with a code other than zero, does not finish within its timeout, " +
+				"cannot run, or its labels have errors.",
+		}, []string{"path", "hook"}),
+		hookDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "hook_duration_seconds",
+			Help:      "How long the hook commands ran, by hook: pre-exec or post-exec, failed ones included.",
+			Buckets:   hookBuckets,
+		}, []string{"hook"}),
 	}
 
 	buildInfo := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
@@ -124,7 +146,7 @@ func New() *Metrics {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		buildInfo, m.lastSuccess, m.duration, m.failures, m.reconcileErrors, m.managed, m.paused, m.owner,
-		m.notifications,
+		m.notifications, m.hookFailures, m.hookDuration,
 	)
 
 	// Every kind and result starts at zero, so that the first shows as an
@@ -135,6 +157,10 @@ func New() *Metrics {
 
 	for _, r := range notify.Results() {
 		m.notifications.WithLabelValues(string(r))
+	}
+
+	for _, h := range hooks {
+		m.hookDuration.WithLabelValues(h)
 	}
 
 	m.countSources()
@@ -155,7 +181,7 @@ func (m *Metrics) ReconcileError(_ string, reason reconcile.Reason) {
 
 // Source implements reconcile.Metrics: the source counts as managed,
 // active or paused, with a series per owner, and its snapshot failures
-// start at zero.
+// start at zero, and so do its hook failures while it has hooks.
 func (m *Metrics) Source(path string, s reconcile.SourceMetrics) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -171,6 +197,14 @@ func (m *Metrics) Source(path string, s reconcile.SourceMetrics) {
 	}
 
 	m.failures.WithLabelValues(path)
+
+	for _, h := range hooks {
+		if s.Hooks {
+			m.hookFailures.WithLabelValues(path, h)
+		} else {
+			m.hookFailures.DeleteLabelValues(path, h)
+		}
+	}
 
 	paused := 0.0
 	if s.Paused {
@@ -213,7 +247,22 @@ func (m *Metrics) ForgetSource(path string) {
 	m.failures.DeleteLabelValues(path)
 	m.paused.DeleteLabelValues(path)
 	m.owner.DeletePartialMatch(prometheus.Labels{"path": path})
+	m.hookFailures.DeletePartialMatch(prometheus.Labels{"path": path})
 	m.countSources()
+}
+
+// HookFinished implements reconcile.Metrics: a hook that failed counts as
+// a failure of its source, and the duration of one that ran goes into the
+// histogram. A failure counts also before the first pass over the source
+// has reported it: a hook that fails at once can end before that pass.
+func (m *Metrics) HookFinished(path string, res reconcile.HookResult) {
+	if res.Duration > 0 {
+		m.hookDuration.WithLabelValues(res.Hook).Observe(res.Duration.Seconds())
+	}
+
+	if res.Error != "" {
+		m.hookFailures.WithLabelValues(path, res.Hook).Inc()
+	}
 }
 
 // SnapshotFinished implements reconcile.Metrics: a snapshot that saved no

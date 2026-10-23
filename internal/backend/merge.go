@@ -65,9 +65,9 @@ var pausedScheduling = json.RawMessage(`{"manual":true}`)
 //     are removed, so the policy inherits them again; an object the
 //     removal leaves empty goes too.
 //  3. Fields of want.Patch are set. This gives Unpaused.
-//  4. If want.Paused, the scheduling section of Unpaused is kept in
-//     Applied.SavedScheduling and replaced by {"manual": true}. Otherwise
-//     Policy is Unpaused and nothing is saved.
+//  4. If want.Paused or want.OwnSchedule, the scheduling section of
+//     Unpaused is kept in Applied.SavedScheduling and replaced by
+//     {"manual": true}. Otherwise Policy is Unpaused and nothing is saved.
 //
 // The pause follows want.Paused alone: a pause set in the web UI on the
 // path of a running container is lifted, and a source the watcher did not
@@ -140,7 +140,7 @@ func Merge(current json.RawMessage, want Desired, last Applied) (Merged, error) 
 		Applied:  Applied{Patch: want.Patch.Clone()},
 	}
 
-	if want.Paused {
+	if want.manual() {
 		saved, ok := policy["scheduling"]
 		if !ok || isNull(saved) {
 			saved = json.RawMessage(`{}`)
@@ -165,7 +165,7 @@ func Merge(current json.RawMessage, want Desired, last Applied) (Merged, error) 
 	}
 
 	if !same && last.Pending == nil && last.StoredHash != "" && currentHash == last.StoredHash &&
-		want.Paused == last.paused() && want.Patch.Equal(last.Patch) {
+		want.manual() == last.paused() && want.Patch.Equal(last.Patch) {
 		// The policy is as kopia server stored the watcher's last write,
 		// and the watcher wants what it wrote then. Nothing is written, so
 		// Policy is the current one.
