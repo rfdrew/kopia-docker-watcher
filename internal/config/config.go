@@ -392,7 +392,9 @@ func ParseWatcherPathPrefix(s string) (string, error) {
 	return s, nil
 }
 
-// LogValue implements slog.LogValuer. Secrets are never logged: only whether
+// LogValue implements slog.LogValuer. Durations are logged as Go duration
+// strings (5m0s): the JSON handler would print slog.Duration as nanoseconds.
+// Secrets are never logged: only whether
 // the password is set and the webhook host.
 func (c *Config) LogValue() slog.Value {
 	webhook := ""
@@ -411,10 +413,10 @@ func (c *Config) LogValue() slog.Value {
 		),
 		slog.String("host_prefix", c.HostPrefix),
 		slog.String("log_level", c.LogLevel.String()),
-		slog.Duration("reconcile_interval", c.ReconcileInterval),
+		slog.String("reconcile_interval", c.ReconcileInterval.String()),
 		slog.Bool("snapshot_on_watcher_start", c.SnapshotOnWatcherStart),
 		slog.String("watcher_path_prefix", c.WatcherPathPrefix),
-		slog.Duration("cleanup_grace", c.CleanupGrace),
+		slog.String("cleanup_grace", c.CleanupGrace.String()),
 		slog.String("state_file", c.StateFile),
 		slog.String("listen_addr", c.ListenAddr),
 		slog.String("notify_webhook", webhook),

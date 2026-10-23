@@ -384,6 +384,24 @@ func TestLogValueHidesSecrets(t *testing.T) {
 	}
 }
 
+func TestLogValueFormatsDurations(t *testing.T) {
+	cfg, err := Load(base())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", "config", cfg)
+
+	out := buf.String()
+	for _, want := range []string{`"reconcile_interval":"5m0s"`, `"cleanup_grace":"24h0m0s"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log output lacks %s: %s", want, out)
+		}
+	}
+}
+
 func mustJSON(t *testing.T, v any) string {
 	t.Helper()
 

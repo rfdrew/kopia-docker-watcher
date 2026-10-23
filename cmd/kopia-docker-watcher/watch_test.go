@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -713,6 +714,8 @@ func TestRunWaitsForKopia(t *testing.T) {
 
 	if l := findLog(wr.td.stderr.String(), "connected to kopia server"); l == nil || l["hostname"] != fakeHost {
 		t.Errorf("connected line = %v", l)
+	} else if _, ok := l["storage"]; ok {
+		t.Errorf("connected line has storage although kopia server reported none: %v", l)
 	}
 
 	if n := k.count("GET /api/v1/repo/status"); n != 4 {
@@ -1412,5 +1415,40 @@ func TestRunStrict(t *testing.T) {
 		if code := wr.wait(t, 10*time.Second); code != tc.code {
 			t.Errorf("%q: exit code = %d, want %d; log:\n%s", tc.args, code, tc.code, wr.td.stderr)
 		}
+	}
+}
+
+func TestLogConnectedStorageAndAPIServer(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        kopiaclient.RepoStatus
+		wantStorage   any
+		wantAPIServer any
+	}{
+		{name: "direct repository", status: kopiaclient.RepoStatus{Storage: "filesystem"}, wantStorage: "filesystem"},
+		{name: "repository server", status: kopiaclient.RepoStatus{APIServerURL: "https://repo:51515"}, wantAPIServer: "https://repo:51515"},
+		{name: "neither", status: kopiaclient.RepoStatus{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf strings.Builder
+
+			w := &watcher{log: slog.New(slog.NewJSONHandler(&buf, nil))}
+			w.logConnected(&tt.status)
+
+			l := findLog(buf.String(), "connected to kopia server")
+			if l == nil {
+				t.Fatalf("no connected line: %s", buf.String())
+			}
+
+			if got := l["storage"]; got != tt.wantStorage {
+				t.Errorf("storage = %v, want %v", got, tt.wantStorage)
+			}
+
+			if got := l["api_server_url"]; got != tt.wantAPIServer {
+				t.Errorf("api_server_url = %v, want %v", got, tt.wantAPIServer)
+			}
+		})
 	}
 }

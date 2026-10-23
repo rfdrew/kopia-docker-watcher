@@ -423,8 +423,21 @@ func (w *watcher) checkKopia(ctx context.Context, kopia *kopiaclient.Client) (*k
 }
 
 func (w *watcher) logConnected(st *kopiaclient.RepoStatus) {
-	w.log.Info("connected to kopia server", "hostname", st.Hostname, "username", st.Username,
-		"storage", st.Storage, "readonly", st.ReadOnly)
+	attrs := []any{"hostname", st.Hostname, "username", st.Username, "readonly", st.ReadOnly}
+
+	// kopia server reports the storage type only when it opens the
+	// repository storage itself. Connected to a repository server it
+	// reports that server's URL instead, and an empty storage= in the log
+	// would look like a fault.
+	if st.Storage != "" {
+		attrs = append(attrs, "storage", st.Storage)
+	}
+
+	if st.APIServerURL != "" {
+		attrs = append(attrs, "api_server_url", st.APIServerURL)
+	}
+
+	w.log.Info("connected to kopia server", attrs...)
 }
 
 // logKopiaError explains an error of kopia server that retrying cannot fix.
