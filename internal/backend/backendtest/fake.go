@@ -137,6 +137,7 @@ type Fake struct {
 	missing  map[string]bool // paths that do not exist on kopia server
 	badCrons map[string]bool
 	upcoming []time.Time
+	schedule func(scheduling json.RawMessage, now time.Time, n int) []time.Time
 	// algorithms are the compression algorithms kopia server supports.
 	algorithms []backend.Algorithm
 
@@ -398,6 +399,17 @@ func (f *Fake) SetUpcoming(times ...time.Time) {
 	defer f.mu.Unlock()
 
 	f.upcoming = slices.Clone(times)
+}
+
+// SetSchedule makes PreviewSchedule work the times out with fn, from the
+// scheduling section of the policy it previews and the fake's clock, in
+// place of the times of SetUpcoming, as kopia server's policy/resolve
+// does. Nil goes back to those.
+func (f *Fake) SetSchedule(fn func(scheduling json.RawMessage, now time.Time, n int) []time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.schedule = fn
 }
 
 // QueueSnapshotResult queues the result of the next WaitSnapshot for src.
@@ -1010,7 +1022,12 @@ func (f *Fake) PreviewSchedule(ctx context.Context, src backend.Source, policy j
 
 	preview := backend.SchedulePreview{Scheduling: section}
 
-	if string(sched["manual"]) != "true" {
+	switch {
+	case string(sched["manual"]) == "true":
+	case f.schedule != nil:
+		times := f.schedule(section, f.now(), max(n, 0))
+		preview.Times = slices.Clone(times[:min(max(n, 0), len(times))])
+	default:
 		preview.Times = slices.Clone(f.upcoming[:min(max(n, 0), len(f.upcoming))])
 	}
 

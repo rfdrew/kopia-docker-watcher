@@ -279,8 +279,10 @@ type recordedMetrics struct {
 	sources map[string]SourceMetrics
 	last    map[string]time.Time
 	reports map[string]int
-	// finished holds the snapshot results reported per path.
+	// finished holds the snapshot results reported per path, hooks the
+	// hook results.
 	finished map[string][]backend.SnapshotResult
+	hooks    map[string][]HookResult
 	// calls are all calls but ReconcileError, as "Method path", in order.
 	calls []string
 }
@@ -371,6 +373,26 @@ func (m *recordedMetrics) SnapshotFinished(path string, res backend.SnapshotResu
 
 	m.finished[path] = append(m.finished[path], res)
 	m.call("SnapshotFinished", path)
+}
+
+func (m *recordedMetrics) HookFinished(path string, res HookResult) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.hooks == nil {
+		m.hooks = map[string][]HookResult{}
+	}
+
+	m.hooks[path] = append(m.hooks[path], res)
+	m.call("HookFinished", path)
+}
+
+// hookResults returns the hook results reported for p.
+func (m *recordedMetrics) hookResults(p string) []HookResult {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return slices.Clone(m.hooks[p])
 }
 
 // source returns what was last reported about p, if it counts as managed.

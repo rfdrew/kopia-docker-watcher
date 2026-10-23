@@ -806,9 +806,34 @@ func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 	row(labels.KeyCleanupOnRemove, string(spec.CleanupOnRemove))
 	row(labels.KeyCleanupDeletePinned, strconv.FormatBool(spec.CleanupDeletePinned))
 
+	if spec.Hooks {
+		row(labels.KeyPreExec, hookCommand(spec.PreExec))
+		row(labels.KeyPostExec, hookCommand(spec.PostExec))
+		row(labels.KeyHookTimeout, cmp.Or(spec.HookTimeout, labels.DefaultHookTimeout).String())
+	}
+
 	_ = tw.Flush()
 
+	if spec.Hooks {
+		_, _ = fmt.Fprintln(w, "\nhooks: the watcher takes the scheduled snapshots of these sources itself and runs the hooks around them; "+
+			"kopia server's schedule of them stays off")
+	}
+
 	printPolicyFields(w, spec.Policy)
+}
+
+// hookCommand shows the arguments of a hook command as a JSON array.
+func hookCommand(args []string) string {
+	if len(args) == 0 {
+		return "(none)"
+	}
+
+	b, err := json.Marshal(args)
+	if err != nil {
+		return strings.Join(args, " ")
+	}
+
+	return string(b)
 }
 
 // scheduleOf returns the cron expressions the policy fields set, those of

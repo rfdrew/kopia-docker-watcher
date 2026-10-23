@@ -1035,6 +1035,8 @@ func TestKnownEntryKeys(t *testing.T) {
 		Owners:                  []Owner{{ID: "c1", Name: "app"}},
 		OwnersUpdated:           mark,
 		OrphanedSince:           mark,
+		Schedule:                &Schedule{Next: mark},
+		HookRun:                 &HookRun{ID: "r", Started: mark, Phase: HookPre},
 	}
 
 	data, err := json.Marshal(entryForTest{Source: srcA, Record: r})

@@ -15,8 +15,9 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
  ─────────────                 ────────────────────                     ────────────
  container events  ──────────▶  queue of source paths  ──── REST API ──▶  policies (schedule, pause)
  (start, die, destroy, …)       one reconcile pass per path              sources/upload, snapshots/edit
- container list    ◀──────────  full reconcile every RECONCILE_INTERVAL  snapshots/delete
-                                STATE_FILE: what was applied, owners
+ container list    ◀──────────  full reconcile every RECONCILE_INTERVAL  snapshots/delete, policy/resolve
+ exec (hooks)      ◀──────────  STATE_FILE: what was applied, owners,
+                                the schedule of sources with hooks
 ```
 
 - The watcher talks to kopia server only over its HTTP API, the one the Kopia web UI uses. It never runs the
@@ -45,6 +46,11 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
   schedule when one starts again. A crash-looping container does not toggle the pause.
 - Takes a snapshot at a container start (`kopia.snapshot-on-start`, rate-limited by `kopia.min-interval`) and
   at a stop (`kopia.snapshot-on-stop`), follows it to the end and logs the result.
+- Runs [hooks](docs/labels.md#hooks) in the container around its snapshots: `kopia.pre-exec` before (a database
+  dump, say; when it fails, no snapshot is taken) and `kopia.post-exec` after, whatever became of the snapshot,
+  each within `kopia.hook-timeout`. kopia server would take scheduled snapshots without the hooks, so the watcher
+  takes the scheduled snapshots of such a source itself, at the times kopia server's policy gives, with
+  `runMissed` honored, and keeps kopia server's schedule of it off.
 - Writes `kopia.description` and `kopia.tags` into the snapshot description, for its own snapshots and for
   scheduled ones.
 - Several containers may share a path: the source is paused only when all of them are stopped.
@@ -56,14 +62,14 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
 - `validate` checks labels before you deploy them; `run --dry-run` prints what the watcher would do without
   changing anything.
 - Serves Prometheus metrics on `/metrics`: when each source last had a complete snapshot (scheduled ones
-  included), failures and durations of the watcher's own snapshots, reconcile errors, and the managed sources
-  with their containers. See [docs/metrics.md](docs/metrics.md).
+  included), failures and durations of the watcher's own snapshots and of the hooks, reconcile errors, and the
+  managed sources with their containers. See [docs/metrics.md](docs/metrics.md).
 - Checks on `/healthz` that Docker answers, that kopia server answers with a repository connected, and that the
   reconcile loop is not stuck, and answers 503 when one of them has failed for a while; the image's
   `HEALTHCHECK` uses it. See [the health check](docs/configuration.md#health-check).
-- Posts a notification to `NOTIFY_WEBHOOK_URL` when a path starts failing (a failed snapshot of the watcher,
-  labels that cannot be applied, kopia server failing for a while) and when it works again, once each, as JSON or
-  for ntfy, Slack or Telegram. See [notifications](docs/configuration.md#notifications).
+- Posts a notification to `NOTIFY_WEBHOOK_URL` when a path starts failing (a failed snapshot of the watcher, a
+  failed hook, labels that cannot be applied, kopia server failing for a while) and when it works again, once
+  each, as JSON or for ntfy, Slack or Telegram. See [notifications](docs/configuration.md#notifications).
 - Sets kopia server's upload, download and storage operation limits from the `KOPIA_THROTTLE_` variables; unset,
   it leaves them to kopia server or Terraform. See [throttle](docs/configuration.md#throttle).
   [docs/terraform.md](docs/terraform.md) splits kopia server's configuration between the watcher and
@@ -71,8 +77,9 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
 
 Not supported yet:
 
-- No hooks (`pre-exec`, `stop-during-backup`, …). These label names are reserved: the watcher warns that they
-  are not supported by this version and ignores them.
+- No stopping or pausing a container for its snapshot (`stop-during-backup`, …), no pins at a stop, no
+  `depends-on`. These label names are reserved: the watcher warns that they are not supported by this version and
+  ignores them.
 - No snapshot tags: kopia server cannot set them through its API yet, so `kopia.tags` go into the description.
 
 ## Requirements
@@ -81,7 +88,8 @@ Not supported yet:
 container list, container inspect and the event stream: through `/var/run/docker.sock`, or through a
 [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) that allows `CONTAINERS` and `EVENTS`
 (see [examples/docker-compose.yml](examples/docker-compose.yml)). The health check pings the daemon (`/_ping`),
-which docker-socket-proxy allows by default.
+which docker-socket-proxy allows by default. [Hooks](docs/labels.md#hooks) run with `docker exec`, which with
+docker-socket-proxy needs `EXEC=1` and `POST=1` as well (see [Docker](docs/configuration.md#docker)).
 
 **kopia server.** The watcher is tested against the latest Kopia release, 0.23.1. kopia server must run with:
 

@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -32,6 +33,9 @@ type passResult struct {
 	recheck bool
 	// sweep reports a pass of a full reconcile.
 	sweep bool
+	// nextRun is when the watcher's own schedule of the source takes its
+	// next snapshot; zero when it takes none.
+	nextRun time.Time
 	// problems were reported on the way; the pass went on without them.
 	problems []error
 	// outcome and paused say how the pass ended, for the summary of the
@@ -97,6 +101,17 @@ type pass struct {
 	// source kopia server does not know is then not registered.
 	fallback bool
 
+	// sched is the watcher's schedule of the source: as the record had it
+	// when the snapshot steps began, nil if it had none, and as the pass
+	// left it once ownSchedule ran. due is the scheduled time the pass
+	// asks a snapshot for, zero if none, and dueNext the time after it,
+	// which the schedule moves on to once the snapshot is taken or
+	// dropped. nextRun is when the next one is due, for the timer.
+	sched   *state.Schedule
+	due     time.Time
+	dueNext nextSchedule
+	nextRun time.Time
+
 	// plan is the plan the pass got to; outcome says why it stopped
 	// without one, or without applying it. unknown reports that kopia
 	// server did not know the source when the pass planned it; policyDone
@@ -109,7 +124,9 @@ type pass struct {
 	problems []error
 	// reported are the keys of the errors this pass reported.
 	reported []string
-	preview  *backend.SchedulePreview
+	// preview is the schedule check of the pass, of the policy previewOf.
+	preview   *backend.SchedulePreview
+	previewOf json.RawMessage
 }
 
 // reconcile runs one pass over path p.
@@ -120,7 +137,7 @@ func (r *Reconciler) reconcile(ctx context.Context, p string) passResult {
 
 	err := ps.run()
 	res := passResult{restarting: anyRestarting(ps.owners), problems: ps.problems,
-		recheck: err == nil && (ps.deferStart || ps.recheckSoon), sweep: ps.sweepDue}
+		recheck: err == nil && (ps.deferStart || ps.recheckSoon), sweep: ps.sweepDue, nextRun: ps.nextRun}
 
 	switch {
 	case err == nil:
@@ -369,6 +386,7 @@ func (ps *pass) desire() bool {
 	}
 
 	ps.want.Paused = !anyRunning(ps.owners)
+	ps.want.OwnSchedule = hooked(ps.owners)
 
 	patch, err := commonPatch(policyOwners(ps.owners))
 	if err != nil {
@@ -435,7 +453,7 @@ func (ps *pass) checkSchedule(plan backend.Plan) (backend.Plan, error) {
 
 	switch {
 	case err == nil:
-		ps.preview = &preview
+		ps.preview, ps.previewOf = &preview, plan.Unpaused
 
 		return plan, nil
 	case !backend.IsConfig(err):
@@ -552,7 +570,8 @@ func (ps *pass) storeApplied(a backend.Applied) error {
 // through, is removed instead, unless it holds the state of snapshots.
 func (ps *pass) restoreRecord() error {
 	rec, _ := ps.store.Get(ps.src)
-	snapshots := len(rec.SnapshotWaits) > 0 || !rec.LastTriggered.IsZero() || rec.AnnotateAfter != nil
+	snapshots := len(rec.SnapshotWaits) > 0 || !rec.LastTriggered.IsZero() || rec.AnnotateAfter != nil ||
+		rec.HookRun != nil
 
 	confirmed := !ps.last.Patch.IsZero() || ps.last.SavedScheduling != nil || ps.last.StoredHash != ""
 	if ps.had && (confirmed || snapshots) {
@@ -577,6 +596,9 @@ func (ps *pass) logApplied(plan backend.Plan) {
 	}
 
 	attrs := []any{"source", ps.src.String(), "owners", ps.want.Owners, "paused", ps.want.Paused, "changes", changes(plan)}
+	if ps.want.OwnSchedule {
+		attrs = append(attrs, "hooks", true)
+	}
 	if len(ps.events) > 0 {
 		attrs = append(attrs, "events", eventNames(ps.events))
 	}

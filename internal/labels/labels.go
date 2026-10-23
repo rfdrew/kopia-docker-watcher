@@ -84,6 +84,23 @@ type ContainerSpec struct {
 	// Without it, a source with a pinned snapshot keeps that snapshot and
 	// its paused policy.
 	CleanupDeletePinned bool
+
+	// PreExec and PostExec are the commands the watcher runs in the
+	// container before and after each snapshot it takes of the
+	// container's sources, as arguments: a command given as text runs
+	// with sh -c. Nil when the label is absent, empty or has an error.
+	PreExec, PostExec []string
+
+	// Hooks reports that the pre-exec or post-exec label is set, also
+	// when its value has an error. The watcher then takes the scheduled
+	// snapshots of the container's sources itself, so that the hooks run
+	// around them; a hook with an error fails the snapshots instead of
+	// letting them go without it.
+	Hooks bool
+
+	// HookTimeout bounds each hook command; zero means
+	// DefaultHookTimeout.
+	HookTimeout time.Duration
 }
 
 // CleanupMode is what becomes of a source once no container backs it up
@@ -228,6 +245,7 @@ func Parse(labels map[string]string, opts Options) (ContainerSpec, Issues) {
 	}
 
 	p.checkPolicy()
+	p.checkHooks()
 
 	if p.spec.Enable && len(p.spec.Paths) == 0 && len(p.spec.Volumes) == 0 {
 		p.label = Name(p.prefix, KeyPath)
@@ -263,6 +281,9 @@ type parser struct {
 	// empty value; setsSchedule that another label sets a schedule: an
 	// interval, times of day, or one of them or cron in policy-json.
 	scheduleLabel, setsSchedule bool
+
+	// hookTimeoutLabel reports that the hook-timeout label is set.
+	hookTimeoutLabel bool
 }
 
 func (p *parser) errorf(format string, args ...any) {

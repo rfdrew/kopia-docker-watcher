@@ -135,6 +135,12 @@ func (ps *pass) writePlan(b *strings.Builder) {
 		b.WriteString("  note: the last apply was not confirmed, so the policy is written again\n")
 	}
 
+	if ps.want.OwnSchedule {
+		fmt.Fprintf(b, "  hooks: the watcher takes the scheduled snapshots, with pre-exec in %s and post-exec in %s; "+
+			"kopia server's schedule stays off\n", namesOrNone(hookTargets(ps.owners, HookPreExec)),
+			namesOrNone(hookTargets(ps.owners, HookPostExec)))
+	}
+
 	if ps.preview != nil && !ps.want.Paused && len(ps.preview.Times) > 0 {
 		times := make([]string, len(ps.preview.Times))
 		for i, t := range ps.preview.Times {
@@ -143,6 +149,15 @@ func (ps *pass) writePlan(b *strings.Builder) {
 
 		fmt.Fprintf(b, "  next snapshots: %s\n", strings.Join(times, ", "))
 	}
+}
+
+// namesOrNone lists the names of the targets, "none" without one.
+func namesOrNone(ts []hookTarget) string {
+	if len(ts) == 0 {
+		return "none"
+	}
+
+	return strings.Join(targetNames(ts), ", ")
 }
 
 func actionText(a backend.Action) string {

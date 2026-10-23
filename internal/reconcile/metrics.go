@@ -39,6 +39,31 @@ type Metrics interface {
 	// (SnapshotUnknown) is reported only when no snapshot of it is found,
 	// by the pass that looked, without the task's times.
 	SnapshotFinished(path string, res backend.SnapshotResult)
+
+	// HookFinished reports how a hook command of a container that backs
+	// up the source of a path ended. It comes from the goroutine that ran
+	// the hook, not from a pass. A hook cut short by the watcher's stop is
+	// not reported.
+	HookFinished(path string, res HookResult)
+}
+
+// Hook names, as HookResult.Hook has them.
+const (
+	HookPreExec  = "pre-exec"
+	HookPostExec = "post-exec"
+)
+
+// HookResult is how one hook command ended.
+type HookResult struct {
+	// Hook is HookPreExec or HookPostExec.
+	Hook string
+	// Container is the name of the container the command ran in.
+	Container string
+	// Duration is how long the command ran; zero when it did not start,
+	// as when the container's hook labels have an error.
+	Duration time.Duration
+	// Error tells why the hook failed; empty when it succeeded.
+	Error string
 }
 
 // SourceMetrics is what a pass reports about a source the watcher manages.
@@ -48,6 +73,9 @@ type SourceMetrics struct {
 	// Owners are the names of the containers that back the source up,
 	// stopped ones included, sorted; none for a source that lost them all.
 	Owners []string
+	// Hooks reports that a container of the source runs hooks around its
+	// snapshots.
+	Hooks bool
 }
 
 type noMetrics struct{}
@@ -57,6 +85,7 @@ func (noMetrics) Source(string, SourceMetrics)                    {}
 func (noMetrics) LastSuccess(string, time.Time)                   {}
 func (noMetrics) ForgetSource(string)                             {}
 func (noMetrics) SnapshotFinished(string, backend.SnapshotResult) {}
+func (noMetrics) HookFinished(string, HookResult)                 {}
 
 // reportMetrics reports the source of the pass as managed, once its policy
 // step has succeeded, or drops what was reported about it when the
@@ -94,7 +123,7 @@ func (ps *pass) reportMetrics(err error) {
 		return
 	}
 
-	ps.metrics.Source(ps.path, SourceMetrics{Paused: ps.want.Paused, Owners: ownerNames(ps.owners)})
+	ps.metrics.Source(ps.path, SourceMetrics{Paused: ps.want.Paused, Owners: ownerNames(ps.owners), Hooks: ps.want.OwnSchedule})
 
 	if err != nil {
 		return

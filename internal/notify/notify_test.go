@@ -667,3 +667,52 @@ func TestNeverBlocks(t *testing.T) {
 		t.Errorf("log:\n%s", f.logs)
 	}
 }
+
+// Hooks: a failure of each hook is notified once, and so is the next
+// success after it.
+func TestHookNotifications(t *testing.T) {
+	f := newFixture(t, config.WebhookJSON, "https://hooks.example.com/x")
+	f.n.SetHost("nas")
+	f.n.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"db"}, Hooks: true})
+
+	f.n.HookFinished("/data/app", reconcile.HookResult{Hook: reconcile.HookPreExec, Container: "db"})
+	mustKinds(t, f)
+
+	f.n.HookFinished("/data/app", reconcile.HookResult{Hook: reconcile.HookPreExec, Container: "db", Error: "exited with code 1"})
+	f.n.HookFinished("/data/app", reconcile.HookResult{Hook: reconcile.HookPreExec, Container: "db", Error: "exited with code 1"})
+	evs := mustKinds(t, f, HookFailed)
+
+	e := evs[0]
+	if e.Reason != "pre-exec" || e.Error != "db: exited with code 1" {
+		t.Errorf("event = %+v", e)
+	}
+
+	if want := "The pre-exec hook of /data/app on nas (db) failed, so no snapshot was taken: db: exited with code 1."; e.Message() != want {
+		t.Errorf("message = %q, want %q", e.Message(), want)
+	}
+
+	if e.Title() != "Backup hook failed: /data/app" || !e.Failing() {
+		t.Errorf("title = %q", e.Title())
+	}
+
+	// The post-exec hook is followed apart.
+	f.n.HookFinished("/data/app", reconcile.HookResult{Hook: reconcile.HookPostExec, Container: "db", Error: "timed out"})
+	evs = mustKinds(t, f, HookFailed)
+
+	if want := "The post-exec hook of /data/app on nas (db) failed: db: timed out."; evs[0].Message() != want {
+		t.Errorf("message = %q, want %q", evs[0].Message(), want)
+	}
+
+	f.clock.advance(time.Hour)
+	f.n.HookFinished("/data/app", reconcile.HookResult{Hook: reconcile.HookPreExec, Container: "db"})
+	evs = mustKinds(t, f, HookRecovered)
+
+	if !evs[0].Since.Equal(e.Time) || evs[0].Reason != "pre-exec" || evs[0].Failing() {
+		t.Errorf("recovered = %+v", evs[0])
+	}
+
+	// A forgotten source forgets its failing hooks.
+	f.n.ForgetSource("/data/app")
+	f.n.HookFinished("/data/app", reconcile.HookResult{Hook: reconcile.HookPostExec, Container: "db"})
+	mustKinds(t, f)
+}

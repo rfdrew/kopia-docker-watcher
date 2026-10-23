@@ -74,6 +74,12 @@ type snapRequest struct {
 	absorbed bool
 	// description is the description of the snapshot taken again.
 	description string
+
+	// scheduled marks the snapshot the watcher's own schedule of a source
+	// with hooks takes: like kopia server's scheduled snapshots, neither
+	// the minimum interval nor a snapshot that is pending or uploading
+	// holds it back.
+	scheduled bool
 }
 
 // describedContainer is what a container's labels say about the
@@ -132,9 +138,11 @@ var errNoChange = errors.New("no change")
 // snapshots runs the snapshot steps of a pass whose policy step succeeded,
 // for a source kopia server knows: it sets the description mark of a
 // source that has none, follows the snapshots the state lists as queued,
-// acts on those that ended, takes the snapshot the events and the owners'
-// states ask for and, in a full reconcile, describes the snapshots that
-// have no description. Only a failure to queue a snapshot fails the pass,
+// acts on those that ended, moves a snapshot with hooks on, runs the
+// watcher's own schedule of a source with hooks, takes the snapshot the
+// events, the owners' states and that schedule ask for and, in a full
+// reconcile, describes the snapshots that have no description. Only a
+// failure to queue a snapshot or to work the schedule out fails the pass,
 // so that its events are kept and the pass is retried; everything else is
 // logged and tried again later.
 func (ps *pass) snapshots() error {
@@ -146,6 +154,7 @@ func (ps *pass) snapshots() error {
 	status := ps.plan.Status
 
 	rec, _ := ps.store.Get(ps.src)
+	ps.sched = rec.Schedule
 	mark := ps.mark(rec, status)
 	ps.annotateAfter = mark
 
@@ -175,9 +184,22 @@ func (ps *pass) snapshots() error {
 	reqs = append(reqs, ps.absorbedRetry(rec, status, mark, identical)...)
 	reqs = append(reqs, ps.requests()...)
 
-	if err := ps.trigger(reqs, status); err != nil {
+	if err := ps.hookRun(status); err != nil {
 		return err
 	}
+
+	rec, _ = ps.store.Get(ps.src)
+
+	scheduled, err := ps.ownSchedule(rec)
+	if err != nil {
+		return err
+	}
+
+	if err := ps.trigger(append(reqs, scheduled...), status); err != nil {
+		return err
+	}
+
+	ps.armSchedule()
 
 	if ps.sweepDue {
 		ps.sweep(status, mark)
@@ -717,12 +739,19 @@ func (ps *pass) requests() []snapRequest {
 // pause, the running owners whose labels ask for one at a start. It makes
 // up an event for each, which the pass keeps if it fails, so that its
 // retry, which no longer sees the change of the pause, asks again.
+//
+// The policy tells whether the source was paused, unless the watcher's own
+// schedule was in force: the policy of a source with hooks stays manual
+// while its owners run, and the schedule records the pause.
 func (ps *pass) unseenRequests(startAsked, stopAsked bool) []snapRequest {
-	if !ps.plan.Known || ps.plan.Action == backend.ActionNone {
+	if !ps.plan.Known || ps.sched == nil && ps.plan.Action == backend.ActionNone {
 		return nil
 	}
 
 	wasPaused := policyPaused(ps.plan.Current)
+	if ps.sched != nil {
+		wasPaused = ps.sched.Paused
+	}
 
 	var reqs []snapRequest
 
@@ -809,8 +838,11 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 		ps.log.Warn("not queuing a snapshot: kopia server does not run snapshots of the source now",
 			append(attrs, "status", string(st))...)
 		ps.settle(reqs, nil)
+		ps.skipDue()
 
 		return nil
+	case !stop && ps.want.OwnSchedule:
+		return ps.triggerHooked(reqs, status, reasons, attrs)
 	case stop && st == backend.StatusPending:
 		ps.log.Info("not queuing a snapshot: the pending one starts after the stop and counts as the stop snapshot", attrs...)
 		ps.absorbStop(reqs, "", status)
@@ -824,12 +856,7 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 		return nil
 	case stop:
 	case ps.wrote && !ps.deferred:
-		for _, r := range reqs {
-			if r.event != nil {
-				ps.keep = append(ps.keep, *r.event)
-			}
-		}
-
+		ps.keepEvents(reqs)
 		ps.deferStart = true
 		ps.log.Debug("deciding on the start snapshot after the policy write has settled", attrs...)
 
@@ -847,6 +874,10 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 
 			return nil
 		}
+	}
+
+	if stop && ps.want.OwnSchedule {
+		ps.log.Warn("taking the snapshot at the stop without hooks: they cannot run in a container that has stopped", attrs...)
 	}
 
 	ticket, err := ps.backend.TriggerSnapshot(ps.ctx, ps.src)
@@ -877,6 +908,99 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 	ps.startWait(w)
 
 	return nil
+}
+
+// triggerHooked takes the snapshot reqs ask for of a source whose owners
+// run hooks, unless it is one at a stop: as a snapshot with hooks, which
+// startHookRun begins. The rules of trigger hold, but for a scheduled
+// snapshot, which neither the minimum interval nor a snapshot that is
+// pending or uploading holds back, as with kopia server's own schedule:
+// the snapshot is queued once the pre-exec hooks have run, behind the one
+// under way. While a snapshot with hooks is under way, the start events
+// are kept, and a scheduled time stays due, until it ends: there is one at
+// a time.
+func (ps *pass) triggerHooked(reqs []snapRequest, status *backend.SourceStatus, reasons []string, attrs []any) error {
+	scheduled := slices.ContainsFunc(reqs, func(r snapRequest) bool { return r.scheduled })
+	rec, _ := ps.store.Get(ps.src)
+
+	var st backend.Status
+	if status != nil {
+		st = status.Status
+	}
+
+	switch {
+	case rec.HookRun != nil || ps.hooksBusy():
+		ps.keepEvents(reqs)
+		ps.log.Debug("the snapshot waits for the snapshot with hooks under way", attrs...)
+
+		return nil
+	case !ps.canRunHooks():
+		ps.keepEvents(reqs)
+		ps.log.Debug("not starting a snapshot with hooks: the watcher stops", attrs...)
+
+		return nil
+	case ps.wrote && !ps.deferred:
+		ps.keepEvents(reqs)
+		ps.deferStart = true
+		ps.log.Debug("deciding on the snapshot after the policy write has settled", attrs...)
+
+		return nil
+	case scheduled:
+	case st == backend.StatusPending || st == backend.StatusUploading:
+		ps.log.Debug("not taking a snapshot: one is "+strings.ToLower(string(st)), attrs...)
+		ps.settle(reqs, nil)
+
+		return nil
+	default:
+		if next, ok := ps.minIntervalPassed(reqs, status); !ok {
+			ps.log.Debug("not taking a snapshot: the minimum interval since the last one has not passed",
+				append(attrs, "next_allowed", next.Format(timeFormat))...)
+			ps.settle(reqs, nil)
+
+			return nil
+		}
+	}
+
+	return ps.startHookRun(reqs, status, reasons)
+}
+
+// keepEvents keeps the start events of reqs for a later pass.
+func (ps *pass) keepEvents(reqs []snapRequest) {
+	for _, r := range reqs {
+		if r.event != nil {
+			ps.keep = append(ps.keep, *r.event)
+		}
+	}
+}
+
+// hooksBusy reports whether a goroutine of this process runs hooks of the
+// source of the pass.
+func (ps *pass) hooksBusy() bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	return ps.hooksRunning[ps.src] != ""
+}
+
+// canRunHooks reports whether Run runs and is not stopping, so hooks can
+// start.
+func (ps *pass) canRunHooks() bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	return ps.runCtx != nil && ps.runCtx.Err() == nil && ps.hookCtx != nil
+}
+
+// skipDue moves the watcher's schedule past the due time the pass drops.
+func (ps *pass) skipDue() {
+	if ps.due.IsZero() {
+		return
+	}
+
+	ps.updateRecord(ps.src, func(r *state.Record) bool {
+		ps.takeDue(r)
+		return true
+	})
 }
 
 // minIntervalPassed reports whether the minimum interval of one of the

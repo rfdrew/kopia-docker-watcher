@@ -34,6 +34,10 @@ func (d *fakeDocker) Containers(context.Context) ([]docker.Container, error) {
 	return slices.Clone(d.containers), nil
 }
 
+func (d *fakeDocker) Exec(context.Context, string, []string) (docker.ExecResult, error) {
+	return docker.ExecResult{}, nil
+}
+
 func (d *fakeDocker) set(cs ...docker.Container) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

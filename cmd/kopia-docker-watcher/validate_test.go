@@ -93,6 +93,19 @@ func TestValidate(t *testing.T) {
 					"use a Go duration such as 10m, 1h or 24h (d is not a unit), or 0 for no minimum"},
 		},
 		{
+			name: "hooks",
+			args: []string{"kopia.enable=true", "kopia.path=/data", `kopia.pre-exec=["pg_dump","-f","/data/db.sql"]`,
+				"kopia.hook-timeout=30m"},
+			stdout: []string{`kopia.pre-exec ["pg_dump","-f","/data/db.sql"]`, "kopia.post-exec (none)", "kopia.hook-timeout 30m0s",
+				"hooks: the watcher takes the scheduled snapshots of these sources itself and runs the hooks around them; " +
+					"kopia server's schedule of them stays off"},
+		},
+		{
+			name:   "shell hook",
+			args:   []string{"kopia.enable=true", "kopia.path=/data", "kopia.post-exec=rm -f /data/db.sql"},
+			stdout: []string{`kopia.post-exec ["sh","-c","rm -f /data/db.sql"]`, "kopia.hook-timeout 10m0s"},
+		},
+		{
 			name:   "error",
 			args:   []string{"kopia.enable=true"},
 			code:   1,

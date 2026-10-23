@@ -46,6 +46,13 @@ type Engine interface {
 	// once ctx is done, io.EOF if the daemon closed the stream. The event
 	// channel is never closed.
 	Events(ctx context.Context, since time.Time) (<-chan Event, <-chan error)
+
+	// Exec runs cmd in the running container id, as docker exec does
+	// without a terminal or input, and waits until it exits. A container
+	// that is not running is ErrNotRunning, a missing one ErrNotFound. When
+	// ctx ends first, Exec stops waiting; the command keeps running in the
+	// container, as Docker cannot stop it.
+	Exec(ctx context.Context, id string, cmd []string) (ExecResult, error)
 }
 
 // Container is a container as the reconciler needs it.

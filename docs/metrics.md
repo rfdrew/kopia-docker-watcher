@@ -20,6 +20,8 @@ the port.
 | [`kopia_watcher_managed_sources`](#kopia_watcher_managed_sources-and-kopia_watcher_source_paused) | gauge | `state` | Managed sources, active and paused |
 | [`kopia_watcher_source_paused`](#kopia_watcher_managed_sources-and-kopia_watcher_source_paused) | gauge | `path` | 1 while a source is paused, 0 while it is active |
 | [`kopia_watcher_source_owner`](#kopia_watcher_source_owner) | gauge | `path`, `container` | 1 for each container that backs up a source |
+| [`kopia_watcher_hook_failures_total`](#kopia_watcher_hook_failures_total) | counter | `path`, `hook` | Hook commands that failed |
+| [`kopia_watcher_hook_duration_seconds`](#kopia_watcher_hook_duration_seconds) | histogram | `hook` | How long the hook commands ran |
 | [`kopia_watcher_notifications_total`](#kopia_watcher_notifications_total) | counter | `result` | Notifications to `NOTIFY_WEBHOOK_URL`: sent, failed, dropped |
 | `kopia_watcher_build_info` | gauge | `version` | Always 1; the version of the watcher |
 
@@ -66,14 +68,15 @@ A source without a complete snapshot, such as one just registered, has no series
 ### `kopia_watcher_snapshot_duration_seconds`
 
 How long the snapshots the watcher queued ran: at a container's start or stop, at the watcher's start with
-[`SNAPSHOT_ON_WATCHER_START`](configuration.md#snapshot_on_watcher_start), or once more after kopia server lost
-a run. It is the time from the start to the end of the snapshot task in kopia server, so a snapshot that waited
+[`SNAPSHOT_ON_WATCHER_START`](configuration.md#snapshot_on_watcher_start), on the watcher's own schedule of a
+source with [hooks](labels.md#hooks), or once more after kopia server lost a run. It is the time from the start to the end of the snapshot task in kopia server, so a snapshot that waited
 for an upload slot does not count its wait.
 
 Only snapshots that ran to the end count: those that saved a snapshot, complete, incomplete or with errors, and
 those that saved none because nothing had changed (with `ignoreIdenticalSnapshots` in the policy). Failed and
 canceled snapshots and lost runs count in `kopia_watcher_snapshot_failures_total` only. Snapshots kopia server
-takes on schedule do not count: the watcher does not follow them.
+takes on schedule do not count: the watcher does not follow them. The scheduled snapshots of a source with hooks
+do: the watcher takes them.
 
 The buckets are 1 s, 5 s, 15 s, 30 s, 1 min, 5 min, 15 min, 30 min, 1 h, 2 h, 4 h and 8 h. There is no `path`
 label, to keep the number of series low; kopia server's task list shows the time of each snapshot.
@@ -96,7 +99,9 @@ before the first scrape of a new source is the exception: Prometheus first sees 
 below also looks for new series above 0.
 
 Snapshots kopia server takes on schedule do not count. kopia server reports their failures in its task list and
-its notification profiles; for the metrics, `kopia_watcher_last_success_timestamp_seconds` falls behind.
+its notification profiles; for the metrics, `kopia_watcher_last_success_timestamp_seconds` falls behind. The
+scheduled snapshots of a source with [hooks](labels.md#hooks) count, as the watcher takes them. A snapshot with
+hooks whose `kopia.pre-exec` failed takes no snapshot and counts in `kopia_watcher_hook_failures_total` instead.
 
 ### `kopia_watcher_reconcile_errors_total`
 
@@ -133,6 +138,23 @@ Join it to show the containers of a source, for example the last success with on
 ```promql
 kopia_watcher_source_owner * on(path) group_left kopia_watcher_last_success_timestamp_seconds
 ```
+
+### `kopia_watcher_hook_failures_total`
+
+The [hook](labels.md#hooks) commands of a source's containers that failed, by `hook`: `pre-exec`, after which no
+snapshot is taken, or `post-exec`. A hook fails when it exits with a code other than 0, does not finish within
+`kopia.hook-timeout`, cannot run (the container is paused, the command does not exist), or its labels have an
+error. The log has the container and the end of the command's output.
+
+The series of a source with hooks start at 0, for both hooks, when the source becomes managed, and go when no
+container of the source has hooks any more. A hook that fails before the first pass over a new source has
+reported it makes its series appear at 1.
+
+### `kopia_watcher_hook_duration_seconds`
+
+How long the hook commands ran, by `hook`, those that failed included; a hook that could not start does not
+count. The buckets are 0.1 s, 0.5 s, 1 s, 5 s, 15 s, 30 s, 1 min, 5 min, 15 min, 30 min, 1 h and 2 h. Both series
+are always there.
 
 ### `kopia_watcher_notifications_total`
 
@@ -193,6 +215,14 @@ groups:
             or (kopia_watcher_snapshot_failures_total > 0 unless kopia_watcher_snapshot_failures_total offset 1h)
         annotations:
           summary: "A snapshot of {{ $labels.path }} the watcher took did not complete"
+
+      # A hook failed: after a failed pre-exec no snapshot was taken.
+      - alert: KopiaWatcherHookFailed
+        expr: |
+          increase(kopia_watcher_hook_failures_total[1h]) > 0
+            or (kopia_watcher_hook_failures_total > 0 unless kopia_watcher_hook_failures_total offset 1h)
+        annotations:
+          summary: "The {{ $labels.hook }} hook of {{ $labels.path }} failed; see the watcher's log"
 
       # Fires when a problem comes up. Most are counted again at every full
       # reconcile while they last, label errors only while they hold back

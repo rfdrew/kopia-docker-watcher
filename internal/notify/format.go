@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/config"
+	"github.com/rfdrew/kopia-docker-watcher/internal/reconcile"
 	"github.com/rfdrew/kopia-docker-watcher/internal/version"
 )
 
@@ -24,6 +25,8 @@ const (
 	SnapshotRecovered  Kind = "snapshot_recovered"
 	ReconcileFailed    Kind = "reconcile_failed"
 	ReconcileRecovered Kind = "reconcile_recovered"
+	HookFailed         Kind = "hook_failed"
+	HookRecovered      Kind = "hook_recovered"
 )
 
 // Event is one notification.
@@ -36,8 +39,9 @@ type Event struct {
 	Containers []string
 	// Host is kopia server's host name; empty if not known yet.
 	Host string
-	// Reason is the snapshot's outcome, or the kind of reconcile error
-	// (reconcile.Reason).
+	// Reason is the snapshot's outcome, the kind of reconcile error
+	// (reconcile.Reason), or the hook (reconcile.HookPreExec or
+	// reconcile.HookPostExec).
 	Reason string
 	// Error tells what went wrong; empty for a recovery.
 	Error string
@@ -47,7 +51,7 @@ type Event struct {
 
 // Failing reports whether e is about a path that started failing.
 func (e Event) Failing() bool {
-	return e.Kind == SnapshotFailed || e.Kind == ReconcileFailed
+	return e.Kind == SnapshotFailed || e.Kind == ReconcileFailed || e.Kind == HookFailed
 }
 
 // Title is a one-line summary of e.
@@ -59,6 +63,10 @@ func (e Event) Title() string {
 		return "Backup works again: " + e.Path
 	case ReconcileFailed:
 		return "Backup labels cannot be applied: " + e.Path
+	case HookFailed:
+		return "Backup hook failed: " + e.Path
+	case HookRecovered:
+		return "Backup hook works again: " + e.Path
 	default:
 		return "Backup labels apply again: " + e.Path
 	}
@@ -91,6 +99,14 @@ func (e Event) Message() string {
 	case ReconcileRecovered:
 		fmt.Fprintf(&b, "kopia-docker-watcher brought the source %s in line with its labels, after problems since %s.",
 			where, stamp(e.Since))
+	case HookFailed:
+		if e.Reason == reconcile.HookPreExec {
+			fmt.Fprintf(&b, "The %s hook of %s failed, so no snapshot was taken", e.Reason, where)
+		} else {
+			fmt.Fprintf(&b, "The %s hook of %s failed", e.Reason, where)
+		}
+	case HookRecovered:
+		fmt.Fprintf(&b, "The %s hook of %s succeeded, after a failure at %s.", e.Reason, where, stamp(e.Since))
 	}
 
 	if e.Failing() {

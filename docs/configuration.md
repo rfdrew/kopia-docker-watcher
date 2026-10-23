@@ -291,6 +291,9 @@ reports what only it sees:
 - **a snapshot the watcher took** that failed, or whose end is unknown because kopia server lost track of it, as
   when it restarted. The next snapshot of the path the watcher takes that succeeds, or that saves nothing because
   nothing changed, sends "works again". Incomplete and canceled snapshots change nothing;
+- **a [hook](labels.md#hooks) that failed**: a `kopia.pre-exec` command, after which no snapshot was taken, or a
+  `kopia.post-exec` command. Each hook of a path is followed apart; its next run that succeeds sends "works
+  again";
 - **labels that cannot be applied** to a path: kopia server rejects the schedule, the policy or the path,
   containers that share the path disagree, a container's labels have errors, or `STATE_FILE` refuses a change.
   The first pass that applies the labels sends "works again".
@@ -357,14 +360,14 @@ The `json` format posts:
 
 | Field | Meaning |
 |---|---|
-| `event` | `snapshot_failed`, `snapshot_recovered`, `reconcile_failed` or `reconcile_recovered` |
+| `event` | `snapshot_failed`, `snapshot_recovered`, `hook_failed`, `hook_recovered`, `reconcile_failed` or `reconcile_recovered` |
 | `status` | `failing` or `resolved` |
 | `title`, `message` | the text the other formats send |
 | `path` | the source path |
 | `containers` | the containers that back the path up, if the watcher manages it; may be empty |
 | `host` | kopia server's host name, the one its sources carry |
-| `reason` | for a snapshot its outcome (`failed`, `unknown`, `succeeded`, `identical`); for the labels the kind of error, as the `kind` of [`kopia_watcher_reconcile_errors_total`](metrics.md#kopia_watcher_reconcile_errors_total); empty for `reconcile_recovered` |
-| `error` | what went wrong, at most 1000 characters; empty for a recovery |
+| `reason` | for a snapshot its outcome (`failed`, `unknown`, `succeeded`, `identical`); for a hook `pre-exec` or `post-exec`; for the labels the kind of error, as the `kind` of [`kopia_watcher_reconcile_errors_total`](metrics.md#kopia_watcher_reconcile_errors_total); empty for `reconcile_recovered` |
+| `error` | what went wrong, at most 1000 characters, for a hook with the container first (`db: exited with code 1`); empty for a recovery |
 | `since` | when the path started failing |
 | `time` | when the notification was made |
 
@@ -410,6 +413,21 @@ every start.
 The watcher reaches Docker like the docker CLI does: `DOCKER_HOST`, `DOCKER_API_VERSION`, `DOCKER_CERT_PATH` and
 `DOCKER_TLS_VERIFY`. Unset, it uses the local socket `/var/run/docker.sock`. With a docker-socket-proxy, set
 `DOCKER_HOST=tcp://docker-socket-proxy:2375`.
+
+What the watcher asks of Docker:
+
+| Requests | For | docker-socket-proxy |
+|---|---|---|
+| `GET /containers/json`, `GET /containers/{id}/json` | the containers and their labels | `CONTAINERS=1` |
+| `GET /events` | the container events | `EVENTS=1` |
+| `GET /_ping`, `GET /version` | the health check and the API version | allowed by default |
+| `POST /containers/{id}/exec`, `POST /exec/{id}/start`, `GET /exec/{id}/json` | [hooks](labels.md#hooks) only | `EXEC=1` and `POST=1` |
+
+Without hooks the watcher only reads, and the proxy can keep `POST=0`. With hooks it needs `POST=1`, which the
+proxy does not narrow down further: it then lets through every `POST` to the sections it allows, so with
+`CONTAINERS=1` also starting, stopping and removing containers. That is still less than the socket itself, which
+allows everything. A hook needs the upgraded connection of `POST /exec/{id}/start`, which docker-socket-proxy
+passes through.
 
 Unless `DOCKER_API_VERSION` sets it, the watcher negotiates the API version with the daemon; any daemon with API
 1.40 (Docker 19.03) or later works. The [health check](#health-check) pings the daemon (`/_ping`).
