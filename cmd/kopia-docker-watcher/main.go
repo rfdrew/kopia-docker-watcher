@@ -24,7 +24,7 @@ const usage = `Usage: kopia-docker-watcher [command]
 
 Commands:
   run          start the watcher (default), see "run --help"
-  healthcheck  exit 0 if the running watcher answers on LISTEN_ADDR /healthz
+  healthcheck  exit 0 if the running watcher answers 200 on LISTEN_ADDR /healthz
   validate     check container labels, see "validate --help"
   version      print the version and exit
 
@@ -47,10 +47,15 @@ type deps struct {
 	// kopiaTransport replaces the HTTP transport of the kopia server client
 	// of run and validate; nil means the default one.
 	kopiaTransport http.RoundTripper
+	// webhookTransport replaces the HTTP transport of the notifications of
+	// run; nil means the default one.
+	webhookTransport http.RoundTripper
 
 	// Timing of run; zero means the default.
 	minKopiaRetry, maxKopiaRetry time.Duration
 	shutdownGrace                time.Duration
+	// healthInterval is how often the health checks run.
+	healthInterval time.Duration
 	// newTicker replaces time.NewTicker for the full reconciles of run.
 	newTicker func(time.Duration) (<-chan time.Time, func())
 }

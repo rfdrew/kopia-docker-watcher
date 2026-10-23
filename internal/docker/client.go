@@ -46,6 +46,16 @@ func (c *Client) Close() error {
 	return c.api.Close()
 }
 
+// Ping checks that the daemon answers, with GET /_ping, which
+// docker-socket-proxy allows by default.
+func (c *Client) Ping(ctx context.Context) error {
+	if _, err := c.api.Ping(ctx, client.PingOptions{}); err != nil {
+		return fmt.Errorf("ping Docker: %w", err)
+	}
+
+	return nil
+}
+
 // Containers lists all containers, stopped ones included.
 func (c *Client) Containers(ctx context.Context) ([]Container, error) {
 	res, err := c.api.ContainerList(ctx, client.ContainerListOptions{All: true})

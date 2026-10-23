@@ -90,7 +90,16 @@ func TestLoadAllSet(t *testing.T) {
 		EnvStateFile, "/data/state.json",
 		EnvListenAddr, "127.0.0.1:9090",
 		EnvNotifyWebhookURL, "https://ntfy.sh/topic?auth=token",
+		EnvNotifyWebhookFormat, "NTFY",
+		EnvNotifyErrorAfter, "30m",
 		EnvLabelPrefix, "backup.kopia",
+		EnvThrottleUploadBytesPerSecond, "10MiB",
+		EnvThrottleDownloadBytesPerSecond, "0",
+		EnvThrottleReadsPerSecond, "50",
+		EnvThrottleWritesPerSecond, "2.5",
+		EnvThrottleListsPerSecond, "10",
+		EnvThrottleConcurrentReads, "4",
+		EnvThrottleConcurrentWrites, "0",
 	))
 	if err != nil {
 		t.Fatal(err)
@@ -112,7 +121,18 @@ func TestLoadAllSet(t *testing.T) {
 		StateFile:              "/data/state.json",
 		ListenAddr:             "127.0.0.1:9090",
 		NotifyWebhookURL:       "https://ntfy.sh/topic?auth=token",
+		NotifyWebhookFormat:    WebhookNtfy,
+		NotifyErrorAfter:       30 * time.Minute,
 		LabelPrefix:            "backup.kopia",
+		Throttle: Throttle{
+			UploadBytesPerSecond:   ptr(10.0 * 1024 * 1024),
+			DownloadBytesPerSecond: ptr(0.0),
+			ReadsPerSecond:         ptr(50.0),
+			WritesPerSecond:        ptr(2.5),
+			ListsPerSecond:         ptr(10.0),
+			ConcurrentReads:        ptr(4),
+			ConcurrentWrites:       ptr(0),
+		},
 	}
 
 	got := *cfg
@@ -385,15 +405,142 @@ func TestLogValueHidesSecrets(t *testing.T) {
 	}
 }
 
-func TestNotifyWebhookURLWarns(t *testing.T) {
+func ptr[T any](v T) *T { return &v }
+
+func TestNotifyDefaults(t *testing.T) {
 	cfg, err := Load(base(EnvNotifyWebhookURL, "https://ntfy.example.com/backups"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	want := "NOTIFY_WEBHOOK_URL is set, but this version sends no webhooks: nothing will be sent to it"
+	if cfg.NotifyWebhookFormat != WebhookJSON || cfg.NotifyErrorAfter != 15*time.Minute {
+		t.Errorf("format %q, error after %v", cfg.NotifyWebhookFormat, cfg.NotifyErrorAfter)
+	}
+
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("Warnings = %q", cfg.Warnings)
+	}
+
+	cfg, err = Load(base(EnvNotifyWebhookFormat, "slack"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "NOTIFY_WEBHOOK_FORMAT is set but NOTIFY_WEBHOOK_URL is not: no notifications are sent"
 	if !slices.Contains(cfg.Warnings, want) {
 		t.Errorf("Warnings = %q, want %q among them", cfg.Warnings, want)
+	}
+}
+
+func TestNotifyErrors(t *testing.T) {
+	const token = "123456:ABC-secret"
+
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"unknown format", []string{EnvNotifyWebhookFormat, "discord"}, "NOTIFY_WEBHOOK_FORMAT: unknown format"},
+		{"bad duration", []string{EnvNotifyErrorAfter, "1d"}, "NOTIFY_ERROR_AFTER: invalid duration"},
+		{"short duration", []string{EnvNotifyErrorAfter, "10s"}, "shorter than the minimum 1m0s"},
+		{"telegram without sendMessage", []string{EnvNotifyWebhookFormat, "telegram",
+			EnvNotifyWebhookURL, "https://api.telegram.org/bot" + token + "/getMe?chat_id=1"}, "must be https://api.telegram.org/bot<token>/sendMessage"},
+		{"telegram without chat", []string{EnvNotifyWebhookFormat, "telegram",
+			EnvNotifyWebhookURL, "https://api.telegram.org/bot" + token + "/sendMessage"}, "needs the chat in its query"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(base(tc.env...))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+
+			if strings.Contains(err.Error(), token) {
+				t.Errorf("the error shows the token: %v", err)
+			}
+		})
+	}
+
+	cfg, err := Load(base(EnvNotifyWebhookFormat, "telegram",
+		EnvNotifyWebhookURL, "https://api.telegram.org/bot"+token+"/sendMessage?chat_id=-100123&message_thread_id=7"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.NotifyWebhookFormat != WebhookTelegram {
+		t.Errorf("format = %q", cfg.NotifyWebhookFormat)
+	}
+}
+
+func TestThrottle(t *testing.T) {
+	cfg, err := Load(base())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Throttle.Set() {
+		t.Errorf("Throttle = %+v, want nothing set", cfg.Throttle)
+	}
+
+	cfg, err = Load(base(EnvThrottleConcurrentWrites, "0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !cfg.Throttle.Set() || *cfg.Throttle.ConcurrentWrites != 0 {
+		t.Errorf("Throttle = %+v, want concurrent writes set to 0", cfg.Throttle)
+	}
+
+	var buf bytes.Buffer
+
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", "config", cfg)
+
+	if want := `"throttle":{"concurrentWrites":0}`; !strings.Contains(buf.String(), want) {
+		t.Errorf("log output lacks %s: %s", want, buf.String())
+	}
+
+	_, err = Load(base(
+		EnvThrottleUploadBytesPerSecond, "fast",
+		EnvThrottleReadsPerSecond, "-1",
+		EnvThrottleListsPerSecond, "NaN",
+		EnvThrottleConcurrentReads, "1.5",
+	))
+	for _, want := range []string{
+		"KOPIA_THROTTLE_UPLOAD_BYTES_PER_SECOND: invalid size \"fast\"",
+		"KOPIA_THROTTLE_READS_PER_SECOND: invalid rate \"-1\"",
+		"KOPIA_THROTTLE_LISTS_PER_SECOND: invalid rate",
+		"KOPIA_THROTTLE_CONCURRENT_READS: invalid count \"1.5\"",
+	} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want %q", err, want)
+		}
+	}
+}
+
+func TestParseByteSize(t *testing.T) {
+	for in, want := range map[string]float64{
+		"0":         0,
+		"1000":      1000,
+		"1.5k":      1500,
+		"500KB":     500_000,
+		"10MiB":     10 << 20,
+		"10 mib":    10 << 20,
+		"2G":        2e9,
+		"1TiB":      1 << 40,
+		".5Mi":      512 << 10,
+		"12345b":    12345,
+		" 4 KiB ":   4096,
+		"1.0000001": 1,
+	} {
+		got, err := ParseByteSize(in)
+		if err != nil || got != want {
+			t.Errorf("ParseByteSize(%q) = %v, %v; want %v", in, got, err, want)
+		}
+	}
+
+	for _, in := range []string{"", "-1", "1e3", "10 MBps", "k", "1.2.3", "10Mbit"} {
+		if _, err := ParseByteSize(in); err == nil {
+			t.Errorf("ParseByteSize(%q) succeeded", in)
+		}
 	}
 }
 

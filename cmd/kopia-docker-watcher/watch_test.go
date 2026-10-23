@@ -77,6 +77,10 @@ type runKopia struct {
 	uploads []string
 	tasks   []kopiaclient.TaskInfo
 	snaps   map[string][]kopiaclient.Snapshot
+	// throttle is what repo/throttle holds; throttleErr makes it answer
+	// STORAGE_CONNECTION, as for a repository server.
+	throttle    kopiaclient.ThrottleLimits
+	throttleErr bool
 }
 
 func newRunKopia(t *testing.T) *runKopia {
@@ -214,6 +218,20 @@ func (f *runKopia) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		writeJSONResponse(w, map[string]any{"effective": req.Updates, "upcomingSnapshotTimes": upcoming})
+	case "GET /api/v1/repo/throttle":
+		if f.throttleErr {
+			writeKopiaError(w, http.StatusBadRequest, "STORAGE_CONNECTION", "no direct storage connection")
+			return
+		}
+
+		writeJSONResponse(w, f.throttle)
+	case "PUT /api/v1/repo/throttle":
+		f.throttle = kopiaclient.ThrottleLimits{}
+		if err := json.Unmarshal(body, &f.throttle); err != nil {
+			f.t.Errorf("repo/throttle body %s: %v", body, err)
+		}
+
+		writeJSONResponse(w, map[string]any{})
 	case "GET /api/v1/tasks":
 		writeJSONResponse(w, map[string]any{"tasks": orEmpty(f.tasks)})
 	case "GET /api/v1/snapshots":
@@ -522,6 +540,8 @@ type watcherOptions struct {
 	grace time.Duration
 	// retry is the first delay between attempts to reach kopia server.
 	retry time.Duration
+	// webhook receives the notifications.
+	webhook http.RoundTripper
 }
 
 func startWatcher(t *testing.T, k *runKopia, e *watchEngine, opts watcherOptions) *watcherRun {
@@ -547,6 +567,7 @@ func startWatcher(t *testing.T, k *runKopia, e *watchEngine, opts watcherOptions
 	wr.td.minKopiaRetry = cmp.Or(opts.retry, time.Millisecond)
 	wr.td.maxKopiaRetry = 2 * time.Millisecond
 	wr.td.shutdownGrace = opts.grace
+	wr.td.webhookTransport = opts.webhook
 	wr.td.newTicker = func(d time.Duration) (<-chan time.Time, func()) {
 		wr.interval <- d
 		return wr.ticks, func() {}
@@ -718,8 +739,9 @@ func TestRunWaitsForKopia(t *testing.T) {
 		t.Errorf("connected line has storage although kopia server reported none: %v", l)
 	}
 
-	if n := k.count("GET /api/v1/repo/status"); n != 4 {
-		t.Errorf("repo/status asked %d times, want 4", n)
+	// Four attempts, then the health checks of kopia server.
+	if n := k.count("GET /api/v1/repo/status"); n < 4 {
+		t.Errorf("repo/status asked %d times, want 4 and more", n)
 	}
 
 	wr.cancel()

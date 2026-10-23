@@ -29,6 +29,7 @@ type fakeDocker struct {
 	containers []container.Summary
 	inspect    map[string]container.InspectResponse
 	failEvents int // /events requests still to answer with 500
+	failPing   bool
 	requests   []recordedRequest
 }
 
@@ -78,6 +79,15 @@ func (f *fakeDocker) lastRequest(t *testing.T, path string) recordedRequest {
 
 func (f *fakeDocker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/_ping" {
+		f.mu.Lock()
+		fail := f.failPing
+		f.mu.Unlock()
+
+		if fail {
+			writeDockerError(w, http.StatusInternalServerError, "daemon is busy")
+			return
+		}
+
 		w.Header().Set("Api-Version", fakeAPIVersion)
 		w.Header().Set("Ostype", "linux")
 		w.WriteHeader(http.StatusOK)
