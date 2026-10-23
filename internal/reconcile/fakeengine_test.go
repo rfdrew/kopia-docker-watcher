@@ -20,6 +20,11 @@ type fakeEngine struct {
 	containers map[string]docker.Container
 	fail       []error
 	nextID     int
+
+	// exec runs the commands of Exec; nil succeeds at once with no
+	// output. execs records them as "container: arg arg".
+	exec  func(ctx context.Context, c docker.Container, cmd []string) (docker.ExecResult, error)
+	execs []string
 }
 
 var _ docker.Engine = (*fakeEngine)(nil)
@@ -77,6 +82,65 @@ func (f *fakeEngine) Inspect(ctx context.Context, id string) (docker.Container, 
 	return docker.Container{}, fmt.Errorf("inspect container %s: %w", id, docker.ErrNotFound)
 }
 
+// Exec implements docker.Engine: a container that does not exist is
+// docker.ErrNotFound, one that does not run docker.ErrNotRunning; any
+// other runs f.exec, and the command counts as started.
+func (f *fakeEngine) Exec(ctx context.Context, id string, cmd []string) (docker.ExecResult, error) {
+	f.mu.Lock()
+
+	c, ok := f.containers[id]
+	if ok {
+		f.execs = append(f.execs, c.Name+": "+strings.Join(cmd, " "))
+	}
+
+	run := f.exec
+	f.mu.Unlock()
+
+	switch {
+	case !ok:
+		return docker.ExecResult{}, fmt.Errorf("exec in container %s: %w", id, docker.ErrNotFound)
+	case c.State != docker.StateRunning:
+		return docker.ExecResult{}, fmt.Errorf("exec in container %s: %w", id, docker.ErrNotRunning)
+	case run == nil:
+		return docker.ExecResult{Started: true}, ctx.Err()
+	}
+
+	res, err := run(ctx, cloneContainer(c), cmd)
+	res.Started = true
+
+	return res, err
+}
+
+// containerID returns the ID of the container with the name.
+func (f *fakeEngine) containerID(name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for id, c := range f.containers {
+		if c.Name == name {
+			return id
+		}
+	}
+
+	panic("no container " + name)
+}
+
+// execLog returns the commands Exec ran, as "container: arg arg".
+func (f *fakeEngine) execLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return slices.Clone(f.execs)
+}
+
+// setExec sets what Exec runs.
+func (f *fakeEngine) setExec(fn func(ctx context.Context, c docker.Container, cmd []string) (docker.ExecResult, error)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.exec = fn
+}
+
 // Events implements docker.Engine with a subscription that only ends with
 // ctx.
 func (f *fakeEngine) Events(ctx context.Context, _ time.Time) (<-chan docker.Event, <-chan error) {
@@ -88,6 +152,14 @@ func (f *fakeEngine) Events(ctx context.Context, _ time.Time) (<-chan docker.Eve
 	}()
 
 	return make(chan docker.Event), errc
+}
+
+// add adds a container as it is, with its own ID.
+func (f *fakeEngine) add(c docker.Container) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.containers[c.ID] = cloneContainer(c)
 }
 
 // run creates a running container with labels given as "key=value" and

@@ -212,6 +212,10 @@ func (e *fakeEngine) Events(context.Context, time.Time) (<-chan docker.Event, <-
 	panic("validate must not subscribe to events")
 }
 
+func (e *fakeEngine) Exec(context.Context, string, []string) (docker.ExecResult, error) {
+	panic("validate must not run hooks")
+}
+
 func (e *fakeEngine) Close() error {
 	e.closed = true
 	return nil

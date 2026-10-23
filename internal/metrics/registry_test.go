@@ -314,3 +314,51 @@ func TestNotification(t *testing.T) {
 		`kopia_watcher_notifications_total{result="dropped"}`: 0,
 	})
 }
+
+// Hooks: a failure counts for its source and hook, a duration goes into
+// the histogram of its hook; the failures of a source with hooks start at
+// zero and go when it no longer has hooks, or is forgotten.
+func TestHookFinished(t *testing.T) {
+	m := New()
+
+	assertSamples(t, scrape(t, m), map[string]float64{
+		`kopia_watcher_hook_duration_seconds_count{hook="pre-exec"}`:  0,
+		`kopia_watcher_hook_duration_seconds_count{hook="post-exec"}`: 0,
+	})
+
+	m.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"db"}, Hooks: true})
+	assertSamples(t, scrape(t, m), map[string]float64{
+		`kopia_watcher_hook_failures_total{hook="pre-exec",path="/data/app"}`:  0,
+		`kopia_watcher_hook_failures_total{hook="post-exec",path="/data/app"}`: 0,
+	})
+
+	m.HookFinished("/data/app", reconcile.HookResult{Hook: reconcile.HookPreExec, Container: "db", Duration: 2 * time.Second,
+		Error: "exited with code 1"})
+	m.HookFinished("/data/app", reconcile.HookResult{Hook: reconcile.HookPostExec, Container: "db", Duration: 100 * time.Millisecond})
+	m.HookFinished("/data/app", reconcile.HookResult{Hook: reconcile.HookPreExec, Container: "db", Error: "the hook labels have errors"})
+
+	assertSamples(t, scrape(t, m), map[string]float64{
+		`kopia_watcher_hook_failures_total{hook="pre-exec",path="/data/app"}`:  2,
+		`kopia_watcher_hook_failures_total{hook="post-exec",path="/data/app"}`: 0,
+		`kopia_watcher_hook_duration_seconds_count{hook="pre-exec"}`:           1,
+		`kopia_watcher_hook_duration_seconds_sum{hook="pre-exec"}`:             2,
+		`kopia_watcher_hook_duration_seconds_count{hook="post-exec"}`:          1,
+	})
+
+	m.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"db"}})
+
+	for s := range scrape(t, m) {
+		if strings.HasPrefix(s, "kopia_watcher_hook_failures_total") {
+			t.Errorf("hook failures of a source without hooks: %s", s)
+		}
+	}
+
+	m.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"db"}, Hooks: true})
+	m.ForgetSource("/data/app")
+
+	for s := range scrape(t, m) {
+		if strings.HasPrefix(s, "kopia_watcher_hook_failures_total") {
+			t.Errorf("hook failures of a forgotten source: %s", s)
+		}
+	}
+}

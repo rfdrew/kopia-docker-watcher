@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/config"
+	"github.com/rfdrew/kopia-docker-watcher/internal/reconcile"
 	"github.com/rfdrew/kopia-docker-watcher/internal/version"
 )
 
@@ -24,6 +25,8 @@ const (
 	SnapshotRecovered  Kind = "snapshot_recovered"
 	ReconcileFailed    Kind = "reconcile_failed"
 	ReconcileRecovered Kind = "reconcile_recovered"
+	HookFailed         Kind = "hook_failed"
+	HookRecovered      Kind = "hook_recovered"
 )
 
 // Event is one notification.
@@ -36,9 +39,12 @@ type Event struct {
 	Containers []string
 	// Host is kopia server's host name; empty if not known yet.
 	Host string
-	// Reason is the snapshot's outcome, or the kind of reconcile error
-	// (reconcile.Reason).
+	// Reason is the snapshot's outcome, the kind of reconcile error
+	// (reconcile.Reason), or the hook (reconcile.HookPreExec or
+	// reconcile.HookPostExec).
 	Reason string
+	// Container is the container a hook ran in; empty for the other kinds.
+	Container string
 	// Error tells what went wrong; empty for a recovery.
 	Error string
 	// Since is when the path started failing; Time is now.
@@ -47,7 +53,7 @@ type Event struct {
 
 // Failing reports whether e is about a path that started failing.
 func (e Event) Failing() bool {
-	return e.Kind == SnapshotFailed || e.Kind == ReconcileFailed
+	return e.Kind == SnapshotFailed || e.Kind == ReconcileFailed || e.Kind == HookFailed
 }
 
 // Title is a one-line summary of e.
@@ -59,6 +65,10 @@ func (e Event) Title() string {
 		return "Backup works again: " + e.Path
 	case ReconcileFailed:
 		return "Backup labels cannot be applied: " + e.Path
+	case HookFailed:
+		return "Backup hook failed: " + e.Path
+	case HookRecovered:
+		return "Backup hook works again: " + e.Path
 	default:
 		return "Backup labels apply again: " + e.Path
 	}
@@ -91,6 +101,14 @@ func (e Event) Message() string {
 	case ReconcileRecovered:
 		fmt.Fprintf(&b, "kopia-docker-watcher brought the source %s in line with its labels, after problems since %s.",
 			where, stamp(e.Since))
+	case HookFailed:
+		if e.Reason == reconcile.HookPreExec {
+			fmt.Fprintf(&b, "The %s hook in %s for %s failed, so no snapshot was taken", e.Reason, e.Container, where)
+		} else {
+			fmt.Fprintf(&b, "The %s hook in %s for %s failed", e.Reason, e.Container, where)
+		}
+	case HookRecovered:
+		fmt.Fprintf(&b, "The %s hook in %s for %s succeeded, after a failure at %s.", e.Reason, e.Container, where, stamp(e.Since))
 	}
 
 	if e.Failing() {
@@ -123,6 +141,7 @@ type payload struct {
 	Containers []string  `json:"containers"`
 	Host       string    `json:"host,omitempty"`
 	Reason     string    `json:"reason,omitempty"`
+	Container  string    `json:"container,omitempty"`
 	Error      string    `json:"error,omitempty"`
 	Since      time.Time `json:"since"`
 	Time       time.Time `json:"time"`
@@ -202,7 +221,7 @@ func (n *Notifier) request(ctx context.Context, e Event) (*http.Request, error) 
 
 		body, err = json.Marshal(payload{
 			Event: e.Kind, Status: status, Title: e.Title(), Message: e.Message(), Path: e.Path,
-			Containers: containers, Host: e.Host, Reason: e.Reason, Error: e.Error,
+			Containers: containers, Host: e.Host, Reason: e.Reason, Container: e.Container, Error: e.Error,
 			Since: e.Since.UTC(), Time: e.Time.UTC(), Version: version.Version,
 		})
 	}

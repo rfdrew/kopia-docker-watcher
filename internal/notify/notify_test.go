@@ -667,3 +667,75 @@ func TestNeverBlocks(t *testing.T) {
 		t.Errorf("log:\n%s", f.logs)
 	}
 }
+
+// Hooks: a failure of each hook of each container is notified once, and
+// so is the next success after it.
+func TestHookNotifications(t *testing.T) {
+	f := newFixture(t, config.WebhookJSON, "https://hooks.example.com/x")
+	f.n.SetHost("nas")
+	f.n.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"api", "db"}, Hooks: true})
+
+	pre := func(container, err string) reconcile.HookResult {
+		return reconcile.HookResult{Hook: reconcile.HookPreExec, Container: container, Error: err}
+	}
+
+	f.n.HookFinished("/data/app", pre("db", ""))
+	mustKinds(t, f)
+
+	f.n.HookFinished("/data/app", pre("db", "exited with code 1"))
+	f.n.HookFinished("/data/app", pre("db", "exited with code 1"))
+	evs := mustKinds(t, f, HookFailed)
+
+	e := evs[0]
+	if e.Reason != "pre-exec" || e.Container != "db" || e.Error != "exited with code 1" {
+		t.Errorf("event = %+v", e)
+	}
+
+	if want := "The pre-exec hook in db for /data/app on nas (api, db) failed, so no snapshot was taken: exited with code 1."; e.Message() != want {
+		t.Errorf("message = %q, want %q", e.Message(), want)
+	}
+
+	if e.Title() != "Backup hook failed: /data/app" || !e.Failing() {
+		t.Errorf("title = %q", e.Title())
+	}
+
+	// Another container's success does not make db's hook fine.
+	f.n.HookFinished("/data/app", pre("api", ""))
+	f.n.HookFinished("/data/app", pre("db", "exited with code 1"))
+	mustKinds(t, f)
+
+	// The post-exec hook is followed apart.
+	f.n.HookFinished("/data/app", reconcile.HookResult{Hook: reconcile.HookPostExec, Container: "db", Error: "timed out"})
+	evs = mustKinds(t, f, HookFailed)
+
+	if want := "The post-exec hook in db for /data/app on nas (api, db) failed: timed out."; evs[0].Message() != want {
+		t.Errorf("message = %q, want %q", evs[0].Message(), want)
+	}
+
+	f.clock.advance(time.Hour)
+	f.n.HookFinished("/data/app", pre("db", ""))
+	evs = mustKinds(t, f, HookRecovered)
+
+	if !evs[0].Since.Equal(e.Time) || evs[0].Reason != "pre-exec" || evs[0].Container != "db" || evs[0].Failing() {
+		t.Errorf("recovered = %+v", evs[0])
+	}
+
+	// A source whose containers no longer have hooks forgets the failing
+	// ones: a failure after they come back is notified.
+	f.n.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"api", "db"}})
+	f.n.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"api", "db"}, Hooks: true})
+	f.n.HookFinished("/data/app", reconcile.HookResult{Hook: reconcile.HookPostExec, Container: "db", Error: "timed out"})
+	mustKinds(t, f, HookFailed)
+
+	// So does a source that loses the container.
+	f.n.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"api"}, Hooks: true})
+	f.n.HookFinished("/data/app", reconcile.HookResult{Hook: reconcile.HookPostExec, Container: "db"})
+	mustKinds(t, f)
+
+	// A forgotten source forgets its failing hooks.
+	f.n.HookFinished("/data/app", pre("api", "exited with code 2"))
+	mustKinds(t, f, HookFailed)
+	f.n.ForgetSource("/data/app")
+	f.n.HookFinished("/data/app", pre("api", ""))
+	mustKinds(t, f)
+}

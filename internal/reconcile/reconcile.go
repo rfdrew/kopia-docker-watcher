@@ -106,6 +106,40 @@
 // A backend that cannot do one of these yet (backend.ErrNotImplemented) is
 // reported once, and the rest goes on without it.
 //
+// # Hooks
+//
+// A container can run commands around the snapshots of its sources: its
+// pre-exec label before them, its post-exec label after. kopia server's
+// schedule would snapshot such a source without them, so the policy keeps
+// the scheduling section {"manual": true}, as while paused, also while its
+// owners run (backend.Desired.OwnSchedule), and the watcher takes the
+// scheduled snapshots itself. It works their times out with policy/resolve
+// from the policy the source would have without the hooks and the pause,
+// so cron, the interval, the times of day and what the source inherits
+// keep kopia server's meaning, and keeps the next time in the state: one
+// that passed while the watcher was not running, while no owner ran, or
+// while a snapshot with hooks was under way, is taken late only as kopia
+// server would take a missed one, with an interval, or with runMissed when
+// the next time is more than half an hour away. While no owner runs, no
+// scheduled snapshot is taken, and nothing is written to kopia server for
+// that; a source whose containers are all gone keeps its schedule for when
+// they come back. Once the owners have no hooks, the saved section comes
+// back as after a pause.
+//
+// Every snapshot of such a source the watcher takes, scheduled or at a
+// start, is a snapshot with hooks. The pre-exec hooks of the running owners
+// run one after the other, outside the passes, each within its timeout;
+// when one fails, no snapshot is taken. Otherwise the next pass queues the
+// snapshot, which a waiter follows as any other; an error of kopia server
+// that is not retried ends the run without a snapshot. Once the snapshot
+// has ended, however it ended, or once there is none, the post-exec hooks
+// of the running owners run. There is one such snapshot at a time per
+// source, and the state keeps how far it got, so that a restart of the
+// watcher takes it up: pre-exec hooks a stop of the watcher cut short
+// count as failed, post-exec hooks run again. A snapshot at a stop is
+// taken without hooks; while pre-exec hooks run, it waits until their
+// snapshot is queued, so that it does not read a dump half written.
+//
 // # Cleanup
 //
 // The state remembers the owners of each source the watcher manages, with
@@ -228,6 +262,8 @@ const (
 // Docker lists the containers; docker.Engine implements it.
 type Docker interface {
 	Containers(ctx context.Context) ([]docker.Container, error)
+	// Exec runs a hook command in a running container.
+	Exec(ctx context.Context, id string, cmd []string) (docker.ExecResult, error)
 }
 
 // Store keeps what was applied to each source; *state.Store implements it.
@@ -418,6 +454,18 @@ type Reconciler struct {
 	inspects    []volumeEvent
 	inspectWake chan struct{}
 
+	// hookCtx is the context the hook commands run on: Run's passes'
+	// context, which ends ShutdownGrace after Run's. hookers counts the
+	// goroutines that run hooks, hooksRunning holds the ID of the hook
+	// run each runs, by source.
+	hookCtx      context.Context
+	hookers      sync.WaitGroup
+	hooksRunning map[backend.Source]string
+	// armed holds per path the scheduled snapshot time this process armed
+	// a timer for: a time that passes while it is armed is taken late,
+	// one that passed before is a missed one.
+	armed map[string]time.Time
+
 	// dockerTimeout bounds every container listing.
 	dockerTimeout time.Duration
 
@@ -432,6 +480,9 @@ type Reconciler struct {
 	afterPass func(path string, res passResult)
 	// afterWait, if set, is called after every snapshot waiter; for tests.
 	afterWait func(w state.SnapshotWait)
+	// afterHooks, if set, is called after every goroutine that ran hooks;
+	// for tests.
+	afterHooks func(src backend.Source, phase string)
 }
 
 // labelReport is what was reported about a container's labels.
@@ -514,6 +565,8 @@ func New(opts Options) (*Reconciler, error) {
 		mounts:         map[string][]string{},
 		removed:        map[string]bool{},
 		inspectWake:    make(chan struct{}, 1),
+		hooksRunning:   map[backend.Source]string{},
+		armed:          map[string]time.Time{},
 		passStarts:     map[string]time.Time{},
 
 		snapshotOnWatcherStart: opts.SnapshotOnWatcherStart,
@@ -555,28 +608,31 @@ func orDefault[T int | time.Duration](v, def T) T {
 // scan by itself: docker.Watcher sends KindResync first, which HandleEvent
 // turns into ReconcileAll.
 //
-// When ctx is done, Run takes no more paths and gives the passes that are
-// running ShutdownGrace to finish. The snapshot waiters stop at once; their
-// waits stay in the state for the next start. Run returns once every
-// goroutine it started has returned, the waiters after the passes; after
-// that it calls neither the store nor the backend, so the caller may close
-// them. Run must be called once.
+// When ctx is done, Run takes no more paths and starts no more hooks, and
+// gives the passes and hooks that are running ShutdownGrace to finish. The
+// snapshot waiters stop at once; their waits stay in the state for the
+// next start. Run returns once every goroutine it started has returned,
+// the waiters and the hooks after the passes; after that it calls neither
+// the store, nor the backend, nor Docker, so the caller may close them.
+// Run must be called once.
 func (r *Reconciler) Run(ctx context.Context) {
 	if !r.running.CompareAndSwap(false, true) {
 		panic("reconcile: Run called twice or along with RunOnce")
 	}
 
+	// Passes run on their own context, canceled ShutdownGrace after ctx.
+	// So do the hooks.
+	passCtx, cancelPasses := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelPasses()
+
 	r.mu.Lock()
 	r.runCtx = ctx
+	r.hookCtx = passCtx
 	r.mu.Unlock()
 
 	r.progressMu.Lock()
 	r.runStart = time.Now()
 	r.progressMu.Unlock()
-
-	// Passes run on their own context, canceled ShutdownGrace after ctx.
-	passCtx, cancelPasses := context.WithCancel(context.WithoutCancel(ctx))
-	defer cancelPasses()
 
 	var wg sync.WaitGroup
 
@@ -596,8 +652,10 @@ func (r *Reconciler) Run(ctx context.Context) {
 	wg.Wait()
 
 	// The waiters run on ctx and stop at once; their waits stay in the
-	// state for the next start.
+	// state for the next start. Hooks have ShutdownGrace, like the passes;
+	// a hook run cut short is taken up after the next start.
 	r.waiters.Wait()
+	r.hookers.Wait()
 }
 
 // work takes paths until ctx is done and runs their passes with passCtx.
@@ -648,6 +706,11 @@ func (r *Reconciler) schedule(ctx context.Context, p string, res passResult) {
 
 	if res.recheck {
 		r.queue.addAfter(p, r.eventDelay)
+	}
+
+	// The watcher's own schedule of a source with hooks.
+	if !res.nextRun.IsZero() {
+		r.queue.addAfter(p, res.nextRun.Sub(r.now()))
 	}
 
 	// A pending retry comes first; it looks at the restarting owner too.

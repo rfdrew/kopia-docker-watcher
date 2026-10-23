@@ -464,6 +464,10 @@ func (e *watchEngine) Inspect(context.Context, string) (docker.Container, error)
 	return docker.Container{}, errors.New("run does not inspect")
 }
 
+func (e *watchEngine) Exec(context.Context, string, []string) (docker.ExecResult, error) {
+	return docker.ExecResult{}, errors.New("no hooks in these tests")
+}
+
 func (e *watchEngine) Events(ctx context.Context, _ time.Time) (<-chan docker.Event, <-chan error) {
 	e.mu.Lock()
 	e.subs = append(e.subs, ctx)

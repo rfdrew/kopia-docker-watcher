@@ -674,6 +674,11 @@ func (t teeMetrics) SnapshotFinished(path string, res backend.SnapshotResult) {
 	t.n.SnapshotFinished(path, res)
 }
 
+func (t teeMetrics) HookFinished(path string, res reconcile.HookResult) {
+	t.m.HookFinished(path, res)
+	t.n.HookFinished(path, res)
+}
+
 // logKopiaError explains an error of kopia server that retrying cannot fix.
 func (w *watcher) logKopiaError(err error) {
 	var msg string

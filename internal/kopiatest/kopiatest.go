@@ -175,6 +175,12 @@ func Start(t testing.TB, opts Options) *Server {
 	return s
 }
 
+// ContainerID returns the ID of the container kopia server runs in, for
+// tests that run commands in it through Docker as hooks.
+func (s *Server) ContainerID() string {
+	return s.ctr.GetContainerID()
+}
+
 // Exec runs a command in the container and returns its output; a non-zero
 // exit fails the test.
 func (s *Server) Exec(t testing.TB, cmd ...string) string {
