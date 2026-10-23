@@ -191,7 +191,9 @@ func TestIntegrationPolicyLabels(t *testing.T) {
 		assertSection(t, got, "retention", `{"keepLatest":5,"keepWeekly":4,"ignoreIdenticalSnapshots":true}`)
 		assertSection(t, got, "files", `{"noParentIgnore":true,"ignoreDotFiles":[".kopiaignore"],"maxFileSize":1073741824,"oneFileSystem":false}`)
 		assertSection(t, got, "compression", `{"compressorName":"s2-default","minSize":4096,"maxSize":100000000,"onlyCompress":[".txt"]}`)
-		assertSection(t, got, "logging", `{"directories":{"snapshotted":5}}`)
+		// kopia server writes the logging section back with its empty
+		// entries object.
+		assertSection(t, got, "logging", `{"directories":{"snapshotted":5},"entries":{}}`)
 
 		// The policy-json label goes: its field goes too.
 		var noJSON []string
