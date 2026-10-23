@@ -70,8 +70,12 @@ type ReturnResult struct {
 	// back without the watcher, as when someone else started it.
 	Downtime time.Duration
 	// Error tells why the container could not be brought back; empty when
-	// it is running again.
+	// it is no longer down.
 	Error string
+	// Note says why a container the watcher failed to bring back before is
+	// no longer held, though the watcher did not bring it back: it is gone,
+	// or someone else started or stopped it; empty when it runs.
+	Note string
 }
 
 // Hook names, as HookResult.Hook has them.

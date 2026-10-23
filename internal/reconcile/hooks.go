@@ -262,16 +262,10 @@ func (ps *pass) hookRun(status *backend.SourceStatus) error {
 	case state.HookDown:
 		return ps.afterDown(*run, status)
 	case state.HookSnapshot:
+		// The retry loop brings the containers back by the run's ReturnBy,
+		// should the snapshot take longer.
 		i := slices.IndexFunc(rec.SnapshotWaits, func(w state.SnapshotWait) bool { return w.ID == run.WaitID })
 		if i >= 0 && rec.SnapshotWaits[i].Result == nil {
-			if ps.holding(run.ID) {
-				if ps.now().Before(run.ReturnBy) {
-					ps.wakeAt(run.ReturnBy)
-				} else {
-					ps.returnEarly(*run)
-				}
-			}
-
 			return nil
 		}
 
@@ -311,8 +305,19 @@ func (ps *pass) afterPre(run state.HookRun, status *backend.SourceStatus) error 
 		return ps.toPost(run)
 	}
 
-	if plan := ps.downPlan(); plan.needed() {
+	plan := ps.downPlan()
+	if plan.needed() {
 		return ps.toDown(run, plan)
+	}
+
+	// An owner another snapshot holds down comes back before this
+	// snapshot is queued.
+	if h, busy := ps.heldBusy(plan, run.ID); busy {
+		ps.log.Info("the snapshot waits: a container it needs is held down for another snapshot",
+			append(attrs, "container", h.Name, "held_for", h.Source.Path)...)
+		ps.waitFor(h.ID)
+
+		return nil
 	}
 
 	return ps.queueSnapshot(run)
@@ -320,9 +325,10 @@ func (ps *pass) afterPre(run state.HookRun, status *backend.SourceStatus) error 
 
 // afterDown queues the snapshot of a run whose containers are down, or
 // goes to the post-exec hooks, which bring them back first, of one that
-// could not take them all down, or whose containers had to come back
-// before the snapshot could be queued. A stop of the watcher while it took
-// them down counts as a failure: they came back when it stopped.
+// could not take them all down, or whose containers came back before the
+// snapshot could be queued: they had to by then, or the watcher stopped
+// meanwhile, or while it took them down, and brought them back. While the
+// watcher stops, it queues nothing.
 func (ps *pass) afterDown(run state.HookRun, status *backend.SourceStatus) error {
 	attrs := []any{"source", ps.src.String(), "reason", run.Reason}
 
@@ -340,13 +346,15 @@ func (ps *pass) afterDown(run state.HookRun, status *backend.SourceStatus) error
 			append(attrs, "return_by", run.ReturnBy.Format(timeFormat))...)
 
 		return ps.toPost(run)
+	case run.DownTaken > len(ps.heldFor(ps.src, run.ID)):
+		ps.log.Warn("no snapshot: the containers came back before it could be queued, as the watcher stopped", attrs...)
+		return ps.toPost(run)
+	case ps.stopping():
+		return nil
 	case status != nil && status.Status == backend.StatusStopped:
 		ps.log.Warn("no snapshot: kopia server does not run snapshots of the source now", append(attrs, "status", string(status.Status))...)
 		return ps.toPost(run)
 	}
-
-	// Should queuing fail and be retried, the containers come back in time.
-	ps.wakeAt(run.ReturnBy)
 
 	return ps.queueSnapshot(run)
 }
@@ -522,7 +530,11 @@ func (ps *pass) goHooks(ctx context.Context, run state.HookRun, hook string, tar
 		defer r.hookers.Done()
 
 		if hook == HookPostExec {
-			failed := r.returnRun(ctx, log, src, run.ID)
+			// They stay held, as back, until the post-exec hooks are done,
+			// so that no other snapshot takes them down meanwhile.
+			failed := r.returnRun(ctx, log, src, run.ID, true)
+			defer r.releaseRun(src, run.ID)
+
 			targets = slices.DeleteFunc(slices.Clone(targets), func(t hookTarget) bool {
 				if failed[t.id] {
 					log.Warn("post-exec hook not run: the container did not come back", "hook", hook, "container", t.name)
@@ -612,9 +624,22 @@ func (r *Reconciler) runHook(ctx context.Context, log *slog.Logger, path, hook s
 	hctx, cancel := context.WithTimeout(ctx, t.timeout)
 	defer cancel()
 
+	// No snapshot of another source takes the container down meanwhile.
+	r.mu.Lock()
+	r.execs[t.id]++
+	r.mu.Unlock()
+
 	start := time.Now()
 	res, err := r.docker.Exec(hctx, t.id, t.cmd)
 	d := time.Since(start)
+
+	r.mu.Lock()
+	if r.execs[t.id]--; r.execs[t.id] <= 0 {
+		delete(r.execs, t.id)
+	}
+	r.mu.Unlock()
+
+	r.wakeWaiters(t.id)
 
 	if ctx.Err() != nil {
 		log.Warn(hook+" hook cut short: the watcher stops", attrs...)

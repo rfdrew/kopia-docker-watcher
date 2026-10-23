@@ -786,8 +786,19 @@ func TestReturnNotifications(t *testing.T) {
 		t.Errorf("recovered = %+v", evs[0])
 	}
 
+	// One that someone else removed is no longer held, and says so.
+	f.n.ContainerReturned("/data/app", reconcile.ReturnResult{Container: "cache", Mode: reconcile.ModePause, Note: "it is gone"})
+	evs = mustKinds(t, f, ReturnRecovered)
+
+	if evs[0].Title() != "Container no longer held after a backup: cache" || !strings.HasPrefix(evs[0].Message(),
+		"kopia-docker-watcher no longer tries to bring back cache after the snapshot of /data/app on nas (db), as it is gone;") {
+		t.Errorf("recovered = %q: %q", evs[0].Title(), evs[0].Message())
+	}
+
 	// A forgotten source forgets its containers.
+	f.n.ContainerReturned("/data/app", back("api", reconcile.ModeStop, "port is already allocated"))
+	mustKinds(t, f, ReturnFailed)
 	f.n.ForgetSource("/data/app")
-	f.n.ContainerReturned("/data/app", back("cache", reconcile.ModePause, ""))
+	f.n.ContainerReturned("/data/app", back("api", reconcile.ModeStop, ""))
 	mustKinds(t, f)
 }

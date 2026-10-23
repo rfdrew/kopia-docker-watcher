@@ -296,7 +296,8 @@ reports what only it sees:
   "works again". A container that no longer backs the path up, or no longer has hooks, is forgotten;
 - **a container the watcher [stopped or paused](labels.md#stopping-and-pausing) for a snapshot and cannot bring
   back**. The watcher keeps trying; once the container runs again, because the watcher started it or someone
-  else did, it sends "works again";
+  else did, it sends "works again". When the watcher stops trying because the container was removed, or someone
+  else started or stopped it, the "works again" says so;
 - **labels that cannot be applied** to a path: kopia server rejects the schedule, the policy or the path,
   containers that share the path disagree, a container's labels have errors, or `STATE_FILE` refuses a change.
   The first pass that applies the labels sends "works again".

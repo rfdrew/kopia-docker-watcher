@@ -303,6 +303,10 @@ type HookRun struct {
 	// ReturnBy is when the containers the run takes down are brought back
 	// at the latest, the snapshot done or not.
 	ReturnBy time.Time `json:"returnBy,omitzero"`
+	// DownTaken is how many containers the run took down. A run that has
+	// fewer held when its snapshot is to be queued lost them, as when the
+	// watcher stopped meanwhile, and takes no snapshot.
+	DownTaken int `json:"downTaken,omitempty"`
 }
 
 // Owner is a container that backs a source up, as the state remembers it.
@@ -370,9 +374,21 @@ type Held struct {
 	// Zero until the watcher has looked, just before it takes the
 	// container down: such a container was not touched.
 	StartedAt time.Time `json:"startedAt,omitzero"`
+	// ReturnBy is when the container comes back at the latest, the
+	// snapshot done or not: the run's max-downtime after it set out to
+	// take its containers down.
+	ReturnBy time.Time `json:"returnBy,omitzero"`
+	// Down reports that the stop or pause of the container returned: it
+	// went down. Without it, a container that still runs as Docker
+	// started it may be one whose stop the watcher's own stop cut short.
+	Down bool `json:"down,omitempty"`
 	// Released marks a container its run is done with, which the watcher
 	// has failed to bring back so far and keeps trying to.
 	Released bool `json:"released,omitempty"`
+	// Back marks a container the watcher has brought back, which stays
+	// listed until the post-exec hooks of its run are done, so that no
+	// other snapshot takes it down while they run in it.
+	Back bool `json:"back,omitempty"`
 }
 
 // validate reports whether h can be stored.

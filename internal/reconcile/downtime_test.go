@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -186,6 +187,14 @@ func TestOwnEventsCounted(t *testing.T) {
 		t.Fatal("a second die is the watcher's own")
 	}
 
+	// A change that failed takes its events back.
+	withdraw := h.r.expect(id, "die", "stop")
+	withdraw()
+
+	if h.r.ownEvent(ev("die")) {
+		t.Fatal("a withdrawn die is the watcher's own")
+	}
+
 	h.r.expect(id, "start")
 	c.add(ownEventWindow + time.Second)
 
@@ -322,7 +331,8 @@ func TestStopFails(t *testing.T) {
 	c.add(time.Hour)
 	h.runHooked(app, 4)
 
-	h.mustActions("stop app", "stop db", "start app")
+	// The stop is tried twice: a failed call may be one cut short.
+	h.mustActions("stop app", "stop db", "stop db", "start app")
 	h.mustState(id, docker.StateRunning)
 	h.mustTriggers(app, 0)
 	h.mustExecs(postRun)
@@ -333,35 +343,58 @@ func TestStopFails(t *testing.T) {
 	}
 }
 
+// withReturnLoop runs the retry loop of h until the test ends; wake makes
+// it look at the held containers again, as after the clock moved.
+func withReturnLoop(h *harness) (wake func()) {
+	h.t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		h.r.returnLoop(ctx)
+		close(done)
+	}()
+
+	h.t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	return h.r.wakeReturns
+}
+
 // When the snapshot runs for longer than max-downtime, the container comes
-// back before it ends, and the post-exec hook runs once it has.
+// back before it ends, without a pass, and the post-exec hook runs once it
+// has.
 func TestStopMaxDowntime(t *testing.T) {
 	h := newHarness(t)
 	c := withClock(h)
 	withHooks(h)
+	wake := withReturnLoop(h)
 	id := h.engine.run("db", enable, pathLabel(app), noOnStart, postExec, stopDuring, "kopia.max-downtime=30m")
 
 	h.passAndSettle(app)
 	c.add(time.Hour)
 	h.passAndSettle(app)
 
-	h.fake.HoldSnapshots(h.src(app))
-
-	res := h.mustPass(app)
-	h.mustTriggers(app, 1)
-
-	if !res.wake.Equal(t0.Add(time.Hour + 30*time.Minute)) {
-		t.Fatalf("wake = %v", res.wake)
+	if held := h.store.Held(); len(held) != 1 || !held[0].ReturnBy.Equal(t0.Add(time.Hour+30*time.Minute)) || !held[0].Down {
+		t.Fatalf("held = %+v", held)
 	}
 
+	h.fake.HoldSnapshots(h.src(app))
+	h.mustPass(app)
+	h.mustTriggers(app, 1)
+
 	c.add(29 * time.Minute)
+	wake()
 	h.mustPass(app)
 	h.mustActions("stop db")
 
 	c.add(time.Minute)
-	h.mustPass(app)
+	wake()
 	eventually(t, "the container comes back", func() bool { return h.engine.container(id).State == docker.StateRunning })
-	eventually(t, "the return ends", func() bool { return !h.r.hooksBusyFor(h.src(app)) })
+	eventually(t, "it is no longer held", func() bool { return len(h.store.Held()) == 0 })
 
 	h.mustActions("stop db", "start db")
 	h.mustExecs()
@@ -370,7 +403,7 @@ func TestStopMaxDowntime(t *testing.T) {
 		t.Fatalf("hook run %+v", run)
 	}
 
-	if !h.logged("bringing the containers back before the snapshot has ended") {
+	if !h.logged("bringing back a container before its snapshot has ended: max-downtime has passed") {
 		t.Fatalf("not logged:\n%s", h.logs)
 	}
 
@@ -383,12 +416,348 @@ func TestStopMaxDowntime(t *testing.T) {
 	h.mustNotHeld()
 }
 
-// hooksBusyFor reports whether a goroutine runs hooks of src.
-func (r *Reconciler) hooksBusyFor(src backend.Source) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// max-downtime holds while kopia server fails: the passes cannot get to
+// the snapshot steps, and the retry loop brings the container back all the
+// same.
+func TestStopMaxDowntimeWithoutPasses(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	withHooks(h)
+	wake := withReturnLoop(h)
+	id := h.engine.run("db", enable, pathLabel(app), noOnStart, stopDuring, "kopia.max-downtime=20m")
 
-	return r.hooksRunning[src] != ""
+	h.passAndSettle(app)
+	c.add(time.Hour)
+	h.passAndSettle(app)
+	h.mustState(id, docker.StateExited)
+
+	unavailable := &backend.Error{Op: "PlanSource", Kind: backend.ErrUnavailable, Err: errors.New("connection refused")}
+
+	for range 3 {
+		h.fake.FailNext(backendtest.PlanSource, unavailable)
+
+		if res := h.pass(app); res.err == nil {
+			t.Fatal("the pass did not fail")
+		}
+	}
+
+	h.mustTriggers(app, 0)
+	h.mustState(id, docker.StateExited)
+
+	c.add(20 * time.Minute)
+	wake()
+	eventually(t, "the container comes back", func() bool { return h.engine.container(id).State == docker.StateRunning })
+
+	// Once kopia server answers, the run ends without a snapshot.
+	h.runHooked(app, 2)
+	h.mustTriggers(app, 0)
+	h.mustNotHeld()
+
+	if !h.logged("no snapshot: the containers had to come back before it could be queued") {
+		t.Fatalf("not logged:\n%s", h.logs)
+	}
+}
+
+// A stop whose call fails while Docker goes on stopping the container,
+// as when a proxy drops the connection, is waited for: the container is
+// down, not on its way, when the snapshot is queued.
+func TestStopCallCutShort(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	withHooks(h)
+	id := h.engine.run("db", enable, pathLabel(app), noOnStart, stopDuring)
+
+	first := true
+
+	h.engine.setLifecycle(func(_ context.Context, action string, _ docker.Container) error {
+		if action == "stop" && first {
+			first = false
+
+			go h.engine.setState(id, docker.StateExited)
+
+			return errors.New("unexpected EOF")
+		}
+
+		return nil
+	})
+
+	h.passAndSettle(app)
+	c.add(time.Hour)
+	h.passAndSettle(app)
+
+	if run := h.record(app).HookRun; run == nil || run.DownError != "" || run.DownTaken != 1 {
+		t.Fatalf("hook run %+v", run)
+	}
+
+	h.runHooked(app, 3)
+	h.mustTriggers(app, 1)
+	h.mustActions("stop db", "stop db", "start db")
+	h.mustState(id, docker.StateRunning)
+}
+
+// A container whose stop a stop of the watcher cut short still runs as
+// Docker started it when the watcher comes back: it is looked at again
+// until it is down, then started.
+func TestStopNotDownYet(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	id := h.engine.run("db", enable, pathLabel(app), stopDuring)
+
+	held := state.Held{ID: id, Name: "db", Mode: state.HeldStop, Source: h.src(app), Run: "r", At: t0, ReturnBy: t0.Add(time.Hour),
+		StartedAt: h.engine.container(id).StartedAt}
+	if err := h.store.UpdateHeld(func([]state.Held) ([]state.Held, error) { return []state.Held{held}, nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	h.r.returnLeftDown(context.Background())
+	h.mustActions()
+
+	if got := h.store.Held(); len(got) != 1 || !got[0].Released {
+		t.Fatalf("held = %+v", got)
+	}
+
+	if !h.logged("the container is not down yet; looking again later") {
+		t.Fatalf("not logged:\n%s", h.logs)
+	}
+
+	// Docker has stopped it meanwhile.
+	h.engine.setState(id, docker.StateExited)
+	c.add(time.Minute)
+
+	todo, _ := h.r.returnsDue(c.now())
+	if len(todo) != 1 {
+		t.Fatalf("due = %+v", todo)
+	}
+
+	h.r.bringBack(context.Background(), h.r.log, todo, false)
+	h.mustActions("start db")
+	h.mustNotHeld()
+
+	// Long after, a container that still runs as started is no longer
+	// taken for one on its way down.
+	if err := h.store.UpdateHeld(func([]state.Held) ([]state.Held, error) {
+		held.StartedAt = h.engine.container(id).StartedAt
+		return []state.Held{held}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	c.add(stopCallTimeout)
+	h.r.returnLeftDown(context.Background())
+	h.mustNotHeld()
+	h.mustActions("start db")
+}
+
+// A watcher that stops after the containers went down, but before the
+// snapshot is queued, brings them back; the run takes no snapshot of them
+// running.
+func TestStopLostBeforeSnapshot(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	withHooks(h)
+	id := h.engine.run("db", enable, pathLabel(app), noOnStart, postExec, stopDuring)
+
+	h.passAndSettle(app)
+	c.add(time.Hour)
+	h.passAndSettle(app)
+
+	if run := h.record(app).HookRun; run == nil || !run.DownDone || run.DownTaken != 1 {
+		t.Fatalf("hook run %+v", run)
+	}
+
+	h.restartHooks(c)
+	h.r.returnLeftDown(context.Background())
+	h.mustState(id, docker.StateRunning)
+
+	h.runHooked(app, 2)
+	h.mustTriggers(app, 0)
+	h.mustExecs(postRun)
+
+	if !h.logged("no snapshot: the containers came back before it could be queued") {
+		t.Fatalf("not logged:\n%s", h.logs)
+	}
+}
+
+// notPersistedStore keeps the held containers in memory only, as with a
+// full disk.
+type notPersistedStore struct{ *state.Store }
+
+func (s notPersistedStore) UpdateHeld(fn func([]state.Held) ([]state.Held, error)) error {
+	if err := s.Store.UpdateHeld(fn); err != nil {
+		return err
+	}
+
+	return fmt.Errorf("write state file: %w", state.ErrNotPersisted)
+}
+
+// Without STATE_FILE no container is taken down: a crash would leave it
+// down for good.
+func TestStopNeedsStateFile(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	withHooks(h)
+	h.r.store = notPersistedStore{h.store}
+	id := h.engine.run("db", enable, pathLabel(app), noOnStart, postExec, stopDuring)
+
+	h.passAndSettle(app)
+	c.add(time.Hour)
+	h.runHooked(app, 3)
+
+	h.mustActions()
+	h.mustTriggers(app, 0)
+	h.mustExecs(postRun)
+	h.mustState(id, docker.StateRunning)
+	h.mustNotHeld()
+
+	if !h.logged("no snapshot: STATE_FILE cannot be written") {
+		t.Fatalf("not logged:\n%s", h.logs)
+	}
+}
+
+// A container that goes down with the stopped one, and that another
+// snapshot holds down already, makes the snapshot wait.
+func TestHeldSharedDependent(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	withHooks(h)
+	other := "/data/other"
+	db := h.engine.run("db", enable, pathLabel(app), noOnStart, stopDuring)
+	web := h.engine.run("web", enable, pathLabel(other), noOnStart, stopDuring, "kopia.depends-on=db")
+
+	h.passAndSettle(app)
+	h.passAndSettle(other)
+	c.add(time.Hour)
+
+	// web's snapshot goes first and holds web down.
+	h.fake.HoldSnapshots(h.src(other))
+	h.passAndSettle(other)
+	h.mustPass(other)
+	h.mustActions("stop web")
+
+	// db's snapshot needs web, which goes down with db.
+	h.mustPass(app)
+	h.mustActions("stop web")
+	h.mustState(db, docker.StateRunning)
+
+	if w := h.r.heldWaiters[web]; !slices.Equal(w, []string{app}) {
+		t.Fatalf("waiters = %v", w)
+	}
+
+	h.fake.ReleaseSnapshots(h.src(other))
+	h.settle()
+	h.runHooked(other, 2)
+	h.mustActions("stop web", "start web")
+
+	h.runHooked(app, 4)
+	h.mustActions("stop web", "start web", "stop web", "stop db", "start db", "start web")
+	h.mustNotHeld()
+}
+
+// An owner another snapshot holds down makes a snapshot whose plan takes
+// nothing down wait too, before it is queued.
+func TestHeldOwnerAfterPreExec(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	withHooks(h)
+	other := "/data/other"
+	id := h.engine.run("db", enable, pathLabel(app+","+other), noOnStart, preExec, stopDuring)
+
+	h.passAndSettle(app)
+	h.passAndSettle(other)
+	c.add(time.Hour)
+
+	// The pre-exec hook of app's snapshot runs; meanwhile other's snapshot
+	// holds db down.
+	h.passAndSettle(app)
+	h.mustExecs(preRun)
+
+	if err := h.engine.Stop(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+
+	held := state.Held{ID: id, Name: "db", Mode: state.HeldStop, Source: h.src(other), Run: "r", At: c.now(),
+		ReturnBy: c.now().Add(time.Hour), StartedAt: h.engine.container(id).StartedAt, Down: true}
+	if err := h.store.UpdateHeld(func([]state.Held) ([]state.Held, error) { return []state.Held{held}, nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	h.passAndSettle(app)
+	h.mustTriggers(app, 0)
+
+	if run := h.record(app).HookRun; run == nil || run.Phase != state.HookPre {
+		t.Fatalf("hook run %+v", run)
+	}
+
+	h.r.bringBack(context.Background(), h.r.log, h.store.Held(), false)
+	h.mustState(id, docker.StateRunning)
+
+	h.runHooked(app, 4)
+	h.mustTriggers(app, 1)
+}
+
+// While a hook of another source runs in a container, no snapshot takes it
+// down; the snapshot goes once the hook has ended. A container brought
+// back stays held until the post-exec hooks of its run are done.
+func TestDowntimeWaitsForHooks(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	withHooks(h)
+	other := "/data/other"
+	id := h.engine.run("db", enable, pathLabel(app+","+other), noOnStart, postExec, stopDuring)
+
+	release := make(chan struct{})
+
+	h.engine.setExec(func(ctx context.Context, _ docker.Container, _ []string) (docker.ExecResult, error) {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+
+		return docker.ExecResult{}, ctx.Err()
+	})
+
+	h.passAndSettle(app)
+	h.passAndSettle(other)
+	c.add(time.Hour)
+
+	// app's snapshot: down, queued, ended; its post-exec hook hangs.
+	h.passAndSettle(app)
+	h.passAndSettle(app)
+	h.mustPass(app)
+
+	eventually(t, "the post-exec hook runs", func() bool { return len(h.engine.execLog()) == 1 })
+	h.mustState(id, docker.StateRunning)
+
+	if held := h.store.Held(); len(held) != 1 || !held[0].Back {
+		t.Fatalf("held = %+v", held)
+	}
+
+	// other's snapshot waits for db.
+	h.mustPass(other)
+	h.mustActions("stop db", "start db")
+
+	// A hook of another source keeps it up too.
+	h.r.mu.Lock()
+	h.r.execs[id]++
+	h.r.mu.Unlock()
+
+	close(release)
+	h.settle()
+	h.mustNotHeld()
+
+	h.mustPass(other)
+	h.mustActions("stop db", "start db")
+
+	if !h.logged("the snapshot waits: a hook of another source runs in a container it takes down") {
+		t.Fatalf("not logged:\n%s", h.logs)
+	}
+
+	h.r.mu.Lock()
+	delete(h.r.execs, id)
+	h.r.mu.Unlock()
+
+	h.runHooked(other, 4)
+	h.mustActions("stop db", "start db", "stop db", "start db")
 }
 
 // The containers that depend on the stopped one, by name or by compose
@@ -441,6 +810,7 @@ func TestDependsOnErrors(t *testing.T) {
 		{"cycle", [][]string{{"api", "kopia.depends-on=db,worker"}, {"worker", "kopia.depends-on=api"}},
 			"api: the container depends on itself through kopia.depends-on"},
 		{"self", [][]string{{"api", "kopia.depends-on=api,db"}}, "api: the container depends on itself"},
+		{"not a name", [][]string{{"api", "kopia.depends-on=db cache"}}, `api: \"db cache\" is not a container or service name`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newHarness(t)
@@ -687,11 +1057,15 @@ func TestReturnAfterRestart(t *testing.T) {
 
 	src := h.src(app)
 	held := []state.Held{
-		{ID: restarted, Name: "web", Mode: state.HeldStop, Source: src, Run: "r", Order: 0, At: t0, StartedAt: h.engine.container(restarted).StartedAt},
-		{ID: running, Name: "api", Mode: state.HeldStop, Source: src, Run: "r", Order: 1, At: t0, StartedAt: h.engine.container(running).StartedAt},
-		{ID: ours, Name: "db", Mode: state.HeldStop, Source: src, Run: "r", Order: 2, At: t0, StartedAt: h.engine.container(ours).StartedAt},
-		{ID: gone, Name: "gone", Mode: state.HeldStop, Source: src, Run: "r", Order: 3, At: t0, StartedAt: t0},
-		{ID: frozen, Name: "cache", Mode: state.HeldPause, Source: src, Run: "r", Order: 4, At: t0, StartedAt: h.engine.container(frozen).StartedAt},
+		{ID: restarted, Name: "web", Mode: state.HeldStop, Source: src, Run: "r", Order: 0, At: t0, Down: true,
+			StartedAt: h.engine.container(restarted).StartedAt},
+		{ID: running, Name: "api", Mode: state.HeldStop, Source: src, Run: "r", Order: 1, At: t0, Down: true,
+			StartedAt: h.engine.container(running).StartedAt},
+		{ID: ours, Name: "db", Mode: state.HeldStop, Source: src, Run: "r", Order: 2, At: t0, Down: true,
+			StartedAt: h.engine.container(ours).StartedAt},
+		{ID: gone, Name: "gone", Mode: state.HeldStop, Source: src, Run: "r", Order: 3, At: t0, Down: true, StartedAt: t0},
+		{ID: frozen, Name: "cache", Mode: state.HeldPause, Source: src, Run: "r", Order: 4, At: t0, Down: true,
+			StartedAt: h.engine.container(frozen).StartedAt},
 	}
 
 	if err := h.store.UpdateHeld(func([]state.Held) ([]state.Held, error) { return held, nil }); err != nil {
@@ -816,7 +1190,7 @@ func TestReturnRetried(t *testing.T) {
 
 	fail = false
 
-	if failed := h.r.bringBack(context.Background(), h.r.log, h.store.Held()); len(failed) != 0 {
+	if failed, _ := h.r.bringBack(context.Background(), h.r.log, h.store.Held(), false); len(failed) != 0 {
 		t.Fatalf("failed = %v", failed)
 	}
 

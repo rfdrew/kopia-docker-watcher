@@ -727,16 +727,22 @@ around them. A snapshot at a stop is taken without stopping anything: the contai
   containers that depend on a container to stop go down, then the container itself, then the containers to pause.
   After the snapshot they come back the other way round, before the post-exec hooks.
 - **The stop** is `docker stop`: the container's stop signal, then `SIGKILL` after its stop timeout,
-  `stop_grace_period` in compose, 10 seconds unless set. Only a running container is stopped or paused; one that
-  is stopped, paused or restarting is left as it is.
+  `stop_grace_period` in compose, 10 seconds unless set. The watcher waits for it as long as Docker takes, so a
+  container is down, not on its way, when the next one goes or the snapshot is queued. Only a running container is
+  stopped or paused; one that is stopped, paused or restarting is left as it is.
 - **The return.** The containers come back once the snapshot has ended, failed or not; when no snapshot could be
-  taken; at the latest `kopia.max-downtime` after the watcher began to take them down, with a warning: the snapshot
-  then goes on with them running, and may read files they change. When the watcher stops (`docker stop`, `SIGTERM`)
-  it brings them back at once, within the few seconds it has for its shutdown. After a crash of the watcher, or a
-  stop that left no time, it brings them back when it starts again, before anything else.
+  taken; at the latest `kopia.max-downtime` after the watcher began to take them down, also while kopia server
+  cannot be reached, with a warning: a snapshot that goes on then reads files they change. When the watcher stops
+  (`docker stop`, `SIGTERM`) it brings them back at once, within the few seconds it has for its shutdown, and a
+  snapshot it had not queued yet is not taken. After a crash of the watcher, or a stop that left no time, it brings
+  them back when it starts again, before anything else.
 - **What it remembers.** `STATE_FILE` lists every container the watcher holds down, written before the container
   goes down, with when Docker last started it. So the watcher does not start a container that someone else
   started and stopped meanwhile, nor one that is gone, and one it paused that someone else stopped stays stopped.
+  A container whose stop a crash or a stop of the watcher cut short, and that still runs when the watcher comes
+  back, is looked at again until it is down, for up to 15 minutes. While `STATE_FILE` cannot be written, as on a
+  full disk, no container is stopped or paused and no snapshot of their sources is taken: a crash would leave them
+  down.
 - **Failures.** A container that cannot be stopped or paused takes no snapshot; those already down come back. A
   container that cannot be started again, say because its port is taken, is tried again with a growing delay, up
   to 5 minutes, until it runs or someone else starts or removes it. Each failure is logged at error level and
@@ -746,8 +752,10 @@ around them. A snapshot at a stop is taken without stopping anything: the contai
   for the rest of the labels: they take no `kopia.snapshot-on-stop` or `kopia.snapshot-on-start` snapshot, and while
   it is down the container still counts as running, so its sources are not paused. The same holds for every
   container that goes down with it. A paused container counts as running anyway.
-- **One snapshot at a time.** A container is held down for one snapshot at a time. A snapshot of another source
-  that needs it, because the container backs that source up too or goes down with it, waits until it is back.
+- **One snapshot at a time.** A container is held down for one snapshot at a time, until the post-exec hooks of
+  that snapshot have run in it. A snapshot of another source that needs it, because the container backs that
+  source up too or goes down with it, waits until then, and no snapshot takes a container down while a hook of
+  another source runs in it.
 
 `kopia.max-downtime` should be longer than the stop timeout of the containers and than a snapshot usually takes:
 [`kopia_watcher_backup_downtime_seconds`](metrics.md#kopia_watcher_backup_downtime_seconds) shows how long they
@@ -770,8 +778,10 @@ the container's sources is taken.
 ### `kopia.max-downtime`
 
 How long the watcher keeps the containers down for one snapshot at most, from when it begins to stop or pause
-them: a Go duration greater than zero, such as `15m`, `1h` or `6h`. Default `1h`. When several containers of a
-path ask for downtime, the shortest applies. A value that cannot be read is an error of the labels; without
+them: a Go duration greater than zero, such as `15m`, `1h` or `6h`. Default `1h`. It holds whatever kopia server
+does. When several containers of a path ask for downtime, the shortest applies. The stops of a group that take
+longer leave no snapshot: the watcher takes nothing more down once the time has passed, and brings back what it
+took. A value that cannot be read is an error of the labels; without
 `kopia.stop-during-backup` or `kopia.pause-during-backup` the label has no effect, with a warning.
 
 ### `kopia.depends-on`
@@ -782,10 +792,11 @@ A name matches a container of that name and, for a container of a docker compose
 compose service in the same project, so `kopia.depends-on: "db"` names `shop-db-1` in project `shop`. The
 container needs no other label.
 
-A name that matches no container, or containers that depend on each other in a circle, are errors: no container
-of the group is stopped and no snapshot is taken. The watcher reports them at every full reconcile while they
-last; `validate --container` checks the names against the containers. Compose's own `depends_on` is not read:
-write `kopia.depends-on` where a container should go down with another.
+A name that matches no container, an item that is no name (`db cache` instead of `db,cache`), or containers that
+depend on each other in a circle, are errors: no container of the group is stopped and no snapshot is taken. A
+full reconcile logs them once, and again when they change, and each snapshot they keep from being taken is
+logged and counted as a label error of its path; `validate --container` checks the names against the containers.
+Compose's own `depends_on` is not read: write `kopia.depends-on` where a container should go down with another.
 
 ## Cleanup
 

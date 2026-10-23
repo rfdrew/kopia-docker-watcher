@@ -999,7 +999,7 @@ func (ps *pass) waitsForHeld(reqs []snapRequest, attrs []any) bool {
 	ps.keepEvents(reqs)
 	ps.log.Debug("the snapshot waits: a container it needs is held down for another snapshot",
 		append(attrs, "container", h.Name, "held_for", h.Source.Path)...)
-	ps.waitForHeld(h)
+	ps.waitFor(h.ID)
 
 	return true
 }

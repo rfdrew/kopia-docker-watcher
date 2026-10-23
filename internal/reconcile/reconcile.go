@@ -148,21 +148,28 @@
 // pre-exec hooks have succeeded, a snapshot with hooks stops the running
 // owners that ask for it, each with every running container that depends
 // on it by the depends-on labels, a container before those it depends on,
-// then pauses those that ask for that. It queues the snapshot once they are
-// down, and once the snapshot has ended, however it ended, it brings them
-// back in the reverse order, before the post-exec hooks. A failure to take
-// one down, or a depends-on label that names no container or goes round in
-// a circle, takes no snapshot. The containers come back max-downtime after
-// they went down at the latest, the snapshot done or not; when the watcher
-// stops, at once, within ShutdownGrace; and after a crash, at the next
-// start, before any other work.
+// then pauses those that ask for that, each stop waited for as long as
+// Docker takes. It queues the snapshot once they are down, and once the
+// snapshot has ended, however it ended, it brings them back in the reverse
+// order, before the post-exec hooks. A failure to take one down, or a
+// depends-on label that names no container or goes round in a circle,
+// takes no snapshot. The containers come back max-downtime after they went
+// down at the latest, the snapshot done or not: the retry loop of Run sees
+// to that, whatever the passes and kopia server do. When the watcher
+// stops, they come back at once, within ShutdownGrace, and a snapshot not
+// queued yet is not taken; after a crash, at the next start, before any
+// other work.
 //
 // The state lists every container held down, stored before it goes down,
 // with the time Docker last started it: a container someone else started
-// since, or that is gone, is not brought back. A container is held for one
-// snapshot at a time; a snapshot with hooks that needs a container held for
-// another waits until it is back. One that cannot be brought back is tried
-// again with a growing delay, logged, counted and notified.
+// since, or that is gone, is not brought back. While the state cannot be
+// written, nothing is taken down. A container is held for one snapshot at
+// a time, until the post-exec hooks of that snapshot have run in it; a
+// snapshot with hooks that needs a container held for another, an owner or
+// one of the group of a container it stops, waits until it is back, and
+// none takes a container down while a hook of another source runs in it.
+// One that cannot be brought back is tried again with a growing delay,
+// logged, counted and notified.
 //
 // While it is held, a stopped container counts as a running owner: its
 // sources are not paused, and no snapshot at a stop is taken. The events
@@ -513,9 +520,16 @@ type Reconciler struct {
 	// a time bring containers back; returnWake wakes the loop that tries
 	// again those it could not. See downtime.go.
 	expected    map[string][]expectation
+	expectSeq   uint64
 	heldWaiters map[string][]string
 	returnMu    sync.Mutex
 	returnWake  chan struct{}
+	// returnFails counts by container ID the failed tries to bring it
+	// back, returnRetry holds when the next one is due; execs counts the
+	// hook commands that run in each container.
+	returnFails map[string]int
+	returnRetry map[string]time.Time
+	execs       map[string]int
 	// dependsLogged holds by container ID the problems of its depends-on
 	// label last reported.
 	dependsLogged map[string]string
@@ -624,6 +638,9 @@ func New(opts Options) (*Reconciler, error) {
 		expected:       map[string][]expectation{},
 		heldWaiters:    map[string][]string{},
 		dependsLogged:  map[string]string{},
+		returnFails:    map[string]int{},
+		returnRetry:    map[string]time.Time{},
+		execs:          map[string]int{},
 		returnWake:     make(chan struct{}, 1),
 		passStarts:     map[string]time.Time{},
 

@@ -306,6 +306,10 @@ type parser struct {
 	// hookTimeoutLabel and maxDowntimeLabel report that the hook-timeout
 	// and the max-downtime label are set.
 	hookTimeoutLabel, maxDowntimeLabel bool
+
+	// badDependsOn are the items of the depends-on label that are no
+	// container or service name.
+	badDependsOn []string
 }
 
 func (p *parser) errorf(format string, args ...any) {

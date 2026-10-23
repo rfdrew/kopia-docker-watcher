@@ -62,28 +62,29 @@ var containerName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 // DependsOn returns what the depends-on label of a container names, as
 // Parse reads it into ContainerSpec.DependsOn, without the rest of the
-// labels; nil without the label.
-func DependsOn(containerLabels map[string]string, prefix string) []string {
+// labels, and the items that are no container or service name; both nil
+// without the label.
+func DependsOn(containerLabels map[string]string, prefix string) (names, bad []string) {
 	if prefix == "" {
 		prefix = config.DefaultLabelPrefix
 	}
 
 	v, ok := containerLabels[Name(prefix, KeyDependsOn)]
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	p := &parser{prefix: prefix}
 	p.dependsOn(v)
 
-	return p.spec.DependsOn
+	return p.spec.DependsOn, p.badDependsOn
 }
 
 // dependsOn parses the containers the container depends on: names
 // separated by commas, trimmed, empty items skipped. Whether they exist is
 // up to the reconciler, which sees the containers.
 func (p *parser) dependsOn(v string) {
-	p.spec.DependsOn = nil
+	p.spec.DependsOn, p.badDependsOn = nil, nil
 
 	for item := range strings.SplitSeq(v, ",") {
 		item = strings.TrimSpace(item)
@@ -92,6 +93,7 @@ func (p *parser) dependsOn(v string) {
 		case item == "":
 		case !containerName.MatchString(item):
 			p.errorf("%q is not a container or service name", item)
+			p.badDependsOn = append(p.badDependsOn, item)
 		case slices.Contains(p.spec.DependsOn, item):
 			p.warn(fmt.Sprintf("%q is listed more than once", item), "", "")
 		default:

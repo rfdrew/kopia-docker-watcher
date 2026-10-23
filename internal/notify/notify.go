@@ -334,7 +334,7 @@ func (n *Notifier) ContainerReturned(path string, res reconcile.ReturnResult) {
 		delete(n.returns, key)
 
 		e := n.event(ReturnRecovered, path, now, t.since, res.Mode, "")
-		e.Container = res.Container
+		e.Container, e.Note = res.Container, res.Note
 		n.enqueue(e)
 	}
 }

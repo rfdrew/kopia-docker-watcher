@@ -315,7 +315,7 @@ func (v *validator) checkContainers(ctx context.Context, d deps, names []string,
 
 		r := v.check(ctx, c.Labels, &c)
 
-		if len(labels.DependsOn(c.Labels, v.prefix)) > 0 {
+		if names, bad := labels.DependsOn(c.Labels, v.prefix); len(names)+len(bad) > 0 {
 			if dependsOn == nil {
 				listing, err := listContainers(ctx, engine)
 				if err != nil {

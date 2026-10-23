@@ -51,6 +51,10 @@ type Event struct {
 	Container string
 	// Error tells what went wrong; empty for a recovery.
 	Error string
+	// Note says, for a return_recovered of a container the watcher did
+	// not bring back itself, why it is no longer down: it is gone, or
+	// someone else started or stopped it. It is part of the message only.
+	Note string
 	// Since is when the path started failing; Time is now.
 	Since, Time time.Time
 }
@@ -76,6 +80,10 @@ func (e Event) Title() string {
 	case ReturnFailed:
 		return "Container left down after a backup: " + e.Container
 	case ReturnRecovered:
+		if e.Note != "" {
+			return "Container no longer held after a backup: " + e.Container
+		}
+
 		return "Container runs again after a backup: " + e.Container
 	default:
 		return "Backup labels apply again: " + e.Path
@@ -125,8 +133,13 @@ func (e Event) Message() string {
 
 		fmt.Fprintf(&b, "kopia-docker-watcher cannot %s %s again after the snapshot of %s; it keeps trying", verb, e.Container, where)
 	case ReturnRecovered:
-		fmt.Fprintf(&b, "%s runs again after the snapshot of %s, after it could not be brought back at %s.", e.Container, where,
-			stamp(e.Since))
+		if e.Note != "" {
+			fmt.Fprintf(&b, "kopia-docker-watcher no longer tries to bring back %s after the snapshot of %s, as %s; it could not "+
+				"bring it back at %s.", e.Container, where, e.Note, stamp(e.Since))
+		} else {
+			fmt.Fprintf(&b, "%s runs again after the snapshot of %s, after it could not be brought back at %s.", e.Container, where,
+				stamp(e.Since))
+		}
 	}
 
 	if e.Failing() {
