@@ -954,7 +954,7 @@ func TestUnwritableDirectory(t *testing.T) {
 func TestUnknownFieldsAreKept(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	content := `{"version":1,"containers":{"x":{"stoppedByWatcher":true}},"sources":[` +
-		`{"source":{"host":"kopia","userName":"root","path":"/data/a"},"patch":{"scheduling":{"cron":["0 * * * *"]},"retention":{"keepDaily":7}},` +
+		`{"source":{"host":"kopia","userName":"root","path":"/data/a"},"patch":{"scheduling":{"cron":["0 * * * *"]},"future":{"keepDaily":7}},` +
 		`"pending":{},"cleanup":"policy","waits":[{"taskID":"1"}]}]}`
 
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {

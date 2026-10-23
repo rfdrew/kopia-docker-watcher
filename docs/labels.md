@@ -17,6 +17,9 @@ services:
       kopia.snapshot-on-stop: "true"
       kopia.description: "app data"
       kopia.tags: "env:prod,app:example"
+      kopia.retention.daily: "14"
+      kopia.compression.algorithm: "zstd"
+      kopia.ignore: "*.tmp,cache/"
 ```
 
 Check labels before you deploy them:
@@ -42,9 +45,40 @@ kopia-docker-watcher validate --all
 | [`kopia.cleanup-on-remove`](#kopiacleanup-on-remove) | `pause` | `pause`, `policy` or `all` |
 | [`kopia.cleanup-delete-pinned`](#kopiacleanup-delete-pinned) | `false` | boolean |
 
+The [policy labels](#policy-labels) set fields of the path's Kopia policy. Each is unset by default: the path
+inherits the field from its parent policies.
+
+| Label | Value | Kopia policy field |
+|---|---|---|
+| [`kopia.interval`](#kopiainterval) | Go duration, at least `1m` | `scheduling.intervalSeconds` |
+| [`kopia.time-of-day`](#kopiatime-of-day) | `HH:MM` times, separated by `,` | `scheduling.timeOfDay` |
+| [`kopia.run-missed`](#kopiarun-missed) | boolean | `scheduling.runMissed` |
+| [`kopia.retention.latest`](#kopiaretention) | whole number, `0` or more | `retention.keepLatest` |
+| [`kopia.retention.hourly`](#kopiaretention) | whole number | `retention.keepHourly` |
+| [`kopia.retention.daily`](#kopiaretention) | whole number | `retention.keepDaily` |
+| [`kopia.retention.weekly`](#kopiaretention) | whole number | `retention.keepWeekly` |
+| [`kopia.retention.monthly`](#kopiaretention) | whole number | `retention.keepMonthly` |
+| [`kopia.retention.annual`](#kopiaretention) | whole number | `retention.keepAnnual` |
+| [`kopia.retention.ignore-identical`](#kopiaretentionignore-identical) | boolean | `retention.ignoreIdenticalSnapshots` |
+| [`kopia.ignore`](#kopiaignore) | ignore rules, separated by `,` | `files.ignore` |
+| [`kopia.ignore-files`](#kopiaignore-files) | file names, separated by `,` | `files.ignoreDotFiles` |
+| [`kopia.ignore-cache-dirs`](#kopiaignore-cache-dirs) | boolean | `files.ignoreCacheDirs` |
+| [`kopia.max-file-size`](#kopiamax-file-size) | [size](#sizes) | `files.maxFileSize` |
+| [`kopia.one-file-system`](#kopiaone-file-system) | boolean | `files.oneFileSystem` |
+| [`kopia.ignore-file-errors`](#error-handling) | boolean | `errorHandling.ignoreFileErrors` |
+| [`kopia.ignore-dir-errors`](#error-handling) | boolean | `errorHandling.ignoreDirectoryErrors` |
+| [`kopia.ignore-unknown-types`](#error-handling) | boolean | `errorHandling.ignoreUnknownTypes` |
+| [`kopia.compression.algorithm`](#kopiacompressionalgorithm) | algorithm name or `none` | `compression.compressorName` |
+| [`kopia.compression.min-size`](#kopiacompressionmin-size-and-max-size) | size | `compression.minSize` |
+| [`kopia.compression.max-size`](#kopiacompressionmin-size-and-max-size) | size | `compression.maxSize` |
+| [`kopia.compression.only`](#kopiacompressiononly-and-never) | file extensions, separated by `,` | `compression.onlyCompress` |
+| [`kopia.compression.never`](#kopiacompressiononly-and-never) | file extensions, separated by `,` | `compression.neverCompress` |
+| [`kopia.upload.parallel-files`](#kopiauploadparallel-files) | whole number, `1` or more | `upload.maxParallelFileReads` |
+| [`kopia.policy-json`](#kopiapolicy-json) | JSON object | any field, merged last |
+
 The names, defaults and boolean values of the Python version's labels (`enable`, `path`, `schedule`,
-`snapshot-on-start`, `snapshot-on-stop`, `description`, `tags`) are kept. `min-interval`, `cleanup-on-remove` and
-`cleanup-delete-pinned` are new.
+`snapshot-on-start`, `snapshot-on-stop`, `description`, `tags`) are kept. `min-interval`, `cleanup-on-remove`,
+`cleanup-delete-pinned` and the policy labels are new.
 
 ## Warnings, errors and strict mode
 
@@ -55,7 +89,9 @@ warning or an error.
   is ignored, a value that is not a boolean counts as `false`, an invalid `min-interval` keeps the default. The
   rest of the labels apply.
 - **An error** means the labels of the container cannot be applied: `kopia.path` missing while `kopia.enable` is
-  `true`, or, in strict mode, any warning.
+  `true`, a policy label whose value cannot be read (`kopia.retention.daily=7d`, `kopia.interval=30s`, a
+  `kopia.policy-json` that is not a JSON object), a compression algorithm kopia server does not have, or, in
+  strict mode, any warning.
 
 What happens to a container with an error:
 
@@ -78,13 +114,10 @@ cannot be used when it is not absolute (and `HOST_PREFIX` is not set), leads out
 lies outside `WATCHER_PATH_PREFIX`.
 
 **Unknown labels** under the prefix are a warning with a hint where there is one: `kopia.snapshot_on_stop` gets
-"did you mean kopia.snapshot-on-stop?". Labels planned for later releases are a warning "not supported by this
-version" and ignored: `kopia.interval`, `kopia.time-of-day`, `kopia.run-missed`, `kopia.retention.*`,
-`kopia.ignore`, `kopia.ignore-files`, `kopia.ignore-cache-dirs`, `kopia.max-file-size`, `kopia.one-file-system`,
-`kopia.ignore-file-errors`, `kopia.ignore-dir-errors`, `kopia.ignore-unknown-types`, `kopia.compression.*`,
-`kopia.upload.parallel-files`, `kopia.policy-json`, `kopia.volumes`, `kopia.exclude-volumes`, `kopia.pre-exec`,
-`kopia.post-exec`, `kopia.stop-during-backup`, `kopia.pause-during-backup`, `kopia.pin-on-stop` and
-`kopia.depends-on`.
+"did you mean kopia.snapshot-on-stop?", and `kopia.compression` gets "it is a group of labels such as
+kopia.compression.algorithm". Labels planned for later releases are a warning "not supported by this version" and
+ignored: `kopia.volumes`, `kopia.exclude-volumes`, `kopia.pre-exec`, `kopia.post-exec`,
+`kopia.stop-during-backup`, `kopia.pause-during-backup`, `kopia.pin-on-stop` and `kopia.depends-on`.
 
 ### Booleans
 
@@ -111,14 +144,19 @@ The paths to back up, separated by commas: `/srv/app/data,/srv/app/config`. Requ
 
 **Shared paths.** Several containers may name the same path; it is one source. Its owners are all containers
 that name it with `kopia.enable=true`, stopped ones included. The source is paused only when none of them runs.
-Their policy labels (`kopia.schedule`) must agree: the running owners decide, or all owners when none runs. When
-they disagree, the source keeps the policy fields last applied, and the watcher logs an error while an owner
-runs, a warning when all are stopped.
+Their policy fields (`kopia.schedule` and the [policy labels](#policy-labels)) must agree: the running owners
+decide, or all owners when none runs. They agree when they ask for the same fields with the same values, however
+the labels are written: `kopia.retention.daily=7` and `kopia.policy-json={"retention":{"keepDaily":7}}` agree.
+When they disagree, the source keeps the policy fields last applied, and the watcher logs an error naming the
+containers and fields while an owner runs, a warning when all are stopped.
 
 ### `kopia.schedule`
 
 When kopia server takes scheduled snapshots: one or more cron expressions separated by `;`, written to
-`scheduling.cron` of the path's policy. Default `0 * * * *`, every hour, as in the Python version.
+`scheduling.cron` of the path's policy. Default `0 * * * *`, every hour, as in the Python version, unless another
+label sets a schedule: with `kopia.interval` or `kopia.time-of-day` (or a cron, interval or times of day in
+`kopia.policy-json`, or a `scheduling` section that is not an object, such as `null`) and no `kopia.schedule`
+label, no cron is set, since kopia server would still snapshot every hour.
 
 - `;` separates expressions because they contain spaces and commas: `0 3 * * *;30 12 * * 1-5`.
 - An empty value, `kopia.schedule=""`, sets no cron: the path inherits the schedule of its parent policies
@@ -128,9 +166,11 @@ When kopia server takes scheduled snapshots: one or more cron expressions separa
   `validate` does not check cron expressions. An expression kopia server rejects is an error of the path: the source
   keeps its previous schedule, and the watcher tries again when the labels change and at every full reconcile.
 
-The watcher owns `scheduling.cron` of the path's policy and puts it back at every full reconcile if it was
-changed in the web UI. Other scheduling fields you set in the web UI, such as an interval or times of day, stay.
-To manage the schedule in the web UI, set `kopia.schedule=""`.
+The watcher owns `scheduling.cron` of the path's policy when it sets one: from a non-empty `kopia.schedule`, or
+the default when no label sets a schedule. It then puts the cron back at every full reconcile if it was changed
+in the web UI. With `kopia.schedule=""`, or with `kopia.interval` or `kopia.time-of-day` and no `kopia.schedule`
+label, it sets no cron and leaves one set in the web UI alone. Other scheduling fields you set in the web UI,
+such as an interval or times of day, stay unless a label sets them.
 
 ### `kopia.snapshot-on-start`
 
@@ -203,6 +243,201 @@ app data [env=prod app=example]
 - Spaces around items and empty items are ignored.
 - An item without `:` or with an empty key is ignored, with a warning.
 - A key given twice keeps its last value, with a warning.
+
+## Policy labels
+
+These labels set fields of the policy of each path in `kopia.path`, the policy kopia server keeps for that path
+alone. They never touch the host or global policy.
+
+- **Empty means inherit.** An absent label and a label with an empty value both leave the field to the parent
+  policies: those of parent directories, then `user@host`, the host and the global policy.
+- **The watcher owns only the fields its labels set.** Every other field of the policy, set in the web UI, the
+  kopia CLI or by Terraform, stays as it is. A field a label sets is put back at every full reconcile if it was
+  changed elsewhere.
+- **A removed label takes its field out.** When a label is removed or emptied, the watcher removes the field it
+  set from the policy, so the path inherits it again. It knows which fields it set from `STATE_FILE`.
+- **An invalid value is an error** of the container's labels: none of its policy fields apply (see
+  [above](#warnings-errors-and-strict-mode)), and the message names the label. Booleans are the exception: they
+  are read like [all booleans](#booleans), an invalid one counts as `false` with a warning.
+- Lists are separated by `,`; spaces around items and empty items are ignored, and an item listed twice is a
+  warning.
+- `validate` prints the policy fields the labels set, under "policy fields", with their Kopia names and JSON
+  values.
+
+`actions` (commands kopia server runs before and after a snapshot) cannot be set by any label: they would run on
+kopia server, which has to allow them. Set them on kopia server.
+
+### Sizes
+
+A size is a number of bytes with an optional unit, upper or lower case, with or without a space: `500MB`,
+`1GiB`, `4 KiB`, `1.5GB`, `1000`. `B`, `KB`, `MB`, `GB`, `TB` count in powers of 1000, `KiB`, `MiB`, `GiB`,
+`TiB` in powers of 1024. The result must be a whole number of bytes. `0` is an error: kopia does not store a
+size of zero, so leave the label empty to inherit the size instead.
+
+### `kopia.interval`
+
+Take a snapshot every interval: a Go duration such as `30m`, `6h` or `24h` (there is no `d` unit), written to
+`scheduling.intervalSeconds`. At least `1m`, the finest step of a cron schedule; a shorter interval would start
+a snapshot as soon as the last one ended. It must be a whole number of seconds.
+
+kopia server runs the source at whichever comes first of the interval, the times of day and the cron
+expressions. Without a `kopia.schedule` label, `kopia.interval` turns the default hourly cron off.
+
+```yaml
+kopia.interval: "6h"
+```
+
+### `kopia.time-of-day`
+
+Take a snapshot at these times of day, in kopia server's time zone: `HH:MM` in 24-hour time, separated by `,`.
+`2:30` is read as `02:30`. Written to `scheduling.timeOfDay`, sorted. Without a `kopia.schedule` label it turns
+the default hourly cron off.
+
+kopia adds the times of day of the parent policies to the path's own. To use only the path's, add
+`kopia.policy-json={"scheduling":{"noParentTimeOfDay":true}}`.
+
+```yaml
+kopia.time-of-day: "02:30,14:00"
+```
+
+### `kopia.run-missed`
+
+`true` takes a snapshot right away when a scheduled time of day or cron run was missed, for example because kopia
+server was down. Written to `scheduling.runMissed`. kopia's default is `true`.
+
+### Schedule, pause and checks
+
+`kopia.schedule`, `kopia.interval`, `kopia.time-of-day` and `kopia.run-missed` all go into the `scheduling`
+section, which the pause replaces: while all containers of a path are stopped, the section is
+`{"manual": true}`, and the watcher keeps the whole section aside in `STATE_FILE`, with fields set in the web UI,
+and puts it back when a container starts. Labels changed while the containers are stopped go into the kept
+section.
+
+Before it writes a new schedule, the watcher asks kopia server for the next snapshot times of the policy as it
+would be (`policy/resolve`), also while the source is paused. `validate` with `KOPIA_SERVER_URL` shows those
+times.
+
+### `kopia.retention.*`
+
+How many snapshots of each kind kopia keeps: `kopia.retention.latest`, `.hourly`, `.daily`, `.weekly`,
+`.monthly` and `.annual`, written to `retention.keepLatest`, `keepHourly`, `keepDaily`, `keepWeekly`,
+`keepMonthly` and `keepAnnual`. A whole number from `0` (keep none of that kind) up to 2147483647.
+
+```yaml
+kopia.retention.latest: "10"
+kopia.retention.daily: "14"
+kopia.retention.weekly: "8"
+kopia.retention.monthly: "12"
+```
+
+### `kopia.retention.ignore-identical`
+
+`true` makes kopia skip a snapshot whose content is the same as the previous one's. Written to
+`retention.ignoreIdenticalSnapshots`.
+
+### `kopia.ignore`
+
+Ignore rules in `.gitignore` syntax, separated by `,`: `*.tmp,cache/,/logs/*.log`. Written to `files.ignore`. A
+rule that contains `,` cannot be written in this label; use `kopia.policy-json` for it.
+
+The path's list replaces the list it would inherit: kopia takes the rules of the most specific policy that has
+any.
+
+### `kopia.ignore-files`
+
+The names of the files that hold ignore rules, in every directory: `.kopiaignore,.gitignore`. Written to
+`files.ignoreDotFiles`. A name with `/` is an error.
+
+The path's list replaces the inherited one, including kopia's default `.kopiaignore`: list `.kopiaignore` too to
+keep it.
+
+### `kopia.ignore-cache-dirs`
+
+`true` skips directories that hold a `CACHEDIR.TAG` file. Written to `files.ignoreCacheDirs`.
+
+### `kopia.max-file-size`
+
+Skip files larger than this [size](#sizes): `500MB`. Written to `files.maxFileSize`.
+
+### `kopia.one-file-system`
+
+`true` keeps the snapshot from crossing into other mounted file systems below the path. Written to
+`files.oneFileSystem`.
+
+### Error handling
+
+`kopia.ignore-file-errors`, `kopia.ignore-dir-errors` and `kopia.ignore-unknown-types` (booleans) make a snapshot
+go on past files it cannot read, directories it cannot list, and entries that are neither files, directories
+nor symbolic links. Written to `errorHandling.ignoreFileErrors`, `ignoreDirectoryErrors` and
+`ignoreUnknownTypes`.
+
+### `kopia.compression.algorithm`
+
+The compression algorithm of the path's files, written to `compression.compressorName`: a name kopia server
+supports, such as `zstd`, `zstd-fastest`, `s2-default`, `gzip` or `pgzip`, or `none` to turn compression off. The
+name is case-sensitive.
+
+The watcher asks kopia server for its algorithms (`GET /api/v1/repo/algorithms`) the first time a label names
+one, and keeps the answer until it restarts. An algorithm kopia server does not have is an error, with a hint
+such as "did you mean zstd?"; a deprecated one is applied with a warning. `validate` checks the name too when
+`KOPIA_SERVER_URL` is set.
+
+```yaml
+kopia.compression.algorithm: "zstd"
+```
+
+### `kopia.compression.min-size` and `max-size`
+
+Compress only files of at least `min-size` and at most `max-size` ([sizes](#sizes)). Written to
+`compression.minSize` and `compression.maxSize`. A `max-size` below `min-size` is an error.
+
+### `kopia.compression.only` and `never`
+
+File extensions with their dot, separated by `,`: `.txt,.log`. Written to `compression.onlyCompress` and
+`compression.neverCompress`. An item without the leading dot, such as `txt` or `*.txt`, or with more than one
+dot, such as `.tar.gz`, is an error: kopia compares the last extension only.
+
+`kopia.compression.never` keeps files with these extensions uncompressed. Despite its name,
+`kopia.compression.only` does not limit compression to its extensions: kopia (as of 0.23) only makes its
+extensions compressed even when a never-list names them, and files with other extensions are compressed as
+well. To compress fewer files, list the others in `kopia.compression.never`, or use `kopia.compression.min-size`
+and `max-size`.
+
+kopia adds the extensions of the parent policies to the path's own. To use only the path's, add
+`kopia.policy-json={"compression":{"noParentOnlyCompress":true}}` (or `noParentNeverCompress`).
+
+### `kopia.upload.parallel-files`
+
+How many files kopia reads at the same time: a whole number of at least `1`. Written to
+`upload.maxParallelFileReads`. kopia's default is the number of CPUs of kopia server.
+
+### `kopia.policy-json`
+
+Any part of a Kopia policy as a JSON object, for fields no label sets: `{"files":{"noParentIgnore":true}}`.
+It is merged after the other labels: objects field by field, any other value (a list, a number, `null`) as a
+whole. Where it sets the same field as a label, it wins. Its fields are owned like those of the other labels: a
+field removed from the JSON, or the whole label removed, is taken out of the policy again.
+
+```yaml
+kopia.policy-json: '{"files":{"noParentIgnore":true},"logging":{"entries":{"snapshotted":5}}}'
+```
+
+It is an error when:
+
+- the value is not one JSON object;
+- it sets `actions`, even an empty object: those commands run on kopia server;
+- it sets `scheduling.manual`, the pause, which belongs to the watcher;
+- a key is spelled in another case than kopia's, such as `"Cron"` or `"keepdaily"`, or two keys of one object
+  differ only in case: kopia server reads keys without regard to case, so they would be the same field to it
+  and not to the watcher. Keys are checked for the sections and for the fields of the sections the labels set;
+- a key has a dot, such as `{"files.ignore":[…]}`: nest the objects instead;
+- it sets a field as a value where a label sets a field inside it, such as `{"retention":null}` together with
+  `kopia.retention.daily`.
+
+kopia server checks the policy when the watcher writes it and rejects some fields on a path policy, such as
+`upload.maxParallelSnapshots`; then the source keeps the policy fields last applied, and the watcher logs the
+error. kopia server drops fields it does not know: such a field never shows in the policy, and the watcher does
+not write it again and again.
 
 ## Cleanup
 

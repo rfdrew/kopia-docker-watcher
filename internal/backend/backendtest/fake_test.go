@@ -106,6 +106,39 @@ func TestIdentityAndPaths(t *testing.T) {
 	}
 }
 
+func TestCompressionAlgorithms(t *testing.T) {
+	f := New()
+
+	got, err := f.CompressionAlgorithms(ctx)
+	if err != nil || !reflect.DeepEqual(got, DefaultAlgorithms) {
+		t.Fatalf("CompressionAlgorithms = %+v, %v; want %+v", got, err, DefaultAlgorithms)
+	}
+
+	f.SetCompressionAlgorithms(backend.Algorithm{Name: "zstd"}, backend.Algorithm{Name: "gzip", Deprecated: true})
+
+	want := []backend.Algorithm{{Name: "gzip", Deprecated: true}, {Name: "zstd"}}
+	if got, err := f.CompressionAlgorithms(ctx); err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("CompressionAlgorithms = %+v, %v; want %+v", got, err, want)
+	}
+
+	boom := errors.New("boom")
+	f.FailNext(CompressionAlgorithms, boom)
+
+	if _, err := f.CompressionAlgorithms(ctx); !errors.Is(err, boom) {
+		t.Errorf("err = %v, want boom", err)
+	}
+
+	f.FailNextAfter(CompressionAlgorithms, boom)
+
+	if _, err := f.CompressionAlgorithms(ctx); !errors.Is(err, boom) {
+		t.Errorf("err = %v, want boom", err)
+	}
+
+	if n := len(f.CallsTo(CompressionAlgorithms)); n != 4 {
+		t.Errorf("%d calls recorded, want 4", n)
+	}
+}
+
 func TestListSources(t *testing.T) {
 	f := New()
 	f.AddSource(f.Source("/b"))

@@ -6,6 +6,8 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
 )
 
 // spec returns Default() changed by mod.
@@ -46,7 +48,7 @@ func TestDefault(t *testing.T) {
 	want := ContainerSpec{
 		SnapshotOnStart: true,
 		MinInterval:     10 * time.Minute,
-		Policy:          Policy{Scheduling: Scheduling{Cron: []string{"0 * * * *"}}},
+		Policy:          backend.PolicyPatch{Scheduling: backend.SchedulingPatch{Cron: []string{"0 * * * *"}}},
 		CleanupOnRemove: CleanupPause,
 	}
 
@@ -112,7 +114,7 @@ func TestParse(t *testing.T) {
 				MinInterval:     DefaultMinInterval,
 				Description:     "my app",
 				Tags:            []Tag{{"env", "prod"}, {"app", "myapp"}},
-				Policy:          Policy{Scheduling: Scheduling{Cron: []string{"30 2 * * *"}}},
+				Policy:          backend.PolicyPatch{Scheduling: backend.SchedulingPatch{Cron: []string{"30 2 * * *"}}},
 				CleanupOnRemove: CleanupPause,
 			},
 		},
@@ -461,8 +463,8 @@ func TestParseUnknownKeys(t *testing.T) {
 		{"kopia.path.extra", "unknown label, ignored"},
 		{"kopia.Enable", "unknown label, ignored; did you mean kopia.enable?"},
 		{"kopia.snapshot_on_stop", "unknown label, ignored; did you mean kopia.snapshot-on-stop?"},
-		{"kopia.retention.daily", "not supported by this version, ignored"},
-		{"kopia.compression.algorithm", "not supported by this version, ignored"},
+		{"kopia.volumes", "not supported by this version, ignored"},
+		{"kopia.pre-exec", "not supported by this version, ignored"},
 		{"kopia.Retention.Daily", "unknown label, ignored; did you mean kopia.retention.daily?"},
 		{"kopia.compression", "unknown label, ignored; it is a group of labels such as kopia.compression.algorithm"},
 		{"kopia.retention", "unknown label, ignored; it is a group of labels such as kopia.retention.latest"},
@@ -487,7 +489,7 @@ func TestParseStrict(t *testing.T) {
 		"kopia.tags":             "standalone,env:dev,env:prod",
 		"kopia.bogus":            "1",
 		"kopia.Enable":           "true",
-		"kopia.retention.daily":  "7",
+		"kopia.pre-exec":         "pg_dump",
 	}
 
 	want := spec(func(s *ContainerSpec) {
@@ -501,7 +503,7 @@ func TestParseStrict(t *testing.T) {
 			"warning kopia.Enable: unknown label, ignored; did you mean kopia.enable?",
 			"warning kopia.bogus: unknown label, ignored",
 			`warning kopia.path: "/data" is listed more than once`,
-			"warning kopia.retention.daily: not supported by this version, ignored",
+			"warning kopia.pre-exec: not supported by this version, ignored",
 			`warning kopia.snapshot-on-stop: "yes" is not a boolean, treated as false; use true or false`,
 			`warning kopia.tags: tag "standalone" is not key:value, ignored`,
 			`warning kopia.tags: tag key "env" is repeated, the last value is used`,
@@ -515,7 +517,7 @@ func TestParseStrict(t *testing.T) {
 			"error kopia.Enable: unknown label; did you mean kopia.enable?",
 			"error kopia.bogus: unknown label",
 			`error kopia.path: "/data" is listed more than once`,
-			"error kopia.retention.daily: not supported by this version",
+			"error kopia.pre-exec: not supported by this version",
 			`error kopia.snapshot-on-stop: "yes" is not a boolean; use true or false`,
 			`error kopia.tags: tag "standalone" is not key:value`,
 			`error kopia.tags: tag key "env" is repeated`,

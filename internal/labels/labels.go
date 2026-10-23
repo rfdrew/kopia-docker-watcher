@@ -22,11 +22,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
 	"github.com/rfdrew/kopia-docker-watcher/internal/config"
 )
 
 // DefaultSchedule is the cron expression used when the schedule label is
-// absent, as in the Python version.
+// absent, as in the Python version, and no other label sets a schedule:
+// an interval, times of day, or one of them or cron in policy-json.
 const DefaultSchedule = "0 * * * *"
 
 // DefaultMinInterval is the shortest time between two snapshots of a
@@ -61,7 +63,10 @@ type ContainerSpec struct {
 	Tags []Tag
 
 	// Policy holds the fields written to the Kopia policy of every path.
-	Policy Policy
+	// A field left unset is inherited from the parent policies: those of
+	// parent directories, then user@host, host and global. The schedule
+	// is DefaultSchedule unless a label sets one.
+	Policy backend.PolicyPatch
 
 	// CleanupOnRemove is what becomes of the source of each path once no
 	// container backs it up any more.
@@ -110,28 +115,13 @@ type Tag struct {
 	Value string
 }
 
-// Policy mirrors the sections of a Kopia policy that labels can set. A
-// field left at its zero value is inherited from the parent policies:
-// those of parent directories, then user@host, host and global.
-type Policy struct {
-	Scheduling Scheduling
-}
-
-// Scheduling is the scheduling section of the policy.
-type Scheduling struct {
-	// Cron lists the cron expressions of the schedule label, separated by
-	// ';' in the label. It is DefaultSchedule when the label is absent and
-	// empty, meaning inherit, when the label is set to an empty value.
-	Cron []string
-}
-
 // Default returns the spec of a container without labels.
 func Default() ContainerSpec {
 	return ContainerSpec{
 		SnapshotOnStart: true,
 		MinInterval:     DefaultMinInterval,
-		Policy: Policy{
-			Scheduling: Scheduling{Cron: []string{DefaultSchedule}},
+		Policy: backend.PolicyPatch{
+			Scheduling: backend.SchedulingPatch{Cron: []string{DefaultSchedule}},
 		},
 		CleanupOnRemove: CleanupPause,
 	}
@@ -223,6 +213,14 @@ func Parse(labels map[string]string, opts Options) (ContainerSpec, Issues) {
 		k.parse(p, labels[name])
 	}
 
+	// DefaultSchedule is for a container that asks for no schedule: next
+	// to an interval or times of day it would still snapshot every hour.
+	if !p.scheduleLabel && p.setsSchedule {
+		p.spec.Policy.Scheduling.Cron = nil
+	}
+
+	p.checkPolicy()
+
 	if p.spec.Enable && len(p.spec.Paths) == 0 {
 		p.label = Name(p.prefix, KeyPath)
 		p.errorf("required when %s is true", Name(p.prefix, KeyEnable))
@@ -247,6 +245,11 @@ type parser struct {
 	// label is the full name of the label being parsed; issues are
 	// reported under it.
 	label string
+
+	// scheduleLabel reports that the schedule label is set, even to an
+	// empty value; setsSchedule that another label sets a schedule: an
+	// interval, times of day, or one of them or cron in policy-json.
+	scheduleLabel, setsSchedule bool
 }
 
 func (p *parser) errorf(format string, args ...any) {
@@ -328,6 +331,7 @@ func (p *parser) paths(v string) {
 // The expressions themselves are left to kopia server to check.
 func (p *parser) schedule(v string) {
 	p.spec.Policy.Scheduling.Cron = nil
+	p.scheduleLabel = true
 
 	for item := range strings.SplitSeq(v, ";") {
 		if item = strings.TrimSpace(item); item != "" {
