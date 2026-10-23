@@ -78,6 +78,9 @@ type pass struct {
 	// describes the snapshots that have no description. recheckSoon asks
 	// for a pass soon after, as after the cleanup deleted a policy.
 	wrote, deferred, deferStart, sweepDue, recheckSoon bool
+	// absorbedHeld reports that the snapshot of an absorbed stop is saved
+	// but could not be described or pinned yet.
+	absorbedHeld bool
 
 	// outside reports a path outside WATCHER_PATH_PREFIX, which the pass
 	// leaves alone.

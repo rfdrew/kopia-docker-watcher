@@ -1320,3 +1320,64 @@ func TestFakeEnginePauseContract(t *testing.T) {
 		t.Errorf("unpause of a stopped container: %v", err)
 	}
 }
+
+// A stop the watcher causes for stop-during-backup is no stop of the
+// container: with snapshot-on-stop and pin-on-stop, and its own die and
+// stop delivered as Docker sends them, it takes no stop snapshot and adds
+// no pin, while the container's own stop afterwards does both.
+func TestStopDuringBackupNoPin(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	withHooks(h)
+	id := h.engine.run("db", enable, pathLabel(app), noOnStart, onStop, "kopia.pin-on-stop=before-update", stopDuring)
+
+	h.passAndSettle(app)
+	c.add(time.Hour)
+
+	h.passAndSettle(app)
+	h.mustActions("stop db")
+	h.dockerEvent(id, "die")
+	h.dockerEvent(id, "stop")
+
+	// Dropped as the watcher's own; and held down, db still counts as
+	// running, which keeps a die that came late from asking either.
+	if evs := h.pendingFor(app); len(evs) != 0 {
+		t.Fatalf("own events kept: %+v", evs)
+	}
+
+	h.passAndSettle(app)
+	h.passAndSettle(app)
+	h.mustActions("stop db", "start db")
+	h.dockerEvent(id, "start")
+
+	h.passAndSettle(app)
+	h.mustTriggers(app, 1)
+
+	pins := func() (n int) {
+		for _, call := range h.fake.CallsFor(h.src(app), backendtest.AnnotateSnapshot) {
+			n += len(call.AddPins)
+		}
+
+		return n
+	}
+
+	if n := pins(); n != 0 {
+		t.Fatalf("%d pins added for the watcher's own stop\nlog:\n%s", n, h.logs)
+	}
+
+	if rec := h.record(app); len(rec.WaitPins) != 0 || rec.HookRun != nil {
+		t.Fatalf("record %+v", rec)
+	}
+
+	// The container's own stop takes the stop snapshot, with the pin.
+	h.engine.setState(id, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+	h.passAndSettle(app)
+	h.passAndSettle(app)
+
+	h.mustTriggers(app, 2)
+
+	if n := pins(); n != 1 {
+		t.Fatalf("%d pins for the container's own stop, want 1\nlog:\n%s", n, h.logs)
+	}
+}

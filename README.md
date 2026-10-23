@@ -46,6 +46,8 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
   schedule when one starts again. A crash-looping container does not toggle the pause.
 - Takes a snapshot at a container start (`kopia.snapshot-on-start`, rate-limited by `kopia.min-interval`) and
   at a stop (`kopia.snapshot-on-stop`), follows it to the end and logs the result.
+- Pins the stop snapshot with `kopia.pin-on-stop` (such as `before-update-{date}`), so that retention keeps
+  the state from before an update; the cleanup keeps pinned snapshots too.
 - Runs [hooks](docs/labels.md#hooks) in the container around its snapshots: `kopia.pre-exec` before (a database
   dump, say; when it fails, no snapshot is taken) and `kopia.post-exec` after, whatever became of the snapshot,
   each within `kopia.hook-timeout`. kopia server would take scheduled snapshots without the hooks, so the watcher
@@ -81,8 +83,6 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
 
 Not supported yet:
 
-- No pins at a stop (`kopia.pin-on-stop`). The label name is reserved: the watcher warns that it is not supported
-  by this version and ignores it.
 - No snapshot tags: kopia server cannot set them through its API yet, so `kopia.tags` go into the description.
 
 ## Requirements

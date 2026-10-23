@@ -463,7 +463,6 @@ func TestParseUnknownKeys(t *testing.T) {
 		{"kopia.path.extra", "unknown label, ignored"},
 		{"kopia.Enable", "unknown label, ignored; did you mean kopia.enable?"},
 		{"kopia.snapshot_on_stop", "unknown label, ignored; did you mean kopia.snapshot-on-stop?"},
-		{"kopia.pin-on-stop", "not supported by this version, ignored"},
 		{"kopia.Retention.Daily", "unknown label, ignored; did you mean kopia.retention.daily?"},
 		{"kopia.compression", "unknown label, ignored; it is a group of labels such as kopia.compression.algorithm"},
 		{"kopia.retention", "unknown label, ignored; it is a group of labels such as kopia.retention.latest"},
@@ -478,6 +477,15 @@ func TestParseUnknownKeys(t *testing.T) {
 			checkParse(t, map[string]string{tt.label: "1"}, Options{}, Default(), []string{"warning " + tt.label + ": " + tt.issue})
 		})
 	}
+
+	// A label planned for a later release is ignored as not supported.
+	t.Run("planned", func(t *testing.T) {
+		planned["in-a-later-release"] = true
+		t.Cleanup(func() { delete(planned, "in-a-later-release") })
+
+		checkParse(t, map[string]string{"kopia.in-a-later-release": "1"}, Options{}, Default(),
+			[]string{"warning kopia.in-a-later-release: not supported by this version, ignored"})
+	})
 }
 
 func TestParseStrict(t *testing.T) {
@@ -488,7 +496,6 @@ func TestParseStrict(t *testing.T) {
 		"kopia.tags":             "standalone,env:dev,env:prod",
 		"kopia.bogus":            "1",
 		"kopia.Enable":           "true",
-		"kopia.pin-on-stop":      "keep",
 	}
 
 	want := spec(func(s *ContainerSpec) {
@@ -502,7 +509,6 @@ func TestParseStrict(t *testing.T) {
 			"warning kopia.Enable: unknown label, ignored; did you mean kopia.enable?",
 			"warning kopia.bogus: unknown label, ignored",
 			`warning kopia.path: "/data" is listed more than once`,
-			"warning kopia.pin-on-stop: not supported by this version, ignored",
 			`warning kopia.snapshot-on-stop: "yes" is not a boolean, treated as false; use true or false`,
 			`warning kopia.tags: tag "standalone" is not key:value, ignored`,
 			`warning kopia.tags: tag key "env" is repeated, the last value is used`,
@@ -516,7 +522,6 @@ func TestParseStrict(t *testing.T) {
 			"error kopia.Enable: unknown label; did you mean kopia.enable?",
 			"error kopia.bogus: unknown label",
 			`error kopia.path: "/data" is listed more than once`,
-			"error kopia.pin-on-stop: not supported by this version",
 			`error kopia.snapshot-on-stop: "yes" is not a boolean; use true or false`,
 			`error kopia.tags: tag "standalone" is not key:value`,
 			`error kopia.tags: tag key "env" is repeated`,
