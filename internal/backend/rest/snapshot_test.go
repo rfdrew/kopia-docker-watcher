@@ -1702,20 +1702,39 @@ func TestAnnotateSnapshot(t *testing.T) {
 		t.Errorf("edits = %+v\nwant %+v", got, want)
 	}
 
-	// A new description alone; an empty one clears it.
-	for _, d := range []string{"app", ""} {
-		f.resetRequests()
+	// A new description alone.
+	f.resetRequests()
 
-		if err := b.AnnotateSnapshot(t.Context(), s, start, d, nil); err != nil {
-			t.Fatal(err)
-		}
-
-		if got := editRequests(t, f); len(got) != 1 || got[0].Description == nil || *got[0].Description != d || len(got[0].AddPins) != 0 {
-			t.Errorf("edits = %+v", got)
-		}
+	if err := b.AnnotateSnapshot(t.Context(), s, start, "app", nil); err != nil {
+		t.Fatal(err)
 	}
 
-	if got := f.snapshotAt(si, "edited-4"); got.Description != "" || !got.StartTime.Equal(start) {
+	if got := editRequests(t, f); len(got) != 1 || got[0].Description == nil || *got[0].Description != "app" || len(got[0].AddPins) != 0 {
+		t.Errorf("edits = %+v", got)
+	}
+
+	// An empty description leaves the snapshot's own: alone it sends
+	// nothing, with a pin only the pin.
+	f.resetRequests()
+
+	if err := b.AnnotateSnapshot(t.Context(), s, start, "", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	assertRoutes(t, f, "GET sources", "GET snapshots")
+
+	f.resetRequests()
+
+	if err := b.AnnotateSnapshot(t.Context(), s, start, "", []string{"before-update"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := editRequests(t, f); len(got) != 1 || got[0].Description != nil || !reflect.DeepEqual(got[0].AddPins, []string{"before-update"}) {
+		t.Errorf("edits = %+v", got)
+	}
+
+	if got := f.snapshotAt(si, "edited-4"); got.Description != "app" || !got.StartTime.Equal(start) ||
+		!slices.Contains(got.Pins, "before-update") {
 		t.Errorf("snapshot = %+v", got)
 	}
 

@@ -18,6 +18,7 @@ const (
 	KeyDescription     = "description"
 	KeyTags            = "tags"
 	KeyMinInterval     = "min-interval"
+	KeyPinOnStop       = "pin-on-stop"
 
 	KeyCleanupOnRemove     = "cleanup-on-remove"
 	KeyCleanupDeletePinned = "cleanup-delete-pinned"
@@ -48,6 +49,7 @@ var coreKeys = []key{
 	{KeyDescription, func(p *parser, v string) { p.spec.Description = strings.TrimSpace(v) }},
 	{KeyTags, (*parser).tags},
 	{KeyMinInterval, (*parser).minInterval},
+	{KeyPinOnStop, (*parser).pinOnStop},
 	{KeyCleanupOnRemove, (*parser).cleanup},
 	{KeyCleanupDeletePinned, func(p *parser, v string) { p.spec.CleanupDeletePinned = p.bool(v) }},
 }
@@ -62,7 +64,6 @@ var plannedKeys = []string{
 	"post-exec",
 	"stop-during-backup",
 	"pause-during-backup",
-	"pin-on-stop",
 	"depends-on",
 }
 

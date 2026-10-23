@@ -1032,6 +1032,8 @@ func TestKnownEntryKeys(t *testing.T) {
 		StopAbsorbedAt:          mark,
 		StopAbsorbedDescription: "d",
 		StopAbsorbedLastStart:   mark,
+		StopAbsorbedPins:        []string{"p"},
+		WaitPins:                map[string][]string{"1": {"p"}},
 		Owners:                  []Owner{{ID: "c1", Name: "app"}},
 		OwnersUpdated:           mark,
 		OrphanedSince:           mark,

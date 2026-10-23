@@ -45,6 +45,8 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
   schedule when one starts again. A crash-looping container does not toggle the pause.
 - Takes a snapshot at a container start (`kopia.snapshot-on-start`, rate-limited by `kopia.min-interval`) and
   at a stop (`kopia.snapshot-on-stop`), follows it to the end and logs the result.
+- Pins the stop snapshot with `kopia.pin-on-stop` (such as `before-update-{date}`), so that retention keeps
+  the state from before an update; the cleanup keeps pinned snapshots too.
 - Writes `kopia.description` and `kopia.tags` into the snapshot description, for its own snapshots and for
   scheduled ones.
 - Several containers may share a path: the source is paused only when all of them are stopped.

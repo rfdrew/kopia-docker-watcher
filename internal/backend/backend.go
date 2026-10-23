@@ -230,7 +230,8 @@ type Backend interface {
 	WaitSnapshot(ctx context.Context, ticket SnapshotTicket, save func(SnapshotTicket)) (SnapshotResult, error)
 
 	// AnnotateSnapshot sets the description of a snapshot of src and adds
-	// pins to it, in one edit. The snapshot is the one that started at
+	// pins to it, in one edit. An empty description leaves the snapshot's
+	// own as it is, for pins alone. The snapshot is the one that started at
 	// startTime and is not a checkpoint; of several, the one that ended
 	// first. Snapshots are found by start time because an edit gives a
 	// snapshot a new ID. No such snapshot is ErrSnapshotNotFound.
