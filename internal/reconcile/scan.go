@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
+	"github.com/rfdrew/kopia-docker-watcher/internal/labels"
 )
 
 // scanLoop serves ReconcileAll until ctx is done. A scan that fails, as
@@ -141,6 +142,10 @@ func (r *Reconciler) listPaths(ctx context.Context) ([]string, []docker.Containe
 		pc := r.parse(c)
 		seen[c.ID] = true
 
+		r.mu.Lock()
+		r.noteMounts(pc)
+		r.mu.Unlock()
+
 		r.reportLabels(pc)
 
 		if !pc.spec.Enable {
@@ -158,6 +163,8 @@ func (r *Reconciler) listPaths(ctx context.Context) ([]string, []docker.Containe
 			delete(r.reported, id)
 		}
 	}
+
+	r.forgetMounts(seen)
 	r.mu.Unlock()
 
 	for _, src := range r.store.Sources() {
@@ -190,7 +197,7 @@ func (r *Reconciler) reportLabels(pc parsed) {
 
 	if pc.spec.Enable {
 		for _, pe := range pc.badPaths {
-			lines = append(lines, "error: "+r.labelPrefix+".path: "+pe.String())
+			lines = append(lines, "error: "+labels.Name(r.labelPrefix, pe.key)+": "+pe.String())
 		}
 	}
 

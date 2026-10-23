@@ -155,7 +155,7 @@ func TestParse(t *testing.T) {
 			want: spec(func(s *ContainerSpec) { s.Enable = true }),
 			issues: []string{
 				"warning kopia.aaa: unknown label, ignored",
-				"error kopia.path: required when kopia.enable is true",
+				"error kopia.path: required when kopia.enable is true, unless kopia.volumes is set",
 				`warning kopia.tags: tag "standalone" is not key:value, ignored`,
 			},
 		},
@@ -217,12 +217,12 @@ func TestParsePaths(t *testing.T) {
 		{
 			name:   "required when enabled",
 			labels: map[string]string{"kopia.enable": "true"},
-			issues: []string{"error kopia.path: required when kopia.enable is true"},
+			issues: []string{"error kopia.path: required when kopia.enable is true, unless kopia.volumes is set"},
 		},
 		{
 			name:   "empty is missing",
 			labels: map[string]string{"kopia.enable": "TRUE", "kopia.path": " , "},
-			issues: []string{"error kopia.path: required when kopia.enable is true"},
+			issues: []string{"error kopia.path: required when kopia.enable is true, unless kopia.volumes is set"},
 		},
 		{
 			name:   "not required when disabled",
@@ -463,7 +463,6 @@ func TestParseUnknownKeys(t *testing.T) {
 		{"kopia.path.extra", "unknown label, ignored"},
 		{"kopia.Enable", "unknown label, ignored; did you mean kopia.enable?"},
 		{"kopia.snapshot_on_stop", "unknown label, ignored; did you mean kopia.snapshot-on-stop?"},
-		{"kopia.volumes", "not supported by this version, ignored"},
 		{"kopia.pre-exec", "not supported by this version, ignored"},
 		{"kopia.Retention.Daily", "unknown label, ignored; did you mean kopia.retention.daily?"},
 		{"kopia.compression", "unknown label, ignored; it is a group of labels such as kopia.compression.algorithm"},
@@ -558,7 +557,7 @@ func TestParseLabelPrefix(t *testing.T) {
 	_, issues := Parse(map[string]string{"backup.enable": "true", "backup.Path": "/x"}, Options{Prefix: "backup"})
 	if got, want := issueStrings(issues), []string{
 		"warning backup.Path: unknown label, ignored; did you mean backup.path?",
-		"error backup.path: required when backup.enable is true",
+		"error backup.path: required when backup.enable is true, unless backup.volumes is set",
 	}; !slices.Equal(got, want) {
 		t.Errorf("issues:\n got %q\nwant %q", got, want)
 	}

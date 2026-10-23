@@ -46,6 +46,14 @@ type ContainerSpec struct {
 	// are applied where the source path is built.
 	Paths []string
 
+	// Volumes are the items of the volumes label, in label order and
+	// without duplicates: VolumeAll, a volume name, or a clean absolute
+	// mount destination. VolumePaths turns them into host paths with the
+	// container's mounts; ExcludeVolumes, in the same forms but for
+	// VolumeAll, are left out.
+	Volumes        []string
+	ExcludeVolumes []string
+
 	SnapshotOnStart bool
 	SnapshotOnStop  bool
 
@@ -221,9 +229,14 @@ func Parse(labels map[string]string, opts Options) (ContainerSpec, Issues) {
 
 	p.checkPolicy()
 
-	if p.spec.Enable && len(p.spec.Paths) == 0 {
+	if p.spec.Enable && len(p.spec.Paths) == 0 && len(p.spec.Volumes) == 0 {
 		p.label = Name(p.prefix, KeyPath)
-		p.errorf("required when %s is true", Name(p.prefix, KeyEnable))
+		p.errorf("required when %s is true, unless %s is set", Name(p.prefix, KeyEnable), Name(p.prefix, KeyVolumes))
+	}
+
+	if len(p.spec.ExcludeVolumes) > 0 && len(p.spec.Volumes) == 0 {
+		p.label = Name(p.prefix, KeyExcludeVolumes)
+		p.warn("has no effect without "+Name(p.prefix, KeyVolumes), "", "")
 	}
 
 	if p.spec.CleanupDeletePinned && p.spec.CleanupOnRemove != CleanupAll {

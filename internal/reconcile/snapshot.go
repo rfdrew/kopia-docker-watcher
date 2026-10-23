@@ -661,8 +661,8 @@ func (ps *pass) requests() []snapRequest {
 	for _, id := range order {
 		s := byID[id]
 
-		pc := ps.parse(docker.Container{ID: id, Name: s.last.Name, Labels: s.last.Labels})
-		if !pc.spec.Enable || !slices.Contains(pc.paths, ps.path) {
+		pc, owns := ps.eventOwner(id, s.last)
+		if !pc.spec.Enable || !owns {
 			continue
 		}
 

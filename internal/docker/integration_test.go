@@ -85,7 +85,7 @@ func TestIntegrationDocker(t *testing.T) {
 		}
 
 		if len(ctr.Mounts) != 1 || ctr.Mounts[0].Type != "volume" || ctr.Mounts[0].Destination != "/data" ||
-			ctr.Mounts[0].Name == "" || ctr.Mounts[0].Source == "" {
+			ctr.Mounts[0].Name == "" || ctr.Mounts[0].Driver != "local" || ctr.Mounts[0].Source == "" {
 			t.Errorf("mounts = %+v", ctr.Mounts)
 		}
 

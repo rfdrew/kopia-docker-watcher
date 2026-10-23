@@ -64,6 +64,9 @@ type Mount struct {
 	Type string
 	// Name is the volume name; empty for bind mounts.
 	Name string
+	// Driver is the volume driver, "local" for Docker's own volumes; empty
+	// for bind mounts.
+	Driver string
 	// Source is the path on the Docker host: the bind source, or the
 	// volume's data directory. Empty for tmpfs.
 	Source string

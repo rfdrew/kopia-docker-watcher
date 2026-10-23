@@ -10,6 +10,8 @@ import (
 const (
 	KeyEnable          = "enable"
 	KeyPath            = "path"
+	KeyVolumes         = "volumes"
+	KeyExcludeVolumes  = "exclude-volumes"
 	KeySchedule        = "schedule"
 	KeySnapshotOnStart = "snapshot-on-start"
 	KeySnapshotOnStop  = "snapshot-on-stop"
@@ -38,6 +40,8 @@ var keys = slices.Concat(coreKeys, policyKeys)
 var coreKeys = []key{
 	{KeyEnable, func(p *parser, v string) { p.spec.Enable = p.bool(v) }},
 	{KeyPath, (*parser).paths},
+	{KeyVolumes, func(p *parser, v string) { p.spec.Volumes = p.volumes(v, false) }},
+	{KeyExcludeVolumes, func(p *parser, v string) { p.spec.ExcludeVolumes = p.volumes(v, true) }},
 	{KeySchedule, (*parser).schedule},
 	{KeySnapshotOnStart, func(p *parser, v string) { p.spec.SnapshotOnStart = p.bool(v) }},
 	{KeySnapshotOnStop, func(p *parser, v string) { p.spec.SnapshotOnStop = p.bool(v) }},
@@ -53,10 +57,6 @@ var coreKeys = []key{
 // the schema tests check them together with keys, so that a key added now
 // cannot clash with one of them later.
 var plannedKeys = []string{
-	// Paths from the container's mounts.
-	"volumes",
-	"exclude-volumes",
-
 	// Hooks around a snapshot.
 	"pre-exec",
 	"post-exec",

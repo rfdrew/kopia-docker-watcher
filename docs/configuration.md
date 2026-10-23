@@ -110,8 +110,8 @@ the files already exist. See the [README](../README.md#requirements) and the
 
 ### `HOST_PREFIX`
 
-Prepended to every path of the `kopia.path` label to make the path kopia server backs up. Empty by default:
-the label path is used as it is.
+Prepended to every path of the `kopia.path` label, and to the host path of every mount `kopia.volumes` picks, to
+make the path kopia server backs up. Empty by default: the path is used as it is.
 
 Labels name paths on the Docker host. Set `HOST_PREFIX` when kopia server sees the host's files under another
 directory, for example when its container mounts the host root at `/host`:
@@ -125,7 +125,8 @@ watcher:
     HOST_PREFIX: /host
 ```
 
-`kopia.path=/srv/app/data` then becomes the source `/host/srv/app/data`. With the host directories mounted at
+`kopia.path=/srv/app/data` then becomes the source `/host/srv/app/data`, and the volume `shop_data` of
+`kopia.volumes=data` the source `/host/var/lib/docker/volumes/shop_data/_data`. With the host directories mounted at
 the same paths inside kopia server, as in the [example](../examples/docker-compose.yml), leave it empty.
 
 - Must be an absolute path. A trailing slash is dropped; `/` means no prefix.
@@ -145,6 +146,8 @@ Limits the sources the watcher may touch to those under this path. Empty by defa
   `kopia.path=/srv/app` is allowed and `kopia.path=/etc` is not.
 - A label path outside the prefix is a label error: the container's labels are not applied. `validate` reports
   it too.
+- The same holds for the host path of a mount that `kopia.volumes` picks: with
+  `WATCHER_PATH_PREFIX=/var/lib/docker/volumes`, only the container's volumes are backed up, not its bind mounts.
 - A source in `STATE_FILE` outside the prefix, for example after the prefix was narrowed, is left alone: the
   watcher neither pauses it, nor cleans it up, nor deletes anything of it. It also forgets that source's owners,
   so that if the prefix is widened again the source is only paused until a container backs it up again.

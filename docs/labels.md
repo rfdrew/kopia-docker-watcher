@@ -35,7 +35,9 @@ kopia-docker-watcher validate --all
 | Label | Default | Value |
 |---|---|---|
 | [`kopia.enable`](#kopiaenable) | `false` | [boolean](#booleans) |
-| [`kopia.path`](#kopiapath) | required with `enable` | paths, separated by `,` |
+| [`kopia.path`](#kopiapath) | required with `enable`, unless `volumes` is set | paths, separated by `,` |
+| [`kopia.volumes`](#kopiavolumes) | — | volume names, mount destinations or `*`, separated by `,` |
+| [`kopia.exclude-volumes`](#kopiaexclude-volumes) | — | volume names or mount destinations, separated by `,` |
 | [`kopia.schedule`](#kopiaschedule) | `0 * * * *` | cron expressions, separated by `;`; empty to inherit |
 | [`kopia.snapshot-on-start`](#kopiasnapshot-on-start) | `true` | boolean |
 | [`kopia.snapshot-on-stop`](#kopiasnapshot-on-stop) | `false` | boolean |
@@ -77,8 +79,8 @@ inherits the field from its parent policies.
 | [`kopia.policy-json`](#kopiapolicy-json) | JSON object | any field, merged last |
 
 The names, defaults and boolean values of the Python version's labels (`enable`, `path`, `schedule`,
-`snapshot-on-start`, `snapshot-on-stop`, `description`, `tags`) are kept. `min-interval`, `cleanup-on-remove`,
-`cleanup-delete-pinned` and the policy labels are new.
+`snapshot-on-start`, `snapshot-on-stop`, `description`, `tags`) are kept. `volumes`, `exclude-volumes`,
+`min-interval`, `cleanup-on-remove`, `cleanup-delete-pinned` and the policy labels are new.
 
 ## Warnings, errors and strict mode
 
@@ -89,7 +91,8 @@ warning or an error.
   is ignored, a value that is not a boolean counts as `false`, an invalid `min-interval` keeps the default. The
   rest of the labels apply.
 - **An error** means the labels of the container cannot be applied: `kopia.path` missing while `kopia.enable` is
-  `true`, a policy label whose value cannot be read (`kopia.retention.daily=7d`, `kopia.interval=30s`, a
+  `true` and `kopia.volumes` is not set, a volume or mount destination in `kopia.volumes` that the container does
+  not have, a policy label whose value cannot be read (`kopia.retention.daily=7d`, `kopia.interval=30s`, a
   `kopia.policy-json` that is not a JSON object), a compression algorithm kopia server does not have, or, in
   strict mode, any warning.
 
@@ -111,12 +114,12 @@ or before a deploy; without it the watcher accepts every compose file the Python
 
 **A path that cannot be used** is an error of that path only: other paths of the same label still work. A path
 cannot be used when it is not absolute (and `HOST_PREFIX` is not set), leads out of `HOST_PREFIX` with `..`, or
-lies outside `WATCHER_PATH_PREFIX`.
+lies outside `WATCHER_PATH_PREFIX`. The same holds for the source of a mount that `kopia.volumes` picks.
 
 **Unknown labels** under the prefix are a warning with a hint where there is one: `kopia.snapshot_on_stop` gets
 "did you mean kopia.snapshot-on-stop?", and `kopia.compression` gets "it is a group of labels such as
 kopia.compression.algorithm". Labels planned for later releases are a warning "not supported by this version" and
-ignored: `kopia.volumes`, `kopia.exclude-volumes`, `kopia.pre-exec`, `kopia.post-exec`,
+ignored: `kopia.pre-exec`, `kopia.post-exec`,
 `kopia.stop-during-backup`, `kopia.pause-during-backup`, `kopia.pin-on-stop` and `kopia.depends-on`.
 
 ### Booleans
@@ -134,7 +137,7 @@ still reports problems with them.
 ### `kopia.path`
 
 The paths to back up, separated by commas: `/srv/app/data,/srv/app/config`. Required when `kopia.enable` is
-`true`.
+`true`, unless [`kopia.volumes`](#kopiavolumes) is set; with both, the container backs up the paths of both.
 
 - Paths are host paths. Each one becomes a source of kopia server: `HOST_PREFIX` is prepended, and the result is
   cleaned (`/srv/app/` becomes `/srv/app`). See [configuration.md](configuration.md#host_prefix).
@@ -149,6 +152,89 @@ decide, or all owners when none runs. They agree when they ask for the same fiel
 the labels are written: `kopia.retention.daily=7` and `kopia.policy-json={"retention":{"keepDaily":7}}` agree.
 When they disagree, the source keeps the policy fields last applied, and the watcher logs an error naming the
 containers and fields while an owner runs, a warning when all are stopped.
+
+### `kopia.volumes`
+
+The volumes and bind mounts of the container to back up, separated by commas, instead of writing their host paths
+into `kopia.path`. Each item is one of:
+
+- **a volume name**: `data`. For a container of a docker compose project, the short name of the compose file
+  matches too: in project `shop`, `data` is the volume `shop_data`. The full name, `shop_data`, or the name of an
+  external volume, works as well. Bind mounts have no name.
+- **a mount destination**, the absolute path inside the container: `/var/lib/postgresql/data`. It matches a
+  volume or a bind mount.
+- **`*`**: every mount the container can write to. Read-only mounts, such as `/etc/localtime:/etc/localtime:ro`,
+  only count when listed by name or destination.
+
+The watcher reads the mounts from Docker, so the label works the same on every host:
+
+```yaml
+services:
+  db:
+    image: postgres:17
+    volumes:
+      - data:/var/lib/postgresql/data
+      - ./config:/etc/postgresql
+    labels:
+      kopia.enable: "true"
+      kopia.volumes: "data,/etc/postgresql"
+volumes:
+  data:
+```
+
+- **The source is the mount's path on the Docker host**, as `docker inspect` shows it under `Mounts`: for a
+  local volume `/var/lib/docker/volumes/<name>/_data` (another directory under a different Docker data root or
+  rootless Docker), for a bind mount its host path. From there it is a path like those of `kopia.path`:
+  `HOST_PREFIX` is prepended, and the result must be absolute and lie within `WATCHER_PATH_PREFIX`.
+- **kopia server must see these paths.** For volumes, mount the volume directory into the kopia server
+  container, read-only, at the same path, or under the directory `HOST_PREFIX` names:
+  `/var/lib/docker/volumes:/var/lib/docker/volumes:ro`. See the [example](../examples/docker-compose.yml).
+- **Not backed up, with a warning:** a tmpfs and any other mount that is neither a volume nor a bind mount, a
+  volume of a driver other than `local` (its data has no directory on the host), a socket such as
+  `/var/run/docker.sock` (a bind mount whose host path ends in `.sock`), and a mount Docker reports no host path
+  for. With `*` these warnings come for every such mount the container can write to; list them in
+  [`kopia.exclude-volumes`](#kopiaexclude-volumes) to silence them. A tmpfs of `docker run --tmpfs` or the compose
+  `tmpfs:` key is not among the mounts Docker reports: it is neither picked nor warned about, and naming it is an
+  error (in `kopia.exclude-volumes`, a warning).
+- **A `local` volume with `driver_opts`**, such as an NFS or CIFS share, is mounted by Docker on the host at its
+  `_data` directory only while a container uses it. A kopia server container that mounts `/var/lib/docker/volumes`
+  with the default propagation does not see such a mount and backs up an empty directory. Mount the directory with
+  `rslave` propagation (`/var/lib/docker/volumes:/var/lib/docker/volumes:ro,rslave`), or back up the share where
+  it lives.
+- **An error:** an item that names no volume or mount destination of the container, and one that is not a volume
+  name (letters, digits, `_`, `.` and `-`, starting with a letter or digit), an absolute path or `*`. A label that
+  picks nothing to back up is a warning, or an error when `kopia.path` is not set either.
+- Spaces around items and empty items are ignored, a trailing slash of a destination too. An item listed twice
+  is a warning. Two mounts with the same host path are one source.
+- **Sources from volumes are sources like any other**: the policy labels, the pause, the snapshots at a start and
+  a stop, and the cleanup work the same. A volume that several containers mount is a [shared
+  path](#kopiapath): with `kopia.volumes`, each of them is an owner.
+- Docker's events do not carry the mounts. When a container with `kopia.volumes` starts, stops or is removed, the
+  watcher queues the sources it last saw for that container and those the state records it as an owner of, and,
+  unless it was removed, lists the containers to find the sources its mounts make now. A container removed
+  before the watcher listed it even once, such as a `docker run --rm` of a few seconds, leaves no trace of its
+  mounts: its sources get no events, so no snapshot at its stop, and the next full reconcile
+  (`RECONCILE_INTERVAL`) pauses them.
+- `validate --container` and `validate --all` list the sources the mounts make, naming the mount of each:
+  `volume shop_data at /var/lib/postgresql/data -> /var/lib/docker/volumes/shop_data/_data`. With labels given on
+  the command line there is no container, and `validate` says so instead.
+
+### `kopia.exclude-volumes`
+
+Mounts that [`kopia.volumes`](#kopiavolumes) must leave out, separated by commas, in the same forms but `*`:
+volume names, compose short names included, and mount destinations. Mostly useful with `*`:
+
+```yaml
+labels:
+  kopia.enable: "true"
+  kopia.volumes: "*"
+  kopia.exclude-volumes: "cache,/var/run/docker.sock"
+```
+
+- An excluded mount is neither backed up nor warned about.
+- An item that names no mount of the container is a warning, and ignored. A mount `kopia.volumes` lists by name
+  or destination and `kopia.exclude-volumes` excludes is an error.
+- Without `kopia.volumes` the label has no effect, which is a warning.
 
 ### `kopia.schedule`
 
@@ -246,8 +332,8 @@ app data [env=prod app=example]
 
 ## Policy labels
 
-These labels set fields of the policy of each path in `kopia.path`, the policy kopia server keeps for that path
-alone. They never touch the host or global policy.
+These labels set fields of the policy of each source of the container, from `kopia.path` and `kopia.volumes`, the
+policy kopia server keeps for that path alone. They never touch the host or global policy.
 
 - **Empty means inherit.** An absent label and a label with an empty value both leave the field to the parent
   policies: those of parent directories, then `user@host`, the host and the global policy.

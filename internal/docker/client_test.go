@@ -105,6 +105,7 @@ func TestContainersIncludesStoppedOnes(t *testing.T) {
 			Mounts: []Mount{{
 				Type:        "volume",
 				Name:        "app_pgdata",
+				Driver:      "local",
 				Source:      "/var/lib/docker/volumes/app_pgdata/_data",
 				Destination: "/var/lib/postgresql/data",
 				RW:          true,
