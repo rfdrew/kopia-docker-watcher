@@ -460,7 +460,7 @@ func (v *validator) checkCompressor(ctx context.Context, r *report) {
 		slices.SortFunc(v.algorithms, func(a, b backend.Algorithm) int { return strings.Compare(a.Name, b.Name) })
 	}
 
-	for _, is := range labels.CheckCompressor(v.prefix, r.spec.Policy, v.algorithms) {
+	for _, is := range labels.CheckCompressor(v.prefix, r.spec.Policy, v.algorithms, v.strict) {
 		if !slices.Contains(r.issues, is) {
 			r.issues = append(r.issues, is)
 		}
@@ -511,7 +511,7 @@ func (v *validator) checkSource(ctx context.Context, r *report, src *sourceRepor
 	}
 
 	if res.SchedulingError != "" {
-		r.addError(labels.Name(v.prefix, labels.KeySchedule), "kopia server rejects the schedule: "+res.SchedulingError)
+		r.addError(labels.Name(v.prefix, labels.ScheduleKey(r.spec.Policy)), "kopia server rejects the schedule: "+res.SchedulingError)
 		return
 	}
 
@@ -744,7 +744,7 @@ func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 
 	row(labels.KeyEnable, strconv.FormatBool(spec.Enable))
 	row(labels.KeyPath, orNone(strings.Join(spec.Paths, ", "), "(none)"))
-	row(labels.KeySchedule, orNone(strings.Join(spec.Policy.Scheduling.Cron, "; "), "(inherit from the parent policies)"))
+	row(labels.KeySchedule, orNone(strings.Join(scheduleOf(spec.Policy), "; "), "(inherit from the parent policies)"))
 	row(labels.KeySnapshotOnStart, strconv.FormatBool(spec.SnapshotOnStart))
 	row(labels.KeySnapshotOnStop, strconv.FormatBool(spec.SnapshotOnStop))
 	row(labels.KeyMinInterval, minInterval(spec.MinInterval))
@@ -762,6 +762,31 @@ func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 	_ = tw.Flush()
 
 	printPolicyFields(w, spec.Policy)
+}
+
+// scheduleOf returns the cron expressions the policy fields set, those of
+// policy-json if it sets them; as written when they are not a list of
+// strings.
+func scheduleOf(pol backend.PolicyPatch) []string {
+	fields, err := pol.Fields()
+	if err != nil {
+		return pol.Scheduling.Cron
+	}
+
+	for _, f := range fields {
+		if f.Name() != "scheduling.cron" {
+			continue
+		}
+
+		var crons []string
+		if json.Unmarshal(f.Value, &crons) != nil {
+			return []string{string(f.Value)}
+		}
+
+		return crons
+	}
+
+	return nil
 }
 
 // printPolicyFields lists the Kopia policy fields the labels set, but for

@@ -396,6 +396,63 @@ func TestParsePolicyLabels(t *testing.T) {
 			issues: []string{`error kopia.policy-json: must not set scheduling.manual: the watcher pauses the source when all its containers are stopped`},
 		},
 		{
+			name:   "policy-json with actions in another case",
+			labels: map[string]string{"kopia.policy-json": `{"Actions":{"beforeSnapshotRoot":{"script":"x"}}}`},
+			want:   Default(),
+			issues: []string{`error kopia.policy-json: must not set actions: they run commands on kopia server, which has to allow them; set them on kopia server instead`},
+		},
+		{
+			name:   "policy-json with the pause in another case",
+			labels: map[string]string{"kopia.policy-json": `{"SCHEDULING":{"Manual":true}}`},
+			want:   Default(),
+			issues: []string{`error kopia.policy-json: must not set scheduling.manual: the watcher pauses the source when all its containers are stopped`},
+		},
+		{
+			name:   "policy-json with a key in another case",
+			labels: map[string]string{"kopia.policy-json": `{"scheduling":{"Cron":["0 3 * * *"]}}`},
+			want:   Default(),
+			issues: []string{`error kopia.policy-json: key "scheduling.Cron" is spelled "scheduling.cron" in a Kopia policy`},
+		},
+		{
+			name:   "policy-json with a section in another case",
+			labels: map[string]string{"kopia.policy-json": `{"Retention":{"keepDaily":3}}`},
+			want:   Default(),
+			issues: []string{`error kopia.policy-json: key "Retention" is spelled "retention" in a Kopia policy`},
+		},
+		{
+			name:   "policy-json with keys that differ in case",
+			labels: map[string]string{"kopia.policy-json": `{"osSnapshots":{"x":1,"X":2}}`},
+			want:   Default(),
+			issues: []string{`error kopia.policy-json: keys "X" and "x" differ only in case, and kopia server reads them as one`},
+		},
+		{
+			name:   "policy-json with a dotted key",
+			labels: map[string]string{"kopia.policy-json": `{"files.ignore":["*.log"]}`},
+			want:   Default(),
+			issues: []string{`error kopia.policy-json: key "files.ignore" has a dot; nest objects instead, such as {"files":{"ignore":["*.tmp"]}}`},
+		},
+		{
+			name:   "policy-json with a nested dotted key",
+			labels: map[string]string{"kopia.policy-json": `{"logging":{"entries.snapshotted":5}}`},
+			want:   Default(),
+			issues: []string{`error kopia.policy-json: key "logging.entries.snapshotted" has a dot; nest objects instead, such as {"files":{"ignore":["*.tmp"]}}`},
+		},
+		{
+			name:   "policy-json that drops the scheduling section",
+			labels: map[string]string{"kopia.policy-json": `{"scheduling":null}`},
+			want: policy(func(p *backend.PolicyPatch) {
+				p.Scheduling.Cron = nil
+				p.Raw = json.RawMessage(`{"scheduling":null}`)
+			}),
+		},
+		{
+			name:   "policy-json with unknown keys in any case",
+			labels: map[string]string{"kopia.policy-json": `{"osSnapshots":{"VolumeShadowCopy":{"Enable":1}}}`},
+			want: policy(func(p *backend.PolicyPatch) {
+				p.Raw = json.RawMessage(`{"osSnapshots":{"VolumeShadowCopy":{"Enable":1}}}`)
+			}),
+		},
+		{
 			name: "policy-json clashing with a label",
 			labels: map[string]string{
 				"kopia.retention.daily": "7", "kopia.policy-json": `{"retention":null}`,
@@ -488,8 +545,29 @@ func TestCheckCompressor(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		if got := issueStrings(CheckCompressor("kopia", tt.pol, algos)); !slices.Equal(got, tt.want) {
+		if got := issueStrings(CheckCompressor("kopia", tt.pol, algos, false)); !slices.Equal(got, tt.want) {
 			t.Errorf("CheckCompressor(%+v) = %q, want %q", tt.pol, got, tt.want)
+		}
+	}
+
+	// Strict mode makes the warning an error.
+	want := []string{`error kopia.compression.algorithm: compression algorithm "deflate-old" is deprecated by kopia`}
+	if got := issueStrings(CheckCompressor("kopia", compress("deflate-old"), algos, true)); !slices.Equal(got, want) {
+		t.Errorf("strict: %q, want %q", got, want)
+	}
+}
+
+func TestScheduleKey(t *testing.T) {
+	for _, tt := range []struct {
+		pol  backend.PolicyPatch
+		want string
+	}{
+		{backend.PolicyPatch{Scheduling: backend.SchedulingPatch{Cron: []string{"0 * * * *"}}}, KeySchedule},
+		{backend.PolicyPatch{Raw: json.RawMessage(`{"scheduling":{"cron":["5 * * * *"]}}`)}, KeyPolicyJSON},
+		{backend.PolicyPatch{Raw: json.RawMessage(`{"scheduling":{"intervalSeconds":60}}`)}, KeySchedule},
+	} {
+		if got := ScheduleKey(tt.pol); got != tt.want {
+			t.Errorf("ScheduleKey(%+v) = %q, want %q", tt.pol, got, tt.want)
 		}
 	}
 }

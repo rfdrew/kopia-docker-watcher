@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
 	"github.com/rfdrew/kopia-docker-watcher/internal/labels"
 )
 
@@ -25,7 +26,7 @@ func (ps *pass) checkCompression() error {
 			return err
 		}
 
-		issues := labels.CheckCompressor(ps.labelPrefix, o.patch, algos)
+		issues := labels.CheckCompressor(ps.labelPrefix, o.patch, algos, ps.strict)
 		if !issues.HasErrors() {
 			for _, is := range issues {
 				ps.warnOnce("compression "+o.name+" "+is.String(), "the labels of a container ask for a deprecated compression algorithm",
@@ -35,9 +36,14 @@ func (ps *pass) checkCompression() error {
 			continue
 		}
 
+		// The labels cannot be applied: as for an error found when they
+		// were parsed, the container's snapshots get its name only.
 		o.issues = append(o.issues, issues...)
 		slices.SortStableFunc(o.issues, func(a, b labels.Issue) int { return strings.Compare(a.Label, b.Label) })
 		o.valid = false
+		o.patch = backend.PolicyPatch{}
+		o.snap.described.description = ""
+		o.snap.described.tags = nil
 	}
 
 	return nil

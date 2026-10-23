@@ -747,3 +747,64 @@ func TestValidateCompressionAlgorithm(t *testing.T) {
 		t.Errorf("calls = %q", calls)
 	}
 }
+
+// kopia server is asked for its algorithms once for all label sets.
+func TestValidateAlgorithmsAskedOnce(t *testing.T) {
+	k := newFakeKopia(t)
+	e := &fakeEngine{containers: []docker.Container{
+		{ID: "1", Name: "a", State: docker.StateRunning, Labels: map[string]string{
+			"kopia.enable": "true", "kopia.path": "/a", "kopia.compression.algorithm": "zstd"}},
+		{ID: "2", Name: "b", State: docker.StateExited, Labels: map[string]string{
+			"kopia.enable": "true", "kopia.path": "/b", "kopia.compression.algorithm": "s2-default"}},
+	}}
+
+	code, stdout, stderr := validateRun{env: kopiaEnv(), kopia: k, engine: e}.run(t, "--all")
+	if code != 0 || stderr != "" {
+		t.Fatalf("exit code = %d, stderr: %s\nstdout: %s", code, stderr, stdout)
+	}
+
+	calls, _ := k.recorded()
+
+	n := 0
+
+	for _, c := range calls {
+		if c == "GET /api/v1/repo/algorithms" {
+			n++
+		}
+	}
+
+	if n != 1 {
+		t.Errorf("repo/algorithms asked %d times, want 1; calls %q", n, calls)
+	}
+}
+
+// A cron in policy-json wins over the schedule label: validate shows it in
+// the schedule row and names policy-json when kopia server rejects it.
+func TestValidatePolicyJSONSchedule(t *testing.T) {
+	k := newFakeKopia(t)
+	k.badCron = "61 * * * *"
+
+	code, stdout, _ := validateRun{env: kopiaEnv(), kopia: k}.run(t,
+		"kopia.enable=true", "kopia.path=/data", "kopia.schedule=0 3 * * *",
+		`kopia.policy-json={"scheduling":{"cron":["61 * * * *"]}}`)
+
+	for _, line := range []string{
+		"kopia.schedule               61 * * * *\n",
+		`error: kopia.policy-json: kopia server rejects the schedule: invalid cron expression "61 * * * *"`,
+	} {
+		if code != 1 || !strings.Contains(stdout, line) {
+			t.Errorf("exit code = %d; stdout lacks %q:\n%s", code, line, stdout)
+		}
+	}
+}
+
+func TestValidateStrictDeprecatedAlgorithm(t *testing.T) {
+	k := newFakeKopia(t)
+
+	code, stdout, _ := validateRun{env: kopiaEnv(), kopia: k}.run(t, "--strict",
+		"kopia.enable=true", "kopia.path=/data", "kopia.compression.algorithm=deflate-default")
+
+	if want := `error: kopia.compression.algorithm: compression algorithm "deflate-default" is deprecated by kopia`; code != 1 || !strings.Contains(stdout, want) {
+		t.Errorf("exit code = %d; stdout lacks %q:\n%s", code, want, stdout)
+	}
+}

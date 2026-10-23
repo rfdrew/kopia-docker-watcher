@@ -223,6 +223,12 @@ func TestRawMustNotSetPauseOrActions(t *testing.T) {
 		`{"scheduling":{"manual":true}}`,
 		`{"scheduling":{"manual":{}}}`,
 		`{"scheduling":{"manual":null}}`,
+		`{"Actions":{}}`,
+		`{"ACTIONS":null}`,
+		`{"Scheduling":{"Manual":true}}`,
+		`{"scheduling":{"MANUAL":{}}}`,
+		`{"files.ignore":["x"]}`,
+		`{"logging":{"entries.snapshotted":5}}`,
 	} {
 		err := PolicyPatch{Raw: json.RawMessage(raw)}.Validate()
 		if !IsConfig(err) {

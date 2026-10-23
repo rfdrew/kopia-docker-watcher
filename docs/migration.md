@@ -54,7 +54,7 @@ persistent TLS certificate.
   running container is lifted too.
 - **Fields from the labels are put back; other web UI edits are kept.** The operator replaced the whole policy
   on every start and stop, so retention, compression and ignore rules set in the web UI were lost. The watcher
-  merges: it writes only `scheduling.cron` (from `kopia.schedule`, `0 * * * *` when the label is absent), the
+  merges: it writes only `scheduling.cron` (from `kopia.schedule`, `0 * * * *` when no label sets a schedule), the
   pause, and the fields of the [policy labels](labels.md#policy-labels), which the operator did not have.
   Everything else in the policy stays. But it puts those fields back at every full reconcile, every 5
   minutes by default, where the operator did so only at the next start: a schedule changed in the web UI is

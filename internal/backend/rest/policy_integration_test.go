@@ -85,7 +85,7 @@ func TestIntegrationPolicyLabels(t *testing.T) {
 		// Every name passes the label check.
 		for _, a := range algos {
 			pol := backend.PolicyPatch{Compression: backend.CompressionPatch{CompressorName: a.Name}}
-			if is := labels.CheckCompressor("kopia", pol, algos); is.HasErrors() {
+			if is := labels.CheckCompressor("kopia", pol, algos, false); is.HasErrors() {
 				t.Errorf("%s: %v", a.Name, is)
 			}
 		}

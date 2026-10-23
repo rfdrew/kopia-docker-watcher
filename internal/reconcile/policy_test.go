@@ -236,3 +236,40 @@ func TestCompressionNoneAndDeprecated(t *testing.T) {
 		t.Errorf("no warning:\n%s", h.logs)
 	}
 }
+
+// An owner whose algorithm kopia server lacks has labels that cannot be
+// applied, so its description and tags are not used either.
+func TestUnknownCompressionKeepsDescriptionOut(t *testing.T) {
+	h := newHarness(t)
+	h.engine.run("app", enable, pathLabel(app), "kopia.compression.algorithm=brotli", "kopia.description=app data", "kopia.tags=env:prod")
+
+	containers, err := h.r.containers(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ps := &pass{Reconciler: h.r, ctx: t.Context(), path: app, owners: h.r.owners(app, containers)}
+	if err := ps.checkCompression(); err != nil {
+		t.Fatal(err)
+	}
+
+	o := ps.owners[0]
+	if o.valid || !o.patch.IsZero() || o.snap.described.description != "" || o.snap.described.tags != nil || o.snap.described.name != "app" {
+		t.Errorf("owner = %+v", o)
+	}
+}
+
+// In strict mode a deprecated algorithm is an error like the other
+// warnings.
+func TestDeprecatedCompressionStrict(t *testing.T) {
+	h := newHarness(t, withStrict)
+	h.fake.SetCompressionAlgorithms(backend.Algorithm{Name: "deflate-old", Deprecated: true})
+	h.engine.run("app", enable, pathLabel(app), "kopia.compression.algorithm=deflate-old")
+
+	res := h.mustPass(app)
+	if len(res.problems) != 1 || !strings.Contains(res.problems[0].Error(), `compression algorithm "deflate-old" is deprecated by kopia`) {
+		t.Errorf("problems = %v", res.problems)
+	}
+
+	h.mustNoSource(app)
+}

@@ -155,8 +155,8 @@ containers and fields while an owner runs, a warning when all are stopped.
 When kopia server takes scheduled snapshots: one or more cron expressions separated by `;`, written to
 `scheduling.cron` of the path's policy. Default `0 * * * *`, every hour, as in the Python version, unless another
 label sets a schedule: with `kopia.interval` or `kopia.time-of-day` (or a cron, interval or times of day in
-`kopia.policy-json`) and no `kopia.schedule` label, no cron is set, since kopia server would still snapshot
-every hour.
+`kopia.policy-json`, or a `scheduling` section that is not an object, such as `null`) and no `kopia.schedule`
+label, no cron is set, since kopia server would still snapshot every hour.
 
 - `;` separates expressions because they contain spaces and commas: `0 3 * * *;30 12 * * 1-5`.
 - An empty value, `kopia.schedule=""`, sets no cron: the path inherits the schedule of its parent policies
@@ -166,9 +166,11 @@ every hour.
   `validate` does not check cron expressions. An expression kopia server rejects is an error of the path: the source
   keeps its previous schedule, and the watcher tries again when the labels change and at every full reconcile.
 
-The watcher owns `scheduling.cron` of the path's policy and puts it back at every full reconcile if it was
-changed in the web UI. Other scheduling fields you set in the web UI, such as an interval or times of day, stay
-unless a label sets them. To manage the schedule in the web UI, set `kopia.schedule=""`.
+The watcher owns `scheduling.cron` of the path's policy when it sets one: from a non-empty `kopia.schedule`, or
+the default when no label sets a schedule. It then puts the cron back at every full reconcile if it was changed
+in the web UI. With `kopia.schedule=""`, or with `kopia.interval` or `kopia.time-of-day` and no `kopia.schedule`
+label, it sets no cron and leaves one set in the web UI alone. Other scheduling fields you set in the web UI,
+such as an interval or times of day, stay unless a label sets them.
 
 ### `kopia.snapshot-on-start`
 
@@ -391,10 +393,15 @@ Compress only files of at least `min-size` and at most `max-size` ([sizes](#size
 
 ### `kopia.compression.only` and `never`
 
-File extensions with their dot, separated by `,`: `.txt,.log`. `kopia.compression.only` compresses only files
-with these extensions, `kopia.compression.never` never compresses them. Written to `compression.onlyCompress`
-and `compression.neverCompress`. An item without the leading dot, such as `txt` or `*.txt`, or with more than
-one dot, such as `.tar.gz`, is an error: kopia compares the last extension only.
+File extensions with their dot, separated by `,`: `.txt,.log`. Written to `compression.onlyCompress` and
+`compression.neverCompress`. An item without the leading dot, such as `txt` or `*.txt`, or with more than one
+dot, such as `.tar.gz`, is an error: kopia compares the last extension only.
+
+`kopia.compression.never` keeps files with these extensions uncompressed. Despite its name,
+`kopia.compression.only` does not limit compression to its extensions: kopia (as of 0.23) only makes its
+extensions compressed even when a never-list names them, and files with other extensions are compressed as
+well. To compress fewer files, list the others in `kopia.compression.never`, or use `kopia.compression.min-size`
+and `max-size`.
 
 kopia adds the extensions of the parent policies to the path's own. To use only the path's, add
 `kopia.policy-json={"compression":{"noParentOnlyCompress":true}}` (or `noParentNeverCompress`).
@@ -420,6 +427,10 @@ It is an error when:
 - the value is not one JSON object;
 - it sets `actions`, even an empty object: those commands run on kopia server;
 - it sets `scheduling.manual`, the pause, which belongs to the watcher;
+- a key is spelled in another case than kopia's, such as `"Cron"` or `"keepdaily"`, or two keys of one object
+  differ only in case: kopia server reads keys without regard to case, so they would be the same field to it
+  and not to the watcher. Keys are checked for the sections and for the fields of the sections the labels set;
+- a key has a dot, such as `{"files.ignore":[…]}`: nest the objects instead;
 - it sets a field as a value where a label sets a field inside it, such as `{"retention":null}` together with
   `kopia.retention.daily`.
 

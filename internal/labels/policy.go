@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"math/big"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -335,7 +337,7 @@ func (p *parser) compressor(v string) {
 // policyJSON takes a JSON object merged into the policy after the fields
 // of the other labels; empty means none. The object must not set
 // scheduling.manual, since the watcher pauses a source itself, or
-// actions, commands that kopia server would run.
+// actions, commands that kopia server would run; see checkPolicyKeys.
 func (p *parser) policyJSON(v string) {
 	p.spec.Policy.Raw = nil
 
@@ -358,22 +360,10 @@ func (p *parser) policyJSON(v string) {
 		return
 	}
 
-	if _, ok := obj["actions"]; ok {
-		p.errorf("must not set actions: they run commands on kopia server, which has to allow them; set them on kopia server instead")
+	sets, msg := checkPolicyKeys(obj)
+	if msg != "" {
+		p.errorf("%s", msg)
 		return
-	}
-
-	if sched, ok := obj["scheduling"].(map[string]any); ok {
-		if _, ok := sched["manual"]; ok {
-			p.errorf("must not set scheduling.manual: the watcher pauses the source when all its containers are stopped")
-			return
-		}
-
-		for _, k := range []string{"cron", "intervalSeconds", "timeOfDay"} {
-			if _, ok := sched[k]; ok {
-				p.setsSchedule = true
-			}
-		}
 	}
 
 	var buf bytes.Buffer
@@ -383,6 +373,119 @@ func (p *parser) policyJSON(v string) {
 	}
 
 	p.spec.Policy.Raw = json.RawMessage(buf.Bytes())
+	p.setsSchedule = p.setsSchedule || sets
+}
+
+// kopiaKeys are the spellings of the policy keys the watcher knows: the
+// sections, and the fields of the sections the labels set, by section.
+// kopia server decodes a policy without regard to case, so "Cron" is
+// scheduling.cron to it, and two keys that differ only in case are one.
+var kopiaKeys = func() map[string][]string {
+	keys := map[string][]string{
+		"":            {"metadataCompression", "splitter", "actions", "osSnapshots", "logging", "noParent"},
+		"scheduling":  {"manual", "noParentTimeOfDay"},
+		"files":       {"noParentIgnore", "noParentDotFiles"},
+		"compression": {"noParentOnlyCompress", "noParentNeverCompress"},
+		"upload":      {"maxParallelSnapshots", "parallelUploadAboveSize"},
+	}
+
+	t := reflect.TypeFor[backend.PolicyPatch]()
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if f.Type.Kind() != reflect.Struct {
+			continue
+		}
+
+		section := jsonName(f)
+		keys[""] = append(keys[""], section)
+
+		for j := range f.Type.NumField() {
+			keys[section] = append(keys[section], jsonName(f.Type.Field(j)))
+		}
+	}
+
+	return keys
+}()
+
+func jsonName(f reflect.StructField) string {
+	name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+
+	return name
+}
+
+// checkPolicyKeys checks the keys of a policy-json object and reports
+// whether it sets a schedule: cron, an interval or times of day, or the
+// whole scheduling section. A message means the object cannot be used:
+//
+//   - it sets actions or scheduling.manual, in any case;
+//   - a key the watcher knows is spelled in another case, or two keys of
+//     one object differ only in case: kopia server would read them as one
+//     field, which the watcher would not see;
+//   - a key has a dot, which would make it look like a nested field.
+func checkPolicyKeys(obj map[string]any) (setsSchedule bool, msg string) {
+	for k, v := range obj {
+		switch {
+		case strings.EqualFold(k, "actions"):
+			return false, "must not set actions: they run commands on kopia server, which has to allow them; set them on kopia server instead"
+		case !strings.EqualFold(k, "scheduling"):
+			continue
+		}
+
+		sched, ok := v.(map[string]any)
+		if !ok {
+			// It replaces the whole section.
+			setsSchedule = true
+			continue
+		}
+
+		for f := range sched {
+			switch {
+			case strings.EqualFold(f, "manual"):
+				return false, "must not set scheduling.manual: the watcher pauses the source when all its containers are stopped"
+			case strings.EqualFold(f, "cron") || strings.EqualFold(f, "intervalSeconds") || strings.EqualFold(f, "timeOfDay"):
+				setsSchedule = true
+			}
+		}
+	}
+
+	return setsSchedule, checkKeys(obj, nil)
+}
+
+// checkKeys checks the spelling of the keys of obj, at path, and of the
+// objects in it.
+func checkKeys(obj map[string]any, path []string) string {
+	section := strings.Join(path, ".")
+	known := kopiaKeys[section]
+
+	if len(path) > 1 {
+		known = nil
+	}
+
+	names := slices.Sorted(maps.Keys(obj))
+
+	for i, k := range names {
+		name := strings.Join(append(slices.Clone(path), k), ".")
+
+		if strings.Contains(k, ".") {
+			return fmt.Sprintf("key %q has a dot; nest objects instead, such as {\"files\":{\"ignore\":[\"*.tmp\"]}}", name)
+		}
+
+		if j := slices.IndexFunc(names[:i], func(o string) bool { return strings.EqualFold(o, k) }); j >= 0 {
+			return fmt.Sprintf("keys %q and %q differ only in case, and kopia server reads them as one", names[j], k)
+		}
+
+		if j := slices.IndexFunc(known, func(o string) bool { return strings.EqualFold(o, k) }); j >= 0 && known[j] != k {
+			return fmt.Sprintf("key %q is spelled %q in a Kopia policy", name, strings.Join(append(slices.Clone(path), known[j]), "."))
+		}
+
+		if child, ok := obj[k].(map[string]any); ok {
+			if msg := checkKeys(child, append(slices.Clone(path), k)); msg != "" {
+				return msg
+			}
+		}
+	}
+
+	return ""
 }
 
 // jsonError describes why s does not decode as a JSON object.
@@ -440,11 +543,28 @@ func Compressor(pol backend.PolicyPatch) (name, key string) {
 	return pol.Compression.CompressorName, KeyCompressionAlgorithm
 }
 
+// ScheduleKey returns the key of the label whose cron expressions the
+// policy fields carry: policy-json when it sets scheduling.cron, as it is
+// merged last, otherwise schedule.
+func ScheduleKey(pol backend.PolicyPatch) string {
+	var raw struct {
+		Scheduling struct {
+			Cron json.RawMessage `json:"cron"`
+		} `json:"scheduling"`
+	}
+
+	if len(pol.Raw) > 0 && json.Unmarshal(pol.Raw, &raw) == nil && raw.Scheduling.Cron != nil {
+		return KeyPolicyJSON
+	}
+
+	return KeySchedule
+}
+
 // CheckCompressor checks the compression algorithm the policy fields ask
 // for against the algorithms kopia server supports: an algorithm it lacks
-// is an error, a deprecated one a warning. NoCompression is always
-// supported.
-func CheckCompressor(prefix string, pol backend.PolicyPatch, algos []backend.Algorithm) Issues {
+// is an error, a deprecated one a warning, or an error in strict mode.
+// NoCompression is always supported.
+func CheckCompressor(prefix string, pol backend.PolicyPatch, algos []backend.Algorithm, strict bool) Issues {
 	name, key := Compressor(pol)
 	if name == "" || name == NoCompression {
 		return nil
@@ -457,8 +577,15 @@ func CheckCompressor(prefix string, pol backend.PolicyPatch, algos []backend.Alg
 			return nil
 		}
 
-		return Issues{{Label: label, Severity: Warning,
-			Message: fmt.Sprintf("compression algorithm %q is deprecated by kopia; it still works", name)}}
+		is := Issue{Label: label, Severity: Warning,
+			Message: fmt.Sprintf("compression algorithm %q is deprecated by kopia; it still works", name)}
+
+		if strict {
+			is.Severity = Error
+			is.Message = fmt.Sprintf("compression algorithm %q is deprecated by kopia", name)
+		}
+
+		return Issues{is}
 	}
 
 	msg := fmt.Sprintf("kopia server does not support the compression algorithm %q", name)

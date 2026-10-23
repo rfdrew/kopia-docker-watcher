@@ -233,18 +233,40 @@ func rawFields(raw json.RawMessage) ([]Field, error) {
 		return nil, configError(fmt.Errorf("raw policy: %w", err))
 	}
 
-	// An empty object has no leaves, so these are checked by key.
-	if _, ok := obj[actionsSection]; ok {
-		return nil, configError(errors.New("raw policy must not set actions: they would run commands on kopia server"))
-	}
+	// kopia server decodes a policy without regard to case, so the keys
+	// are compared that way. An empty object has no leaves, so these are
+	// checked by key.
+	for k, v := range obj {
+		switch {
+		case strings.EqualFold(k, actionsSection):
+			return nil, configError(errors.New("raw policy must not set actions: they would run commands on kopia server"))
+		case !strings.EqualFold(k, manualField[0]) || !isObject(v):
+			continue
+		}
 
-	if _, ok := obj.get(manualField); ok {
-		return nil, configError(errors.New("raw policy must not set scheduling.manual: the watcher pauses a source when all its containers are stopped"))
+		sched, err := parseObject(v)
+		if err != nil {
+			return nil, configError(fmt.Errorf("raw policy: %w", err))
+		}
+
+		for f := range sched {
+			if strings.EqualFold(f, manualField[1]) {
+				return nil, configError(errors.New("raw policy must not set scheduling.manual: the watcher pauses a source when all its containers are stopped"))
+			}
+		}
 	}
 
 	fields, err := leaves(raw)
 	if err != nil {
 		return nil, configError(fmt.Errorf("raw policy: %w", err))
+	}
+
+	// A field is known by its dotted name, so a key with a dot would pass
+	// for a nested field.
+	for _, f := range fields {
+		if slices.ContainsFunc(f.Path, func(k string) bool { return strings.Contains(k, ".") }) {
+			return nil, configError(fmt.Errorf("raw policy field %q has a key with a dot", f.Path))
+		}
 	}
 
 	return fields, nil
