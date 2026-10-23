@@ -35,6 +35,9 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
 ## What it does
 
 - Registers a source per path of `kopia.path` and keeps `scheduling.cron` in line with `kopia.schedule`.
+- Finds the host paths of a container's volumes and bind mounts from Docker with `kopia.volumes` (`data`, a mount
+  destination such as `/var/lib/postgresql/data`, or `*`), leaving out `kopia.exclude-volumes`. See
+  [docs/labels.md](docs/labels.md#kopiavolumes).
 - Sets the fields of the path's policy that the [policy labels](docs/labels.md#policy-labels) ask for: an
   interval or times of day, retention, ignore rules and file limits, error handling, compression (checked
   against the algorithms kopia server has), parallel file reads, and any other field with `kopia.policy-json`.
@@ -61,8 +64,8 @@ Not supported yet:
 - **No full health check.** `/healthz` answers 200 while the process serves HTTP; it does not check Docker,
   kopia server or the reconcile loop.
 - **No webhook.** `NOTIFY_WEBHOOK_URL` is read and validated, but nothing is sent to it yet.
-- No `kopia.volumes`, no hooks (`pre-exec`, `stop-during-backup`, …). These label names are reserved: the
-  watcher warns that they are not supported by this version and ignores them.
+- No hooks (`pre-exec`, `stop-during-backup`, …). These label names are reserved: the watcher warns that they
+  are not supported by this version and ignores them.
 - No snapshot tags: kopia server cannot set them through its API yet, so `kopia.tags` go into the description.
 
 ## Requirements
@@ -85,7 +88,9 @@ container list, container inspect and the event stream: through `/var/run/docker
   new one after kopia server restarts, so you can keep the CSRF checks on.
 - **the paths visible.** Every path in `kopia.path` must exist inside the kopia server container, at the same
   path or under `HOST_PREFIX` (see [HOST_PREFIX](docs/configuration.md#host_prefix)). kopia server checks that
-  the path exists when the watcher registers it.
+  the path exists when the watcher registers it. For `kopia.volumes`, kopia server must see Docker's volume
+  directory, `/var/lib/docker/volumes` by default, and the host paths of the bind mounts: mount them read-only,
+  for example `/var/lib/docker/volumes:/var/lib/docker/volumes:ro`.
 - **a stable host name.** kopia server registers sources as `user@host` of its repository connection. Set
   `hostname:` on the kopia server container, or create the repository with `--override-hostname`, so that a
   recreated container does not register every path again under a new name.

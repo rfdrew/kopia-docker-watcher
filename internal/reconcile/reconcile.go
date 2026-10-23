@@ -401,6 +401,14 @@ type Reconciler struct {
 	lastComplete map[string]lastComplete
 	reportedLost map[waitKey]bool
 
+	// mounts holds the volume paths of the containers last listed or
+	// inspected; inspects the events of containers with the volumes label
+	// whose inspect is due, in their order, and inspectWake signals a new
+	// one. See volumes.go.
+	mounts      map[string][]string
+	inspects    []volumeEvent
+	inspectWake chan struct{}
+
 	// dockerTimeout bounds every container listing.
 	dockerTimeout time.Duration
 
@@ -486,6 +494,8 @@ func New(opts Options) (*Reconciler, error) {
 		reportedLost:   map[waitKey]bool{},
 		deferred:       map[string]bool{},
 		sweepDue:       map[string]bool{},
+		mounts:         map[string][]string{},
+		inspectWake:    make(chan struct{}, 1),
 
 		snapshotOnWatcherStart: opts.SnapshotOnWatcherStart,
 		cleanupGrace:           orDefault(opts.CleanupGrace, config.DefaultCleanupGrace),
@@ -548,6 +558,7 @@ func (r *Reconciler) Run(ctx context.Context) {
 	}
 
 	wg.Go(func() { r.scanLoop(ctx) })
+	wg.Go(func() { r.inspectLoop(ctx) })
 
 	<-ctx.Done()
 	r.queue.close()
@@ -657,14 +668,17 @@ func (r *Reconciler) HandleEvent(ev docker.Event) {
 		return
 	}
 
-	pc := r.parse(docker.Container{ID: ev.ContainerID, Name: ev.Name, Labels: ev.Labels})
+	pc := r.parseLabels(docker.Container{ID: ev.ContainerID, Name: ev.Name, Labels: ev.Labels})
+	volumes := r.hasVolumes(ev.Labels)
 
 	if ev.Kind == docker.KindRemoved {
 		r.mu.Lock()
 		r.reports++
 		r.reported[ev.ContainerID] = labelReport{seq: r.reports, gone: true}
 		r.mu.Unlock()
-	} else {
+	} else if !volumes {
+		// With the volumes label, the inspect reports them with the
+		// problems of the mounts.
 		r.reportLabels(pc)
 	}
 
@@ -676,6 +690,10 @@ func (r *Reconciler) HandleEvent(ev docker.Event) {
 
 	for _, p := range pc.paths {
 		r.queue.addAfter(p, r.eventDelay)
+	}
+
+	if volumes {
+		r.handleVolumeEvent(ev, pc.paths)
 	}
 }
 

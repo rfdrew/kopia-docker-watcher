@@ -96,7 +96,7 @@ func TestValidate(t *testing.T) {
 			name:   "error",
 			args:   []string{"kopia.enable=true"},
 			code:   1,
-			stdout: []string{"kopia.path (none)", "error: kopia.path: required when kopia.enable is true"},
+			stdout: []string{"kopia.path (none)", "error: kopia.path: required when kopia.enable is true, unless kopia.volumes is set"},
 		},
 		{
 			name:   "strict",

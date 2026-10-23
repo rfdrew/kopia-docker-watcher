@@ -16,34 +16,73 @@ type parsed struct {
 	spec      labels.ContainerSpec
 	issues    labels.Issues
 	// paths are the source paths of the path label that are valid, in
-	// label order, each once.
+	// label order, then those of the mounts the volumes label picks, each
+	// once.
 	paths []string
-	// badPaths are the label paths that make no source path, with why.
+	// volumePaths are the source paths of the mounts the volumes label
+	// picks, in their order; the mounts come from c, so an event, which
+	// has none, has none either.
+	volumePaths []string
+	// badPaths are the label paths and mount sources that make no source
+	// path, with why.
 	badPaths []pathError
 }
 
 type pathError struct {
+	// key is the label the path comes from: the path or the volumes label.
+	key  string
 	path string
 	err  error
 }
 
 func (e pathError) String() string { return e.err.Error() }
 
-// parse reads the labels of c.
-func (r *Reconciler) parse(c docker.Container) parsed {
-	spec, issues := labels.Parse(c.Labels, labels.Options{Prefix: r.labelPrefix, Strict: r.strict})
+// parse reads the labels of c, and with the volumes label c's mounts. The
+// problems with the mounts are issues of a container whose labels enable
+// the backup only.
+func (r *Reconciler) parse(c docker.Container) parsed { return r.parseWith(c, true) }
+
+// parseLabels is parse for a container known by its labels only, as from
+// an event: the volumes label picks no path and reports no problem.
+func (r *Reconciler) parseLabels(c docker.Container) parsed { return r.parseWith(c, false) }
+
+func (r *Reconciler) parseWith(c docker.Container, mounts bool) parsed {
+	opts := labels.Options{Prefix: r.labelPrefix, Strict: r.strict}
+	spec, issues := labels.Parse(c.Labels, opts)
 	pc := parsed{container: c, spec: spec, issues: issues}
 
-	for _, p := range spec.Paths {
+	add := func(key, p string) {
 		sp, err := labels.SourcePathWithin(r.hostPrefix, r.watcherPrefix, p)
 		if err != nil {
-			pc.badPaths = append(pc.badPaths, pathError{path: p, err: err})
-			continue
+			pc.badPaths = append(pc.badPaths, pathError{key: key, path: p, err: err})
+			return
+		}
+
+		if key == labels.KeyVolumes && !slices.Contains(pc.volumePaths, sp) {
+			pc.volumePaths = append(pc.volumePaths, sp)
 		}
 
 		if !slices.Contains(pc.paths, sp) {
 			pc.paths = append(pc.paths, sp)
 		}
+	}
+
+	for _, p := range spec.Paths {
+		add(labels.KeyPath, p)
+	}
+
+	if !mounts {
+		return pc
+	}
+
+	vols, volIssues := labels.VolumePaths(spec, c, opts)
+	for _, v := range vols {
+		add(labels.KeyVolumes, v.Path)
+	}
+
+	if spec.Enable && len(volIssues) > 0 {
+		pc.issues = append(pc.issues, volIssues...)
+		slices.SortStableFunc(pc.issues, func(a, b labels.Issue) int { return strings.Compare(a.Label, b.Label) })
 	}
 
 	return pc

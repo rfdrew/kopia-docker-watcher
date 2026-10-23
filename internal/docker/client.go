@@ -229,6 +229,7 @@ func mountsFromDocker(in []container.MountPoint) []Mount {
 		out = append(out, Mount{
 			Type:        string(m.Type),
 			Name:        m.Name,
+			Driver:      m.Driver,
 			Source:      m.Source,
 			Destination: m.Destination,
 			RW:          m.RW,

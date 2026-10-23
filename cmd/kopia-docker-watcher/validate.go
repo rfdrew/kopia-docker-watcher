@@ -41,8 +41,9 @@ every problem. The labels come from one of:
 Labels without the LABEL_PREFIX prefix are ignored. Docker is reached like
 the docker CLI reaches it, through DOCKER_HOST.
 
-Each path of the path label is put under HOST_PREFIX and must then be
-absolute. With KOPIA_SERVER_URL set, kopia server checks more, read-only:
+Each path of the path label, and for a container the source of each mount
+the volumes label picks, is put under HOST_PREFIX and must then be
+absolute; the sources list says which mount each source comes from. With KOPIA_SERVER_URL set, kopia server checks more, read-only:
 it normalizes every path (paths/resolve), computes the next snapshot times
 of the path's stored policy with the policy fields of the labels in place
 (policy/resolve), in its own time zone, which rejects a bad cron
@@ -155,7 +156,7 @@ func runValidate(ctx context.Context, args []string, d deps) int {
 			return 1
 		}
 	} else {
-		r := v.check(ctx, input)
+		r := v.check(ctx, input, nil)
 		r.print(d.stdout, v.prefix, "given")
 		ok = !r.issues.HasErrors()
 	}
@@ -307,7 +308,7 @@ func (v *validator) checkContainers(ctx context.Context, d deps, names []string,
 		begin()
 		_, _ = fmt.Fprintf(d.stdout, "container %s (%s, %s)\n", printable(c.Name), shortID(c.ID), printable(string(c.State)))
 
-		r := v.check(ctx, c.Labels)
+		r := v.check(ctx, c.Labels, &c)
 		r.print(d.stdout, v.prefix, "on this container")
 
 		if r.issues.HasErrors() {
@@ -389,11 +390,17 @@ type report struct {
 	noLabels bool
 	// server is true if kopia server checked the sources.
 	server bool
+	// noMounts is true if the volumes label is set but no container was
+	// given, so its mounts are unknown.
+	noMounts bool
 }
 
 // sourceReport is what is known about one path of the path label.
 type sourceReport struct {
-	// label is the path as written in the label.
+	// key is the label the path comes from: the path or the volumes label.
+	key string
+	// label is the path as written in the label, or the mount the volumes
+	// label picks.
 	label string
 	// path is the label path under HOST_PREFIX.
 	path string
@@ -407,32 +414,60 @@ type sourceReport struct {
 }
 
 // check parses the labels and checks the paths and, with kopia server, the
-// schedule.
-func (v *validator) check(ctx context.Context, input map[string]string) report {
+// schedule. c is the container the labels are of, whose mounts the volumes
+// label picks from; nil for labels given on their own.
+func (v *validator) check(ctx context.Context, input map[string]string, c *docker.Container) report {
 	v.checked++
 
-	spec, issues := labels.Parse(input, labels.Options{Prefix: v.prefix, Strict: v.strict})
+	opts := labels.Options{Prefix: v.prefix, Strict: v.strict}
+	spec, issues := labels.Parse(input, opts)
 	r := report{spec: spec, issues: issues, noLabels: !hasPrefixed(input, v.prefix), server: v.kopia != nil}
-	pathLabel := labels.Name(v.prefix, labels.KeyPath)
 
 	if v.kopia != nil {
 		v.checkCompressor(ctx, &r)
 	}
 
-	for _, p := range spec.Paths {
+	add := func(key, label, p string) {
 		sp, err := labels.SourcePathWithin(v.hostPrefix, v.watcherPrefix, p)
 		if err != nil {
-			r.addError(pathLabel, err.Error())
-			continue
+			r.addError(labels.Name(v.prefix, key), err.Error())
+			return
 		}
 
-		src := sourceReport{label: p, path: sp}
+		if slices.ContainsFunc(r.sources, func(s sourceReport) bool { return s.path == sp }) {
+			return
+		}
+
+		src := sourceReport{key: key, label: label, path: sp}
 
 		if v.kopia != nil {
 			v.checkSource(ctx, &r, &src)
 		}
 
 		r.sources = append(r.sources, src)
+	}
+
+	for _, p := range spec.Paths {
+		add(labels.KeyPath, p, p)
+	}
+
+	if len(spec.Volumes) > 0 && c == nil {
+		r.noMounts = true
+		return r
+	}
+
+	if c == nil {
+		return r
+	}
+
+	vols, volIssues := labels.VolumePaths(spec, *c, opts)
+	if spec.Enable {
+		r.issues = append(r.issues, volIssues...)
+		slices.SortStableFunc(r.issues, func(a, b labels.Issue) int { return strings.Compare(a.Label, b.Label) })
+	}
+
+	for _, vp := range vols {
+		add(labels.KeyVolumes, vp.String(), vp.Path)
 	}
 
 	return r
@@ -470,7 +505,7 @@ func (v *validator) checkCompressor(ctx context.Context, r *report) {
 // checkSource asks kopia server to normalize the path of src and to compute
 // its next snapshot times with the schedule of the labels.
 func (v *validator) checkSource(ctx context.Context, r *report, src *sourceReport) {
-	pathLabel := labels.Name(v.prefix, labels.KeyPath)
+	pathLabel := labels.Name(v.prefix, src.key)
 
 	source, err := v.kopia.ResolvePath(ctx, src.path)
 	if err != nil {
@@ -621,6 +656,11 @@ func (r report) print(w io.Writer, prefix, where string) {
 		_, _ = fmt.Fprintf(w, "    next snapshots (kopia server time): %s\n", strings.Join(times, ", "))
 	}
 
+	if r.noMounts {
+		_, _ = fmt.Fprintf(w, "\n%s: the paths of the mounts are only known for a container; use --container or --all\n",
+			labels.Name(prefix, labels.KeyVolumes))
+	}
+
 	if len(r.issues) > 0 {
 		_, _ = fmt.Fprintln(w)
 	}
@@ -744,6 +784,13 @@ func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 
 	row(labels.KeyEnable, strconv.FormatBool(spec.Enable))
 	row(labels.KeyPath, orNone(strings.Join(spec.Paths, ", "), "(none)"))
+	if len(spec.Volumes) > 0 {
+		row(labels.KeyVolumes, strings.Join(spec.Volumes, ", "))
+	}
+
+	if len(spec.ExcludeVolumes) > 0 {
+		row(labels.KeyExcludeVolumes, strings.Join(spec.ExcludeVolumes, ", "))
+	}
 	row(labels.KeySchedule, orNone(strings.Join(scheduleOf(spec.Policy), "; "), "(inherit from the parent policies)"))
 	row(labels.KeySnapshotOnStart, strconv.FormatBool(spec.SnapshotOnStart))
 	row(labels.KeySnapshotOnStop, strconv.FormatBool(spec.SnapshotOnStop))

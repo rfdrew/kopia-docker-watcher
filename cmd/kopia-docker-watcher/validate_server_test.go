@@ -558,7 +558,7 @@ func TestValidateContainers(t *testing.T) {
 			env:    []string{"LABEL_PREFIX", "backup"},
 			args:   []string{"--all"},
 			code:   1,
-			stdout: []string{"container broken (998877665544, created)", "error: backup.path: required when backup.enable is true"},
+			stdout: []string{"container broken (998877665544, created)", "error: backup.path: required when backup.enable is true, unless backup.volumes is set"},
 			absent: []string{"container web (a1b2c3d4e5f6, running)"},
 		},
 		{
