@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -378,6 +379,36 @@ func TestLogValueHidesSecrets(t *testing.T) {
 	}
 
 	for _, want := range []string{`"password_set":true`, `"notify_webhook":"https://hooks.example.com"`, `"url":"https://kopia:51515"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log output lacks %s: %s", want, out)
+		}
+	}
+}
+
+func TestNotifyWebhookURLWarns(t *testing.T) {
+	cfg, err := Load(base(EnvNotifyWebhookURL, "https://ntfy.example.com/backups"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "NOTIFY_WEBHOOK_URL is set, but this version sends no webhooks: nothing will be sent to it"
+	if !slices.Contains(cfg.Warnings, want) {
+		t.Errorf("Warnings = %q, want %q among them", cfg.Warnings, want)
+	}
+}
+
+func TestLogValueFormatsDurations(t *testing.T) {
+	cfg, err := Load(base())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", "config", cfg)
+
+	out := buf.String()
+	for _, want := range []string{`"reconcile_interval":"5m0s"`, `"cleanup_grace":"24h0m0s"`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("log output lacks %s: %s", want, out)
 		}

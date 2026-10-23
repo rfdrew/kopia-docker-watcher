@@ -231,7 +231,8 @@ Python version, mean `error`. Logs are JSON lines on stderr.
 
 ### `NOTIFY_WEBHOOK_URL`
 
-Reserved for notifications about errors. **v0.1.0 sends nothing to it.** The value is only checked: an
+Reserved for notifications about errors. **v0.1.0 sends nothing to it**, and the watcher logs a warning at
+start when it is set. The value is only checked: an
 `http://` or `https://` URL with a host and no fragment; a query is allowed. Errors and the start-up log never
 show more of it than the scheme and the host, since the URL may contain a token.
 

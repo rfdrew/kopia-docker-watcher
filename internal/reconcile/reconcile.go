@@ -385,6 +385,9 @@ type Reconciler struct {
 	waiting map[waitKey]bool
 	// startScanned is set once the first full reconcile is queued.
 	startScanned bool
+	// firstScan counts the passes of the first full reconcile until each
+	// of its paths had one; nil before and after.
+	firstScan *scanSummary
 	// deferred holds the paths whose start snapshot a pass put off until
 	// the next one; sweepDue those a full reconcile queued.
 	deferred map[string]bool
@@ -569,6 +572,7 @@ func (r *Reconciler) work(ctx, passCtx context.Context) {
 
 		res := r.reconcile(passCtx, p)
 		r.schedule(ctx, p, res)
+		r.noteFirstScan(p, res)
 
 		if r.afterPass != nil {
 			r.afterPass(p, res)

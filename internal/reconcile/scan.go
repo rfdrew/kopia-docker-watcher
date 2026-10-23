@@ -29,8 +29,11 @@ func (r *Reconciler) scanLoop(ctx context.Context) {
 
 				// The first full reconcile is the one of the watcher's
 				// start.
+				var first *scanSummary
+
 				if !r.startScanned {
 					r.startScanned = true
+					first = r.beginFirstScan(paths, containers)
 
 					if r.snapshotOnWatcherStart {
 						r.watcherStart(containers)
@@ -42,6 +45,12 @@ func (r *Reconciler) scanLoop(ctx context.Context) {
 				}
 
 				r.mu.Unlock()
+
+				// Logged before the paths are queued, so it comes before
+				// the summary of their passes.
+				if first != nil {
+					r.logFirstScanStart(first)
+				}
 
 				for _, p := range paths {
 					r.queue.addUnlessRetrying(p)
