@@ -27,6 +27,8 @@ const (
 	ReconcileRecovered Kind = "reconcile_recovered"
 	HookFailed         Kind = "hook_failed"
 	HookRecovered      Kind = "hook_recovered"
+	ReturnFailed       Kind = "return_failed"
+	ReturnRecovered    Kind = "return_recovered"
 )
 
 // Event is one notification.
@@ -40,20 +42,26 @@ type Event struct {
 	// Host is kopia server's host name; empty if not known yet.
 	Host string
 	// Reason is the snapshot's outcome, the kind of reconcile error
-	// (reconcile.Reason), or the hook (reconcile.HookPreExec or
-	// reconcile.HookPostExec).
+	// (reconcile.Reason), the hook (reconcile.HookPreExec or
+	// reconcile.HookPostExec), or how the container was taken down
+	// (reconcile.ModeStop or reconcile.ModePause).
 	Reason string
-	// Container is the container a hook ran in; empty for the other kinds.
+	// Container is the container a hook ran in, or that the watcher took
+	// down; empty for the other kinds.
 	Container string
 	// Error tells what went wrong; empty for a recovery.
 	Error string
+	// Note says, for a return_recovered of a container the watcher did
+	// not bring back itself, why it is no longer down: it is gone, or
+	// someone else started or stopped it. It is part of the message only.
+	Note string
 	// Since is when the path started failing; Time is now.
 	Since, Time time.Time
 }
 
 // Failing reports whether e is about a path that started failing.
 func (e Event) Failing() bool {
-	return e.Kind == SnapshotFailed || e.Kind == ReconcileFailed || e.Kind == HookFailed
+	return e.Kind == SnapshotFailed || e.Kind == ReconcileFailed || e.Kind == HookFailed || e.Kind == ReturnFailed
 }
 
 // Title is a one-line summary of e.
@@ -69,6 +77,14 @@ func (e Event) Title() string {
 		return "Backup hook failed: " + e.Path
 	case HookRecovered:
 		return "Backup hook works again: " + e.Path
+	case ReturnFailed:
+		return "Container left down after a backup: " + e.Container
+	case ReturnRecovered:
+		if e.Note != "" {
+			return "Container no longer held after a backup: " + e.Container
+		}
+
+		return "Container runs again after a backup: " + e.Container
 	default:
 		return "Backup labels apply again: " + e.Path
 	}
@@ -109,6 +125,21 @@ func (e Event) Message() string {
 		}
 	case HookRecovered:
 		fmt.Fprintf(&b, "The %s hook in %s for %s succeeded, after a failure at %s.", e.Reason, e.Container, where, stamp(e.Since))
+	case ReturnFailed:
+		verb := "start"
+		if e.Reason == reconcile.ModePause {
+			verb = "unpause"
+		}
+
+		fmt.Fprintf(&b, "kopia-docker-watcher cannot %s %s again after the snapshot of %s; it keeps trying", verb, e.Container, where)
+	case ReturnRecovered:
+		if e.Note != "" {
+			fmt.Fprintf(&b, "kopia-docker-watcher no longer tries to bring back %s after the snapshot of %s, as %s; it could not "+
+				"bring it back at %s.", e.Container, where, e.Note, stamp(e.Since))
+		} else {
+			fmt.Fprintf(&b, "%s runs again after the snapshot of %s, after it could not be brought back at %s.", e.Container, where,
+				stamp(e.Since))
+		}
 	}
 
 	if e.Failing() {

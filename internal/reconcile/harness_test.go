@@ -285,6 +285,7 @@ type recordedMetrics struct {
 	// hook results.
 	finished map[string][]backend.SnapshotResult
 	hooks    map[string][]HookResult
+	returns  map[string][]ReturnResult
 	// calls are all calls but ReconcileError, as "Method path", in order.
 	calls []string
 }
@@ -387,6 +388,26 @@ func (m *recordedMetrics) HookFinished(path string, res HookResult) {
 
 	m.hooks[path] = append(m.hooks[path], res)
 	m.call("HookFinished", path)
+}
+
+func (m *recordedMetrics) ContainerReturned(path string, res ReturnResult) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.returns == nil {
+		m.returns = map[string][]ReturnResult{}
+	}
+
+	m.returns[path] = append(m.returns[path], res)
+	m.call("ContainerReturned", path)
+}
+
+// returnResults returns the returns reported for p.
+func (m *recordedMetrics) returnResults(p string) []ReturnResult {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return slices.Clone(m.returns[p])
 }
 
 // hookResults returns the hook results reported for p.

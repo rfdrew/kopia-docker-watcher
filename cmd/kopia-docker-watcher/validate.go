@@ -21,6 +21,7 @@ import (
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
 	"github.com/rfdrew/kopia-docker-watcher/internal/kopiaclient"
 	"github.com/rfdrew/kopia-docker-watcher/internal/labels"
+	"github.com/rfdrew/kopia-docker-watcher/internal/reconcile"
 	"github.com/rfdrew/kopia-docker-watcher/internal/version"
 )
 
@@ -304,11 +305,32 @@ func (v *validator) checkContainers(ctx context.Context, d deps, names []string,
 		first = false
 	}
 
+	// The names of depends-on labels are looked up among all containers,
+	// listed once.
+	var dependsOn map[string][]string
+
 	report := func(c docker.Container) {
 		begin()
 		_, _ = fmt.Fprintf(d.stdout, "container %s (%s, %s)\n", printable(c.Name), shortID(c.ID), printable(string(c.State)))
 
 		r := v.check(ctx, c.Labels, &c)
+
+		if names, bad := labels.DependsOn(c.Labels, v.prefix); len(names)+len(bad) > 0 {
+			if dependsOn == nil {
+				listing, err := listContainers(ctx, engine)
+				if err != nil {
+					listing = nil
+					r.addError(labels.Name(v.prefix, labels.KeyDependsOn), "cannot list the containers to check the names: "+err.Error())
+				}
+
+				dependsOn = reconcile.DependsOnProblems(listing, v.prefix)
+			}
+
+			for _, p := range dependsOn[c.ID] {
+				r.addError(labels.Name(v.prefix, labels.KeyDependsOn), p)
+			}
+		}
+
 		r.print(d.stdout, v.prefix, "on this container")
 
 		if r.issues.HasErrors() {
@@ -346,13 +368,18 @@ func inspect(ctx context.Context, engine docker.Engine, name string) (docker.Con
 	return engine.Inspect(ctx, name)
 }
 
-// enabledContainers lists the containers with the enable label, whatever
-// its value, sorted by name.
-func (v *validator) enabledContainers(ctx context.Context, engine docker.Engine) ([]docker.Container, error) {
+// listContainers lists all containers within dockerTimeout.
+func listContainers(ctx context.Context, engine docker.Engine) ([]docker.Container, error) {
 	ctx, cancel := context.WithTimeout(ctx, dockerTimeout)
 	defer cancel()
 
-	all, err := engine.Containers(ctx)
+	return engine.Containers(ctx)
+}
+
+// enabledContainers lists the containers with the enable label, whatever
+// its value, sorted by name.
+func (v *validator) enabledContainers(ctx context.Context, engine docker.Engine) ([]docker.Container, error) {
+	all, err := listContainers(ctx, engine)
 	if err != nil {
 		return nil, err
 	}
@@ -810,6 +837,13 @@ func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 		row(labels.KeyPreExec, hookCommand(spec.PreExec))
 		row(labels.KeyPostExec, hookCommand(spec.PostExec))
 		row(labels.KeyHookTimeout, cmp.Or(spec.HookTimeout, labels.DefaultHookTimeout).String())
+		row(labels.KeyStopDuringBackup, strconv.FormatBool(spec.StopDuringBackup))
+		row(labels.KeyPauseDuringBackup, strconv.FormatBool(spec.PauseDuringBackup))
+		row(labels.KeyMaxDowntime, cmp.Or(spec.MaxDowntime, labels.DefaultMaxDowntime).String())
+	}
+
+	if len(spec.DependsOn) > 0 {
+		row(labels.KeyDependsOn, strings.Join(spec.DependsOn, ", "))
 	}
 
 	_ = tw.Flush()
@@ -817,6 +851,14 @@ func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 	if spec.Hooks {
 		_, _ = fmt.Fprintln(w, "\nhooks: the watcher takes the scheduled snapshots of these sources itself and runs the hooks around them; "+
 			"kopia server's schedule of them stays off")
+	}
+
+	switch {
+	case spec.StopDuringBackup && !spec.PauseDuringBackup:
+		_, _ = fmt.Fprintln(w, "downtime: the container, and every running container that depends on it, is stopped for each "+
+			"snapshot the watcher takes and started again after it")
+	case spec.PauseDuringBackup && !spec.StopDuringBackup:
+		_, _ = fmt.Fprintln(w, "downtime: the container is paused for each snapshot the watcher takes and unpaused after it")
 	}
 
 	printPolicyFields(w, spec.Policy)

@@ -36,6 +36,10 @@ type passResult struct {
 	// nextRun is when the watcher's own schedule of the source takes its
 	// next snapshot; zero when it takes none.
 	nextRun time.Time
+	// wake asks for another pass at that time at the latest, as when the
+	// containers of a snapshot with hooks have to come back then; zero for
+	// none.
+	wake time.Time
 	// problems were reported on the way; the pass went on without them.
 	problems []error
 	// outcome and paused say how the pass ended, for the summary of the
@@ -117,6 +121,9 @@ type pass struct {
 	due     time.Time
 	dueNext nextSchedule
 	nextRun time.Time
+	// wake is when the pass asks for the next pass at the latest; zero for
+	// no time.
+	wake time.Time
 
 	// plan is the plan the pass got to; outcome says why it stopped
 	// without one, or without applying it. unknown reports that kopia
@@ -143,7 +150,7 @@ func (r *Reconciler) reconcile(ctx context.Context, p string) passResult {
 
 	err := ps.run()
 	res := passResult{restarting: anyRestarting(ps.owners), problems: ps.problems,
-		recheck: err == nil && (ps.deferStart || ps.recheckSoon), sweep: ps.sweepDue, nextRun: ps.nextRun}
+		recheck: err == nil && (ps.deferStart || ps.recheckSoon), sweep: ps.sweepDue, nextRun: ps.nextRun, wake: ps.wake}
 
 	switch {
 	case err == nil:

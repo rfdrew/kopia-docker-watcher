@@ -31,8 +31,15 @@ var durationBuckets = []float64{1, 5, 15, 30, 60, 300, 900, 1800, 3600, 7200, 14
 // seconds: from a tenth of a second to two hours.
 var hookBuckets = []float64{0.1, 0.5, 1, 5, 15, 30, 60, 300, 900, 1800, 3600, 7200}
 
-// hooks are the values of the hook label.
-var hooks = []string{reconcile.HookPreExec, reconcile.HookPostExec}
+// hooks are the values of the hook label, modes those of the mode label.
+var (
+	hooks = []string{reconcile.HookPreExec, reconcile.HookPostExec}
+	modes = []string{reconcile.ModeStop, reconcile.ModePause}
+)
+
+// downtimeBuckets are the upper bounds of the downtime buckets, in
+// seconds: from a second to six hours.
+var downtimeBuckets = []float64{1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600, 7200, 21600}
 
 // Metrics holds the metrics the watcher serves on /metrics: its own, which
 // the reconciler reports through reconcile.Metrics, and those of the Go
@@ -56,6 +63,8 @@ type Metrics struct {
 	notifications   *prometheus.CounterVec
 	hookFailures    *prometheus.CounterVec
 	hookDuration    *prometheus.HistogramVec
+	downtime        *prometheus.HistogramVec
+	returnFailures  *prometheus.CounterVec
 
 	// mu guards sources, the sources reported as managed by path, and
 	// keeps the series of one source consistent with each other.
@@ -133,6 +142,19 @@ func New() *Metrics {
 			Help:      "How long the hook commands ran, by hook: pre-exec or post-exec, failed ones included.",
 			Buckets:   hookBuckets,
 		}, []string{"hook"}),
+		downtime: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "backup_downtime_seconds",
+			Help: "How long the containers the watcher stopped or paused for a snapshot were down, by mode: stop or " +
+				"pause, from the stop or pause until the watcher started or unpaused them again.",
+			Buckets: downtimeBuckets,
+		}, []string{"mode"}),
+		returnFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "return_failures_total",
+			Help: "Failed attempts to start or unpause again a container the watcher stopped or paused for a snapshot " +
+				"of a source; the watcher keeps trying.",
+		}, []string{"path", "container"}),
 	}
 
 	buildInfo := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
@@ -146,7 +168,7 @@ func New() *Metrics {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		buildInfo, m.lastSuccess, m.duration, m.failures, m.reconcileErrors, m.managed, m.paused, m.owner,
-		m.notifications, m.hookFailures, m.hookDuration,
+		m.notifications, m.hookFailures, m.hookDuration, m.downtime, m.returnFailures,
 	)
 
 	// Every kind and result starts at zero, so that the first shows as an
@@ -161,6 +183,10 @@ func New() *Metrics {
 
 	for _, h := range hooks {
 		m.hookDuration.WithLabelValues(h)
+	}
+
+	for _, mode := range modes {
+		m.downtime.WithLabelValues(mode)
 	}
 
 	m.countSources()
@@ -248,7 +274,23 @@ func (m *Metrics) ForgetSource(path string) {
 	m.paused.DeleteLabelValues(path)
 	m.owner.DeletePartialMatch(prometheus.Labels{"path": path})
 	m.hookFailures.DeletePartialMatch(prometheus.Labels{"path": path})
+	m.returnFailures.DeletePartialMatch(prometheus.Labels{"path": path})
 	m.countSources()
+}
+
+// ContainerReturned implements reconcile.Metrics: the downtime of a
+// container that the watcher brought back goes into the histogram, and an
+// attempt that failed counts as a failure of the container and its
+// source.
+func (m *Metrics) ContainerReturned(path string, res reconcile.ReturnResult) {
+	if res.Error != "" {
+		m.returnFailures.WithLabelValues(path, res.Container).Inc()
+		return
+	}
+
+	if res.Downtime > 0 {
+		m.downtime.WithLabelValues(res.Mode).Observe(res.Downtime.Seconds())
+	}
 }
 
 // HookFinished implements reconcile.Metrics: a hook that failed counts as

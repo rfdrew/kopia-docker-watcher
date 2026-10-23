@@ -686,6 +686,7 @@ func (ps *pass) requests() []snapRequest {
 	var (
 		reqs                  []snapRequest
 		startAsked, stopAsked bool
+		held                  = ps.heldByID()
 	)
 
 	for _, id := range order {
@@ -698,7 +699,9 @@ func (ps *pass) requests() []snapRequest {
 
 		sl := ps.snapshotLabels(pc)
 		c, found := ps.container(id)
-		running := found && c.State.Running()
+		// A container the watcher holds down for a snapshot still runs.
+		_, isHeld := held[id]
+		running := found && (c.State.Running() || isHeld)
 
 		// An event of a one-off container explains a change of the pause
 		// as well, but asks for no snapshot.
@@ -775,7 +778,7 @@ func (ps *pass) unseenRequests(startAsked, stopAsked bool) []snapRequest {
 			ps.events = append(ps.events, ev)
 			reqs = append(reqs, snapRequest{stop: true, reason: "stop of " + o.name + " without an event", container: o.snap.described,
 				event: &ev, pins: stopPins(o.snap, ps.started, ps.started)})
-		case wasPaused && !ps.want.Paused && !startAsked && o.snap.onStart && o.state.Running():
+		case wasPaused && !ps.want.Paused && !startAsked && o.snap.onStart && o.running():
 			ev := docker.Event{Kind: docker.KindStarted, Action: unseenStartAction, ContainerID: o.id, Name: o.name,
 				Labels: o.labels, Time: ps.started}
 			reqs = append(reqs, snapRequest{reason: "start of " + o.name + " without an event", minInterval: o.snap.minInterval,
@@ -966,6 +969,8 @@ func (ps *pass) triggerHooked(reqs []snapRequest, status *backend.SourceStatus, 
 		ps.log.Debug("not starting a snapshot with hooks: the watcher stops", attrs...)
 
 		return nil
+	case ps.waitsForHeld(reqs, attrs):
+		return nil
 	case ps.wrote && !ps.deferred:
 		ps.keepEvents(reqs)
 		ps.deferStart = true
@@ -989,6 +994,23 @@ func (ps *pass) triggerHooked(reqs []snapRequest, status *backend.SourceStatus, 
 	}
 
 	return ps.startHookRun(reqs, status, reasons)
+}
+
+// waitsForHeld reports whether a container the snapshot with hooks needs,
+// an owner or one it takes down, is held down for another snapshot: the
+// start events are kept, and a scheduled time stays due, until it is back.
+func (ps *pass) waitsForHeld(reqs []snapRequest, attrs []any) bool {
+	h, busy := ps.heldBusy(ps.downPlan(), "")
+	if !busy {
+		return false
+	}
+
+	ps.keepEvents(reqs)
+	ps.log.Debug("the snapshot waits: a container it needs is held down for another snapshot",
+		append(attrs, "container", h.Name, "held_for", h.Source.Path)...)
+	ps.waitFor(h.ID)
+
+	return true
 }
 
 // preExecRunning reports whether the snapshot with hooks under way of the

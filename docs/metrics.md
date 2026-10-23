@@ -22,6 +22,8 @@ the port.
 | [`kopia_watcher_source_owner`](#kopia_watcher_source_owner) | gauge | `path`, `container` | 1 for each container that backs up a source |
 | [`kopia_watcher_hook_failures_total`](#kopia_watcher_hook_failures_total) | counter | `path`, `hook` | Hook commands that failed |
 | [`kopia_watcher_hook_duration_seconds`](#kopia_watcher_hook_duration_seconds) | histogram | `hook` | How long the hook commands ran |
+| [`kopia_watcher_backup_downtime_seconds`](#kopia_watcher_backup_downtime_seconds) | histogram | `mode` | How long the containers stopped or paused for a snapshot were down |
+| [`kopia_watcher_return_failures_total`](#kopia_watcher_return_failures_total) | counter | `path`, `container` | Failed attempts to start or unpause such a container again |
 | [`kopia_watcher_notifications_total`](#kopia_watcher_notifications_total) | counter | `result` | Notifications to `NOTIFY_WEBHOOK_URL`: sent, failed, dropped |
 | `kopia_watcher_build_info` | gauge | `version` | Always 1; the version of the watcher |
 
@@ -155,6 +157,27 @@ reported it makes its series appear at 1.
 How long the hook commands ran, by `hook`, those that failed included; a hook that did not start, as Docker
 refused the exec or its labels have an error, does not count. The buckets are 0.1 s, 0.5 s, 1 s, 5 s, 15 s, 30 s, 1 min, 5 min, 15 min, 30 min, 1 h and 2 h. Both series
 are always there.
+
+### `kopia_watcher_backup_downtime_seconds`
+
+How long the containers the watcher [stopped or paused](labels.md#stopping-and-pausing) for a snapshot were down,
+by `mode`: `stop` or `pause`, from just before the watcher stopped or paused a container until it started or
+unpaused it again. A container that came back without the watcher, because someone else started it, does not
+count. The buckets are 1 s, 5 s, 15 s, 30 s, 1 min, 2 min, 5 min, 10 min, 30 min, 1 h, 2 h and 6 h. Both series are
+always there.
+
+### `kopia_watcher_return_failures_total`
+
+The attempts to start or unpause again a container the watcher stopped or paused for a snapshot of the source at
+`path` that failed, by container; the watcher keeps trying, with a growing delay. A series appears with the first
+failure and goes with the source. An increase means a container is down that should run:
+
+```yaml
+      - alert: KopiaContainerLeftDown
+        expr: increase(kopia_watcher_return_failures_total[15m]) > 0
+        annotations:
+          summary: "{{ $labels.container }} did not come back after the snapshot of {{ $labels.path }}"
+```
 
 ### `kopia_watcher_notifications_total`
 

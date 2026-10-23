@@ -53,6 +53,10 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
   each within `kopia.hook-timeout`. kopia server would take scheduled snapshots without the hooks, so the watcher
   takes the scheduled snapshots of such a source itself, at the times kopia server's policy gives, with
   `runMissed` honored, and keeps kopia server's schedule of it off.
+- [Stops or pauses](docs/labels.md#stopping-and-pausing) a container for its snapshots
+  (`kopia.stop-during-backup`, `kopia.pause-during-backup`), with the containers that depend on it
+  (`kopia.depends-on`), and starts it again after, at the latest after `kopia.max-downtime`, also when the
+  watcher stops; one the watcher left down when it crashed comes back when it starts again.
 - Writes `kopia.description` and `kopia.tags` into the snapshot description, for its own snapshots and for
   scheduled ones.
 - Several containers may share a path: the source is paused only when all of them are stopped.
@@ -79,8 +83,6 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
 
 Not supported yet:
 
-- No stopping or pausing a container for its snapshot (`stop-during-backup`, …), no `depends-on`. These label
-  names are reserved: the watcher warns that they are not supported by this version and ignores them.
 - No snapshot tags: kopia server cannot set them through its API yet, so `kopia.tags` go into the description.
 
 ## Requirements
@@ -90,7 +92,9 @@ container list, container inspect and the event stream: through `/var/run/docker
 [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) that allows `CONTAINERS` and `EVENTS`
 (see [examples/docker-compose.yml](examples/docker-compose.yml)). The health check pings the daemon (`/_ping`),
 which docker-socket-proxy allows by default. [Hooks](docs/labels.md#hooks) run with `docker exec`, which with
-docker-socket-proxy needs `EXEC=1` and `POST=1` as well (see [Docker](docs/configuration.md#docker)).
+docker-socket-proxy needs `EXEC=1` and `POST=1` as well, and [stopping and
+pausing](docs/labels.md#stopping-and-pausing) containers needs `POST=1` (see
+[Docker](docs/configuration.md#docker)).
 
 **kopia server.** The watcher is tested against the latest Kopia release, 0.23.1. kopia server must run with:
 

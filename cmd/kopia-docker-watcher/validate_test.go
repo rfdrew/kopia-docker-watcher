@@ -101,6 +101,28 @@ func TestValidate(t *testing.T) {
 					"kopia server's schedule of them stays off"},
 		},
 		{
+			name: "stop during backup",
+			args: []string{"kopia.enable=true", "kopia.path=/data", "kopia.stop-during-backup=true", "kopia.max-downtime=20m",
+				"kopia.depends-on=web, worker"},
+			stdout: []string{"kopia.stop-during-backup true", "kopia.pause-during-backup false", "kopia.max-downtime 20m0s",
+				"kopia.depends-on web, worker", "kopia.pre-exec (none)",
+				"downtime: the container, and every running container that depends on it, is stopped for each snapshot " +
+					"the watcher takes and started again after it"},
+		},
+		{
+			name: "pause during backup",
+			args: []string{"kopia.enable=true", "kopia.path=/data", "kopia.pause-during-backup=true"},
+			stdout: []string{"kopia.pause-during-backup true", "kopia.max-downtime 1h0m0s",
+				"downtime: the container is paused for each snapshot the watcher takes and unpaused after it"},
+		},
+		{
+			name: "stop and pause",
+			args: []string{"kopia.enable=true", "kopia.path=/data", "kopia.stop-during-backup=true", "kopia.pause-during-backup=true"},
+			code: 1,
+			stdout: []string{"error: kopia.pause-during-backup: cannot be used with kopia.stop-during-backup: " +
+				"a container is either stopped or paused"},
+		},
+		{
 			name:   "shell hook",
 			args:   []string{"kopia.enable=true", "kopia.path=/data", "kopia.post-exec=rm -f /data/db.sql && echo done > /data/log"},
 			stdout: []string{`kopia.post-exec ["sh","-c","rm -f /data/db.sql && echo done > /data/log"]`, "kopia.hook-timeout 10m0s"},

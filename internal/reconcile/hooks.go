@@ -202,8 +202,14 @@ func (ps *pass) startHookRun(reqs []snapRequest, status *backend.SourceStatus, r
 
 	ps.dropEvents(reqs)
 
-	ps.log.Info("snapshot with hooks started", "source", ps.src.String(), "reasons", reasons,
-		"pre_exec", targetNames(pre), "post_exec", targetNames(hookTargets(ps.owners, HookPostExec)))
+	attrs := []any{"source", ps.src.String(), "reasons", reasons, "pre_exec", targetNames(pre),
+		"post_exec", targetNames(hookTargets(ps.owners, HookPostExec))}
+
+	if plan := ps.downPlan(); len(plan.items) > 0 {
+		attrs = append(attrs, "take_down", downNames(plan.items))
+	}
+
+	ps.log.Info("snapshot with hooks started", attrs...)
 
 	if run.PreDone {
 		return ps.afterPre(run, status)
@@ -254,7 +260,11 @@ func (ps *pass) hookRun(status *backend.SourceStatus) error {
 	switch run.Phase {
 	case state.HookPre:
 		return ps.afterPre(*run, status)
+	case state.HookDown:
+		return ps.afterDown(*run, status)
 	case state.HookSnapshot:
+		// The retry loop brings the containers back by the run's ReturnBy,
+		// should the snapshot take longer.
 		i := slices.IndexFunc(rec.SnapshotWaits, func(w state.SnapshotWait) bool { return w.ID == run.WaitID })
 		if i >= 0 && rec.SnapshotWaits[i].Result == nil {
 			return nil
@@ -275,11 +285,9 @@ func (ps *pass) hookRun(status *backend.SourceStatus) error {
 	}
 }
 
-// afterPre queues the snapshot of a run whose pre-exec hooks succeeded, or
-// goes to the post-exec hooks of one whose hooks failed or could not queue
-// it. An error of kopia server that is tried again leaves the run for the
-// retry; any other ends it without a snapshot, so that it does not hold the
-// post-exec hooks, and the next snapshots, for good.
+// afterPre queues the snapshot of a run whose pre-exec hooks succeeded,
+// after it took down the containers that ask for it, or goes to the
+// post-exec hooks of one whose hooks failed or could not queue it.
 func (ps *pass) afterPre(run state.HookRun, status *backend.SourceStatus) error {
 	attrs := []any{"source", ps.src.String(), "reason", run.Reason}
 
@@ -297,6 +305,67 @@ func (ps *pass) afterPre(run state.HookRun, status *backend.SourceStatus) error 
 		ps.log.Warn("no snapshot: kopia server does not run snapshots of the source now", append(attrs, "status", string(status.Status))...)
 		return ps.toPost(run)
 	}
+
+	plan := ps.downPlan()
+	if plan.needed() {
+		return ps.toDown(run, plan)
+	}
+
+	// An owner another snapshot holds down comes back before this
+	// snapshot is queued.
+	if h, busy := ps.heldBusy(plan, run.ID); busy {
+		ps.log.Info("the snapshot waits: a container it needs is held down for another snapshot",
+			append(attrs, "container", h.Name, "held_for", h.Source.Path)...)
+		ps.waitFor(h.ID)
+
+		return nil
+	}
+
+	return ps.queueSnapshot(run)
+}
+
+// afterDown queues the snapshot of a run whose containers are down, or
+// goes to the post-exec hooks, which bring them back first, of one that
+// could not take them all down, or whose containers came back before the
+// snapshot could be queued: they had to by then, or the watcher stopped
+// meanwhile, or while it took them down, and brought them back. While the
+// watcher stops, it queues nothing.
+func (ps *pass) afterDown(run state.HookRun, status *backend.SourceStatus) error {
+	attrs := []any{"source", ps.src.String(), "reason", run.Reason}
+
+	switch {
+	case !run.DownDone:
+		ps.log.Warn("no snapshot: the watcher stopped while it took the containers down", attrs...)
+		return ps.toPost(run)
+	case run.DownError != "":
+		ps.metrics.ReconcileError(ps.path, ReasonDocker)
+		ps.log.Error("no snapshot: a container could not be stopped or paused for it", append(attrs, "error", run.DownError)...)
+
+		return ps.toPost(run)
+	case !ps.now().Before(run.ReturnBy):
+		ps.log.Warn("no snapshot: the containers had to come back before it could be queued; raise max-downtime",
+			append(attrs, "return_by", run.ReturnBy.Format(timeFormat))...)
+
+		return ps.toPost(run)
+	case run.DownTaken > len(ps.heldFor(ps.src, run.ID)):
+		ps.log.Warn("no snapshot: the containers came back before it could be queued, as the watcher stopped", attrs...)
+		return ps.toPost(run)
+	case ps.stopping():
+		return nil
+	case status != nil && status.Status == backend.StatusStopped:
+		ps.log.Warn("no snapshot: kopia server does not run snapshots of the source now", append(attrs, "status", string(status.Status))...)
+		return ps.toPost(run)
+	}
+
+	return ps.queueSnapshot(run)
+}
+
+// queueSnapshot queues the snapshot of a run that is ready for it. An
+// error of kopia server that is tried again leaves the run for the retry;
+// any other ends it without a snapshot, so that it does not hold the
+// post-exec hooks, and the next snapshots, for good.
+func (ps *pass) queueSnapshot(run state.HookRun) error {
+	attrs := []any{"source", ps.src.String(), "reason", run.Reason}
 
 	ticket, err := ps.backend.TriggerSnapshot(ps.ctx, ps.src)
 
@@ -336,14 +405,15 @@ func (ps *pass) afterPre(run state.HookRun, status *backend.SourceStatus) error 
 	return nil
 }
 
-// toPost runs the post-exec hooks of a run, which ends it. Without a
-// running owner that has one, the run ends at once. While no goroutine can
-// run them, as while the watcher stops, the run stays as it is, for a
-// later pass or the next start.
+// toPost brings back the containers the run took down and runs the
+// post-exec hooks of a run, which ends it. Without a container to bring
+// back and a running owner that has a post-exec hook, the run ends at
+// once. While no goroutine can run them, as while the watcher stops, the
+// run stays as it is, for a later pass or the next start.
 func (ps *pass) toPost(run state.HookRun) error {
-	post := hookTargets(ps.owners, HookPostExec)
+	post := ps.postTargets(run.ID)
 
-	if len(post) == 0 {
+	if len(post) == 0 && len(ps.heldFor(ps.src, run.ID)) == 0 {
 		ps.endHookRun(run.ID)
 		ps.log.Info("snapshot with hooks done", "source", ps.src.String(), "reason", run.Reason)
 
@@ -385,6 +455,25 @@ func (ps *pass) toPost(run state.HookRun) error {
 	ps.goHooks(ctx, run, HookPostExec, post)
 
 	return nil
+}
+
+// postTargets returns the owners whose post-exec hook the run runs: those
+// that run, and those it holds down, which it brings back before.
+func (ps *pass) postTargets(run string) []hookTarget {
+	held := map[string]bool{}
+	for _, h := range ps.heldFor(ps.src, run) {
+		held[h.ID] = true
+	}
+
+	var out []hookTarget
+
+	for _, o := range ps.owners {
+		if (o.state.Running() || held[o.id]) && o.hooks.post.isSet() {
+			out = append(out, hookTarget{id: o.id, name: o.name, hookCommand: o.hooks.post})
+		}
+	}
+
+	return out
 }
 
 // endHookRun removes the run with the ID from the record.
@@ -431,13 +520,30 @@ func (ps *pass) releaseHooks() {
 
 // goHooks runs the hook of the targets in the goroutine reserveHooks set
 // up, one target after the other, then stores the outcome in the run and
-// queues the path. Hooks a stop of the watcher cut short store nothing:
-// the next start takes them up.
+// queues the path. Before the post-exec hooks, it brings back the
+// containers the run took down; the post-exec hook of one that does not
+// come back is not run. Hooks a stop of the watcher cut short store
+// nothing: the next start takes them up.
 func (ps *pass) goHooks(ctx context.Context, run state.HookRun, hook string, targets []hookTarget) {
 	r, src, path, log := ps.Reconciler, ps.src, ps.path, ps.log
 
 	go func() {
 		defer r.hookers.Done()
+
+		if hook == HookPostExec {
+			// They stay held, as back, until the post-exec hooks are done,
+			// so that no other snapshot takes them down meanwhile.
+			failed := r.returnRun(ctx, log, src, run.ID, true)
+			defer r.releaseRun(src, run.ID)
+
+			targets = slices.DeleteFunc(slices.Clone(targets), func(t hookTarget) bool {
+				if failed[t.id] {
+					log.Warn("post-exec hook not run: the container did not come back", "hook", hook, "container", t.name)
+				}
+
+				return failed[t.id]
+			})
+		}
 
 		failure := r.runHooks(ctx, log, path, hook, targets)
 
@@ -519,9 +625,22 @@ func (r *Reconciler) runHook(ctx context.Context, log *slog.Logger, path, hook s
 	hctx, cancel := context.WithTimeout(ctx, t.timeout)
 	defer cancel()
 
+	// No snapshot of another source takes the container down meanwhile.
+	r.mu.Lock()
+	r.execs[t.id]++
+	r.mu.Unlock()
+
 	start := time.Now()
 	res, err := r.docker.Exec(hctx, t.id, t.cmd)
 	d := time.Since(start)
+
+	r.mu.Lock()
+	if r.execs[t.id]--; r.execs[t.id] <= 0 {
+		delete(r.execs, t.id)
+	}
+	r.mu.Unlock()
+
+	r.wakeWaiters(t.id)
 
 	if ctx.Err() != nil {
 		log.Warn(hook+" hook cut short: the watcher stops", attrs...)

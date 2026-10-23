@@ -1,5 +1,7 @@
 // Package docker is the watcher's view of the Docker Engine: containers with
-// their labels, state and mounts, and a stream of container events.
+// their labels, state and mounts, and a stream of container events, and the
+// few things it does to containers around their snapshots: run a hook
+// command, stop and start, pause and unpause.
 //
 // Reconciliation depends on the small Engine interface, so its tests run
 // against a fake Docker. Client implements Engine with the Docker SDK, and
@@ -53,6 +55,26 @@ type Engine interface {
 	// ctx ends first, Exec stops waiting; the command keeps running in the
 	// container, as Docker cannot stop it.
 	Exec(ctx context.Context, id string, cmd []string) (ExecResult, error)
+
+	// Stop stops the container id as docker stop does: its stop signal,
+	// then SIGKILL after its stop timeout (stop_grace_period in compose, 10
+	// seconds unless set). Stopping a container that is not running is no
+	// error. A missing container is ErrNotFound.
+	Stop(ctx context.Context, id string) error
+
+	// Start starts the container id. Starting a running container is no
+	// error. A missing container is ErrNotFound.
+	Start(ctx context.Context, id string) error
+
+	// Pause freezes the processes of the running container id. Pausing a
+	// paused container is no error. A container that is neither running nor
+	// paused is ErrNotRunning, a missing one ErrNotFound.
+	Pause(ctx context.Context, id string) error
+
+	// Unpause thaws the processes of the paused container id. Unpausing a
+	// running container is no error. A container that is neither paused nor
+	// running is ErrNotPaused, a missing one ErrNotFound.
+	Unpause(ctx context.Context, id string) error
 }
 
 // Container is a container as the reconciler needs it.
@@ -63,6 +85,9 @@ type Container struct {
 	Labels map[string]string
 	State  State
 	Mounts []Mount
+	// StartedAt is when Docker last started the container, by the daemon's
+	// clock; zero if it never ran. Only Inspect sets it.
+	StartedAt time.Time
 }
 
 // Mount is a volume or bind mount of a container.

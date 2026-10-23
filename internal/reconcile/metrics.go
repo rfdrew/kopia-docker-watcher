@@ -45,6 +45,37 @@ type Metrics interface {
 	// the hook, not from a pass. A hook cut short by the watcher's stop is
 	// not reported.
 	HookFinished(path string, res HookResult)
+
+	// ContainerReturned reports how the watcher brought back a container it
+	// stopped or paused for a snapshot of the source of a path: once it is
+	// running again, and each time an attempt fails. It comes from the
+	// goroutine that brought it back.
+	ContainerReturned(path string, res ReturnResult)
+}
+
+// Modes a container is taken down in, as ReturnResult.Mode has them.
+const (
+	ModeStop  = "stop"
+	ModePause = "pause"
+)
+
+// ReturnResult is how the watcher brought back a container it took down.
+type ReturnResult struct {
+	// Container is the name of the container.
+	Container string
+	// Mode is ModeStop or ModePause.
+	Mode string
+	// Downtime is how long the container was down, from the stop or pause
+	// to the start or unpause; zero when it is not running again, or came
+	// back without the watcher, as when someone else started it.
+	Downtime time.Duration
+	// Error tells why the container could not be brought back; empty when
+	// it is no longer down.
+	Error string
+	// Note says why a container the watcher failed to bring back before is
+	// no longer held, though the watcher did not bring it back: it is gone,
+	// or someone else started or stopped it; empty when it runs.
+	Note string
 }
 
 // Hook names, as HookResult.Hook has them.
@@ -87,6 +118,7 @@ func (noMetrics) LastSuccess(string, time.Time)                   {}
 func (noMetrics) ForgetSource(string)                             {}
 func (noMetrics) SnapshotFinished(string, backend.SnapshotResult) {}
 func (noMetrics) HookFinished(string, HookResult)                 {}
+func (noMetrics) ContainerReturned(string, ReturnResult)          {}
 
 // reportMetrics reports the source of the pass as managed, once its policy
 // step has succeeded, or drops what was reported about it when the

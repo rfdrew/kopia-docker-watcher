@@ -468,6 +468,13 @@ func (e *watchEngine) Exec(context.Context, string, []string) (docker.ExecResult
 	return docker.ExecResult{}, errors.New("no hooks in these tests")
 }
 
+func (e *watchEngine) Stop(context.Context, string) error    { return errNoHooks }
+func (e *watchEngine) Start(context.Context, string) error   { return errNoHooks }
+func (e *watchEngine) Pause(context.Context, string) error   { return errNoHooks }
+func (e *watchEngine) Unpause(context.Context, string) error { return errNoHooks }
+
+var errNoHooks = errors.New("no hooks in these tests")
+
 func (e *watchEngine) Events(ctx context.Context, _ time.Time) (<-chan docker.Event, <-chan error) {
 	e.mu.Lock()
 	e.subs = append(e.subs, ctx)

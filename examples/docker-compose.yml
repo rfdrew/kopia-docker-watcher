@@ -125,7 +125,8 @@ services:
   # and remove group_add and the docker.sock mount from the watcher.
   # Hooks (kopia.pre-exec, kopia.post-exec) run with docker exec: they need
   # EXEC: 1 and POST: 1, which lets through every POST to containers too
-  # (../docs/configuration.md#docker).
+  # (../docs/configuration.md#docker). kopia.stop-during-backup and
+  # kopia.pause-during-backup need POST: 1.
   #
   # docker-socket-proxy:
   #   image: tecnativa/docker-socket-proxy:latest  # pin a version
