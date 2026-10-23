@@ -128,7 +128,12 @@ The commands assume the watcher runs as the service `watcher` of a compose proje
    ```
 
    It waits for kopia server, logs "connected to kopia server" and "watching containers", and then one line per
-   change it makes. Errors name the container or the path.
+   change it makes. Errors name the container or the path. Two lines sum up its start:
+
+   - "first full reconcile": how many containers it found, how many enable the backup, how many paths that gives;
+   - "first full reconcile done", once each of those paths had a pass: how many sources it registered, updated,
+     found up to date, paused, skipped or failed on. With no container enabling the backup it adds a hint about
+     the `kopia.enable` label.
 
 7. **Check the Kopia web UI**:
 

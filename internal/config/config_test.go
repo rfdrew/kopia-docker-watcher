@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -381,6 +382,18 @@ func TestLogValueHidesSecrets(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("log output lacks %s: %s", want, out)
 		}
+	}
+}
+
+func TestNotifyWebhookURLWarns(t *testing.T) {
+	cfg, err := Load(base(EnvNotifyWebhookURL, "https://ntfy.example.com/backups"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "NOTIFY_WEBHOOK_URL is set, but this version sends no webhooks: nothing will be sent to it"
+	if !slices.Contains(cfg.Warnings, want) {
+		t.Errorf("Warnings = %q, want %q among them", cfg.Warnings, want)
 	}
 }
 

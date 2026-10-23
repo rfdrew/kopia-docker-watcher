@@ -217,6 +217,10 @@ func Load(getenv func(string) string) (*Config, error) {
 		}
 
 		cfg.NotifyWebhookURL = v
+
+		// Read and checked now so that a configuration written for a later
+		// version keeps working, but nothing sends to it yet.
+		l.warnf("%s is set, but this version sends no webhooks: nothing will be sent to it", EnvNotifyWebhookURL)
 	}
 
 	if v := l.get(EnvLabelPrefix); v != "" {

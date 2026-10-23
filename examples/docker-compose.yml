@@ -60,8 +60,17 @@ services:
       - "127.0.0.1:51515:51515"
 
   watcher:
+    # :0.1 follows the latest 0.1.x release and appears with v0.1.0. To try a
+    # release candidate, name it exactly, as in :0.1.0-rc.2; candidates never
+    # move :0.1 or :latest.
     image: ghcr.io/rfdrew/kopia-docker-watcher:0.1
     restart: unless-stopped
+    # The default command is run. To see the plan first without changing
+    # anything, either run it once next to this service:
+    #   docker compose run --rm watcher run --dry-run
+    # or uncomment the line below; a dry run exits when it is done, so
+    # set restart: "no" for it as well.
+    # command: ["run", "--dry-run"]
     depends_on:
       - kopia
     # The image runs as the non-root user 65532. To read the Docker socket it

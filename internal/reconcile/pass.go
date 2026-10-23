@@ -34,6 +34,10 @@ type passResult struct {
 	sweep bool
 	// problems were reported on the way; the pass went on without them.
 	problems []error
+	// outcome and paused say how the pass ended, for the summary of the
+	// first full reconcile.
+	outcome passOutcome
+	paused  bool
 }
 
 // pass is one reconcile of one path.
@@ -129,6 +133,8 @@ func (r *Reconciler) reconcile(ctx context.Context, p string) passResult {
 		res.err = err
 		res.retry = ps.fail(err)
 	}
+
+	res.outcome, res.paused = ps.summarize(err)
 
 	ps.reportMetrics(err)
 
