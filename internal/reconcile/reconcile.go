@@ -117,24 +117,28 @@
 // from the policy the source would have without the hooks and the pause,
 // so cron, the interval, the times of day and what the source inherits
 // keep kopia server's meaning, and keeps the next time in the state: one
-// that passed while the watcher was not running, or while no owner ran,
-// is taken late only as kopia server would take a missed one, with an
-// interval, or with runMissed when the next time is more than half an hour
-// away. While no owner runs, no scheduled snapshot is taken, and nothing
-// is written to kopia server for that. Once no owner has hooks, the saved
-// section comes back as after a pause.
+// that passed while the watcher was not running, while no owner ran, or
+// while a snapshot with hooks was under way, is taken late only as kopia
+// server would take a missed one, with an interval, or with runMissed when
+// the next time is more than half an hour away. While no owner runs, no
+// scheduled snapshot is taken, and nothing is written to kopia server for
+// that; a source whose containers are all gone keeps its schedule for when
+// they come back. Once the owners have no hooks, the saved section comes
+// back as after a pause.
 //
 // Every snapshot of such a source the watcher takes, scheduled or at a
 // start, is a snapshot with hooks. The pre-exec hooks of the running owners
 // run one after the other, outside the passes, each within its timeout;
 // when one fails, no snapshot is taken. Otherwise the next pass queues the
-// snapshot, which a waiter follows as any other. Once it has ended, however
-// it ended, or once the pre-exec hooks failed, the post-exec hooks of the
-// running owners run. There is one such snapshot at a time per source, and
-// the state keeps how far it got, so that a restart of the watcher takes it
-// up: pre-exec hooks a stop of the watcher cut short count as failed,
-// post-exec hooks run again. A snapshot at a stop is taken without hooks:
-// they cannot run in a container that has stopped.
+// snapshot, which a waiter follows as any other; an error of kopia server
+// that is not retried ends the run without a snapshot. Once the snapshot
+// has ended, however it ended, or once there is none, the post-exec hooks
+// of the running owners run. There is one such snapshot at a time per
+// source, and the state keeps how far it got, so that a restart of the
+// watcher takes it up: pre-exec hooks a stop of the watcher cut short
+// count as failed, post-exec hooks run again. A snapshot at a stop is
+// taken without hooks; while pre-exec hooks run, it waits until their
+// snapshot is queued, so that it does not read a dump half written.
 //
 // # Cleanup
 //

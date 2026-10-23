@@ -94,8 +94,9 @@ type ContainerSpec struct {
 	// Hooks reports that the pre-exec or post-exec label is set, also
 	// when its value has an error. The watcher then takes the scheduled
 	// snapshots of the container's sources itself, so that the hooks run
-	// around them; a hook with an error fails the snapshots instead of
-	// letting them go without it.
+	// around them; a hook with an error fails when it is due, so a
+	// pre-exec hook with an error takes no snapshot rather than one
+	// without it.
 	Hooks bool
 
 	// HookTimeout bounds each hook command; zero means

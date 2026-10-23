@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
+	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
 	"github.com/rfdrew/kopia-docker-watcher/internal/labels"
 	"github.com/rfdrew/kopia-docker-watcher/internal/state"
 )
@@ -129,7 +130,10 @@ func targetNames(ts []hookTarget) []string {
 // the snapshot. Without a pre-exec hook, the snapshot is queued at once.
 // The run is stored first, with the time of the attempt, which the minimum
 // interval counts from even if no snapshot comes of it, and the waits the
-// requests take again go.
+// requests take again go; the run takes the requests, so a pass that
+// fails after it does not ask for them again. The goroutine is set up
+// before the run is stored: a run that no goroutine took would look like
+// one a stop of the watcher cut short.
 func (ps *pass) startHookRun(reqs []snapRequest, status *backend.SourceStatus, reasons []string) error {
 	now := ps.now()
 	desc, tags := ps.description(reqs)
@@ -155,6 +159,21 @@ func (ps *pass) startHookRun(reqs []snapRequest, status *backend.SourceStatus, r
 	pre := hookTargets(ps.owners, HookPreExec)
 	run.PreDone = len(pre) == 0
 
+	var hookCtx context.Context
+
+	if !run.PreDone {
+		ctx, ok := ps.reserveHooks(run.ID)
+		if !ok {
+			ps.keepEvents(reqs)
+			ps.log.Debug("not starting a snapshot with hooks now: hooks of the source run, or the watcher stops",
+				"source", ps.src.String(), "reasons", reasons)
+
+			return nil
+		}
+
+		hookCtx = ctx
+	}
+
 	err := ps.store.Update(ps.src, func(r *state.Record) error {
 		if r.HookRun != nil {
 			return errNoChange
@@ -168,12 +187,19 @@ func (ps *pass) startHookRun(reqs []snapRequest, status *backend.SourceStatus, r
 		return nil
 	})
 
-	switch {
-	case errors.Is(err, errNoChange):
-		return nil
-	case storeErr(err) != nil:
+	if errors.Is(err, errNoChange) || storeErr(err) != nil {
+		if hookCtx != nil {
+			ps.releaseHooks()
+		}
+
+		if errors.Is(err, errNoChange) {
+			return nil
+		}
+
 		return storeErr(err)
 	}
+
+	ps.dropEvents(reqs)
 
 	ps.log.Info("snapshot with hooks started", "source", ps.src.String(), "reasons", reasons,
 		"pre_exec", targetNames(pre), "post_exec", targetNames(hookTargets(ps.owners, HookPostExec)))
@@ -182,9 +208,24 @@ func (ps *pass) startHookRun(reqs []snapRequest, status *backend.SourceStatus, r
 		return ps.afterPre(run, status)
 	}
 
-	ps.startHooks(run, HookPreExec, pre)
+	ps.goHooks(hookCtx, run, HookPreExec, pre)
 
 	return nil
+}
+
+// dropEvents removes the events of reqs from those of the pass, which a
+// pass that fails puts back.
+func (ps *pass) dropEvents(reqs []snapRequest) {
+	for _, r := range reqs {
+		if r.event == nil {
+			continue
+		}
+
+		ev := *r.event
+		ps.events = slices.DeleteFunc(ps.events, func(x docker.Event) bool {
+			return x.ContainerID == ev.ContainerID && x.Kind == ev.Kind && x.Action == ev.Action && x.Time.Equal(ev.Time)
+		})
+	}
 }
 
 // hookRun moves the snapshot with hooks under way on, as far as it can go
@@ -193,14 +234,19 @@ func (ps *pass) startHookRun(reqs []snapRequest, status *backend.SourceStatus, r
 // ended, however it ended, it runs the post-exec hooks. A phase that a stop
 // of the watcher cut short is taken up: pre-exec hooks it cut short count
 // as failed, as their effect is not known, and post-exec hooks run again.
-// While a goroutine runs hooks of the source, or is just done with them,
-// the pass leaves the run alone: the goroutine queues the path when it is
-// done.
+// While a goroutine runs hooks of the source, the pass leaves the run
+// alone: the goroutine queues the path when it is done. It stores what it
+// did before it counts as done, so a run read after that check is up to
+// date.
 func (ps *pass) hookRun(status *backend.SourceStatus) error {
+	if ps.hooksBusy() {
+		return nil
+	}
+
 	rec, _ := ps.store.Get(ps.src)
 
 	run := rec.HookRun
-	if run == nil || ps.hooksBusy() {
+	if run == nil {
 		return nil
 	}
 
@@ -230,7 +276,9 @@ func (ps *pass) hookRun(status *backend.SourceStatus) error {
 
 // afterPre queues the snapshot of a run whose pre-exec hooks succeeded, or
 // goes to the post-exec hooks of one whose hooks failed or could not queue
-// it.
+// it. An error of kopia server that is tried again leaves the run for the
+// retry; any other ends it without a snapshot, so that it does not hold the
+// post-exec hooks, and the next snapshots, for good.
 func (ps *pass) afterPre(run state.HookRun, status *backend.SourceStatus) error {
 	attrs := []any{"source", ps.src.String(), "reason", run.Reason}
 
@@ -250,13 +298,18 @@ func (ps *pass) afterPre(run state.HookRun, status *backend.SourceStatus) error 
 	}
 
 	ticket, err := ps.backend.TriggerSnapshot(ps.ctx, ps.src)
-	if errors.Is(err, backend.ErrNotImplemented) {
+
+	switch {
+	case errors.Is(err, backend.ErrNotImplemented):
 		ps.warnOnce("TriggerSnapshot", "the backend cannot queue snapshots; no snapshot is taken at container starts and stops")
 		return ps.toPost(run)
-	}
-
-	if err != nil {
+	case err == nil:
+	case ps.ctx.Err() != nil, errors.Is(err, backend.ErrWrongIdentity), backend.IsUnavailable(err), backend.IsTemporary(err):
 		return err
+	default:
+		ps.log.Warn("no snapshot: kopia server does not queue it", append(attrs, "error", err.Error())...)
+
+		return errors.Join(err, ps.toPost(run))
 	}
 
 	w := state.SnapshotWait{Ticket: ticket, Reason: run.Reason, Description: run.Description, Retried: run.Retried}
@@ -283,7 +336,9 @@ func (ps *pass) afterPre(run state.HookRun, status *backend.SourceStatus) error 
 }
 
 // toPost runs the post-exec hooks of a run, which ends it. Without a
-// running owner that has one, the run ends at once.
+// running owner that has one, the run ends at once. While no goroutine can
+// run them, as while the watcher stops, the run stays as it is, for a
+// later pass or the next start.
 func (ps *pass) toPost(run state.HookRun) error {
 	post := hookTargets(ps.owners, HookPostExec)
 
@@ -294,8 +349,24 @@ func (ps *pass) toPost(run state.HookRun) error {
 		return nil
 	}
 
+	ctx, ok := ps.reserveHooks(run.ID)
+	if !ok {
+		ps.log.Debug("not running the post-exec hooks now: hooks of the source run, or the watcher stops",
+			"source", ps.src.String(), "reason", run.Reason)
+
+		return nil
+	}
+
+	found := false
+
 	ps.updateRecord(ps.src, func(r *state.Record) bool {
-		if r.HookRun == nil || r.HookRun.ID != run.ID || r.HookRun.Phase == state.HookPost {
+		if r.HookRun == nil || r.HookRun.ID != run.ID {
+			return false
+		}
+
+		found = true
+
+		if r.HookRun.Phase == state.HookPost {
 			return false
 		}
 
@@ -304,8 +375,13 @@ func (ps *pass) toPost(run state.HookRun) error {
 		return true
 	})
 
+	if !found {
+		ps.releaseHooks()
+		return nil
+	}
+
 	run.Phase = state.HookPost
-	ps.startHooks(run, HookPostExec, post)
+	ps.goHooks(ctx, run, HookPostExec, post)
 
 	return nil
 }
@@ -323,36 +399,47 @@ func (ps *pass) endHookRun(id string) {
 	})
 }
 
-// startHooks runs the hook of the targets in a goroutine, one target after
-// the other, then stores the outcome in the run and queues the path. It
-// does nothing while Run is not running or is stopping, nor while another
-// goroutine runs hooks of the source: the run then waits in the state for
-// a later pass, or for the next start. The goroutine is counted under r.mu,
-// so Run, which waits for it after its passes, never misses one.
-func (ps *pass) startHooks(run state.HookRun, hook string, targets []hookTarget) {
-	r, src, path, log := ps.Reconciler, ps.src, ps.path, ps.log
+// reserveHooks sets up a goroutine to run the hooks of the run with the
+// ID, counted under r.mu so that Run, which waits for it after its
+// passes, never misses one, and returns the context the hooks run on. It
+// fails while Run is not running or is stopping, and while another
+// goroutine runs hooks of the source. goHooks starts it, releaseHooks
+// gives it up.
+func (ps *pass) reserveHooks(id string) (context.Context, bool) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
 
-	r.mu.Lock()
-
-	ctx := r.hookCtx
-
-	if r.runCtx == nil || r.runCtx.Err() != nil || ctx == nil || r.hooksRunning[src] != "" {
-		r.mu.Unlock()
-		log.Debug("not running hooks now; a later pass takes the snapshot with hooks up", "source", src.String(), "hook", hook)
-
-		return
+	if ps.runCtx == nil || ps.runCtx.Err() != nil || ps.hookCtx == nil || ps.hooksRunning[ps.src] != "" {
+		return nil, false
 	}
 
-	r.hooksRunning[src] = run.ID
-	r.hookers.Add(1)
-	r.mu.Unlock()
+	ps.hooksRunning[ps.src] = id
+	ps.hookers.Add(1)
+
+	return ps.hookCtx, true
+}
+
+// releaseHooks gives up the goroutine reserveHooks set up.
+func (ps *pass) releaseHooks() {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	delete(ps.hooksRunning, ps.src)
+	ps.hookers.Done()
+}
+
+// goHooks runs the hook of the targets in the goroutine reserveHooks set
+// up, one target after the other, then stores the outcome in the run and
+// queues the path. Hooks a stop of the watcher cut short store nothing:
+// the next start takes them up.
+func (ps *pass) goHooks(ctx context.Context, run state.HookRun, hook string, targets []hookTarget) {
+	r, src, path, log := ps.Reconciler, ps.src, ps.path, ps.log
 
 	go func() {
 		defer r.hookers.Done()
 
 		failure := r.runHooks(ctx, log, path, hook, targets)
 
-		// Hooks cut short by the stop are taken up after the next start.
 		if ctx.Err() == nil {
 			r.updateRecord(src, func(rec *state.Record) bool {
 				if rec.HookRun == nil || rec.HookRun.ID != run.ID {
@@ -452,7 +539,12 @@ func (r *Reconciler) runHook(ctx context.Context, log *slog.Logger, path, hook s
 		msg = fmt.Sprintf("exited with code %d", res.ExitCode)
 	}
 
-	attrs = append(attrs, "duration", d.String())
+	if res.Started {
+		attrs = append(attrs, "duration", d.String())
+	} else {
+		// A hook Docker did not start has no duration.
+		d = 0
+	}
 
 	if out := strings.TrimRight(string(res.Output), "\n"); out != "" {
 		attrs = append(attrs, "output", out)

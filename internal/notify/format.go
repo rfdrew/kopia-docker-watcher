@@ -43,6 +43,8 @@ type Event struct {
 	// (reconcile.Reason), or the hook (reconcile.HookPreExec or
 	// reconcile.HookPostExec).
 	Reason string
+	// Container is the container a hook ran in; empty for the other kinds.
+	Container string
 	// Error tells what went wrong; empty for a recovery.
 	Error string
 	// Since is when the path started failing; Time is now.
@@ -101,12 +103,12 @@ func (e Event) Message() string {
 			where, stamp(e.Since))
 	case HookFailed:
 		if e.Reason == reconcile.HookPreExec {
-			fmt.Fprintf(&b, "The %s hook of %s failed, so no snapshot was taken", e.Reason, where)
+			fmt.Fprintf(&b, "The %s hook in %s for %s failed, so no snapshot was taken", e.Reason, e.Container, where)
 		} else {
-			fmt.Fprintf(&b, "The %s hook of %s failed", e.Reason, where)
+			fmt.Fprintf(&b, "The %s hook in %s for %s failed", e.Reason, e.Container, where)
 		}
 	case HookRecovered:
-		fmt.Fprintf(&b, "The %s hook of %s succeeded, after a failure at %s.", e.Reason, where, stamp(e.Since))
+		fmt.Fprintf(&b, "The %s hook in %s for %s succeeded, after a failure at %s.", e.Reason, e.Container, where, stamp(e.Since))
 	}
 
 	if e.Failing() {
@@ -139,6 +141,7 @@ type payload struct {
 	Containers []string  `json:"containers"`
 	Host       string    `json:"host,omitempty"`
 	Reason     string    `json:"reason,omitempty"`
+	Container  string    `json:"container,omitempty"`
 	Error      string    `json:"error,omitempty"`
 	Since      time.Time `json:"since"`
 	Time       time.Time `json:"time"`
@@ -218,7 +221,7 @@ func (n *Notifier) request(ctx context.Context, e Event) (*http.Request, error) 
 
 		body, err = json.Marshal(payload{
 			Event: e.Kind, Status: status, Title: e.Title(), Message: e.Message(), Path: e.Path,
-			Containers: containers, Host: e.Host, Reason: e.Reason, Error: e.Error,
+			Containers: containers, Host: e.Host, Reason: e.Reason, Container: e.Container, Error: e.Error,
 			Since: e.Since.UTC(), Time: e.Time.UTC(), Version: version.Version,
 		})
 	}

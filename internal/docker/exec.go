@@ -5,13 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"time"
 	"unicode/utf8"
 
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/pkg/stdcopy"
-	"github.com/moby/moby/api/types"
 	"github.com/moby/moby/client"
 )
 
@@ -24,28 +22,37 @@ var ErrNotRunning = errors.New("container is not running")
 
 // ExecResult is how a command run with Exec ended.
 type ExecResult struct {
+	// Started reports that Docker started the command; when it is false,
+	// the exec could not be created or started, and nothing ran.
+	Started bool
 	// ExitCode is the exit code of the command.
 	ExitCode int
 	// Output is what the command wrote to stdout and stderr, interleaved,
 	// at most the last MaxExecOutput bytes of it; Truncated reports that
-	// what came before was dropped.
+	// what came before was dropped. A command Exec stopped waiting for
+	// has the output it wrote until then.
 	Output    []byte
 	Truncated bool
 }
 
-// execExitPolls and execExitPoll bound how long Exec waits for the daemon
-// to record the exit code once the output has ended: the stream can end a
-// moment before the daemon marks the process as exited.
+// execExitPoll and execExitPollMax are the first and the longest delay
+// between the checks for the exit code once the output has ended. The
+// stream can end a moment before the daemon marks the process as exited,
+// and much earlier when a proxy closes a connection that was silent for
+// too long, as docker-socket-proxy does after ten minutes.
 const (
-	execExitPolls = 50
-	execExitPoll  = 100 * time.Millisecond
+	execExitPoll    = 100 * time.Millisecond
+	execExitPollMax = 5 * time.Second
 )
 
 // Exec runs cmd in the running container id as docker exec does, without a
 // terminal or input, and waits until it exits. A command that exits with a
 // code other than zero is no error: the result tells. When ctx ends first,
-// Exec stops waiting and returns an error that wraps ctx's: Docker cannot
-// stop the command, which keeps running in the container.
+// Exec stops waiting and returns an error that wraps ctx's, with the output
+// so far: Docker cannot stop the command, which keeps running in the
+// container. When the output ends before the command, as when a proxy
+// closes the connection, Exec asks Docker for the exit code until the
+// command has exited or ctx ends.
 func (c *Client) Exec(ctx context.Context, id string, cmd []string) (ExecResult, error) {
 	created, err := c.api.ExecCreate(ctx, id, client.ExecCreateOptions{Cmd: cmd, AttachStdout: true, AttachStderr: true})
 	if err != nil {
@@ -64,46 +71,47 @@ func (c *Client) Exec(ctx context.Context, id string, cmd []string) (ExecResult,
 	stop := context.AfterFunc(ctx, attached.Close)
 	defer stop()
 
+	// Without a terminal the stream is always multiplexed. Daemons before
+	// API 1.42 label it as a raw stream all the same, so the label is not
+	// asked. A read error ends the output like its end does: a connection
+	// cut short, and the exit code tells whether the command ended.
 	out := &tailBuffer{max: MaxExecOutput}
+	_, _ = stdcopy.StdCopy(out, out, attached.Reader)
 
-	if mt, ok := attached.MediaType(); ok && mt == types.MediaTypeRawStream {
-		_, err = io.Copy(out, attached.Reader)
-	} else {
-		_, err = stdcopy.StdCopy(out, out, attached.Reader)
+	res := func() ExecResult {
+		return ExecResult{Started: true, Output: out.bytes(), Truncated: out.dropped}
 	}
 
 	if ctx.Err() != nil {
-		return ExecResult{}, fmt.Errorf("exec in container %s: %w", id, ctx.Err())
+		return res(), fmt.Errorf("exec in container %s: %w", id, ctx.Err())
 	}
 
-	if err != nil {
-		return ExecResult{}, fmt.Errorf("exec in container %s: read output: %w", id, err)
-	}
+	delay := execExitPoll
 
-	res := ExecResult{Output: out.bytes(), Truncated: out.dropped}
-
-	for range execExitPolls {
+	for {
 		ins, err := c.api.ExecInspect(ctx, created.ID, client.ExecInspectOptions{})
 		if err != nil {
-			return ExecResult{}, execError(ctx, id, "inspect exec", err)
+			return res(), execError(ctx, id, "inspect exec", err)
 		}
 
 		if !ins.Running {
-			res.ExitCode = ins.ExitCode
-			return res, nil
+			r := res()
+			r.ExitCode = ins.ExitCode
+
+			return r, nil
 		}
 
-		t := time.NewTimer(execExitPoll)
+		t := time.NewTimer(delay)
 
 		select {
 		case <-ctx.Done():
 			t.Stop()
-			return ExecResult{}, fmt.Errorf("exec in container %s: %w", id, ctx.Err())
+			return res(), fmt.Errorf("exec in container %s: %w", id, ctx.Err())
 		case <-t.C:
 		}
-	}
 
-	return ExecResult{}, fmt.Errorf("exec in container %s: the output ended, but Docker still reports the command running", id)
+		delay = min(2*delay, execExitPollMax)
+	}
 }
 
 // execError explains an error of an exec request.

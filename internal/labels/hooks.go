@@ -35,8 +35,9 @@ const commandHint = `a value that starts with [ is a JSON array of strings such 
 // never a shell command, so that a mistake in it is found here rather than
 // when the hook runs. An empty value is no hook. A value with an error is
 // no command, but it still marks the container as one with hooks: its
-// sources stay on the watcher's schedule, and the snapshots fail instead
-// of being taken without the hook.
+// sources stay on the watcher's schedule, and the hook fails when it is due
+// to run, so that a pre-exec hook with an error takes no snapshot instead
+// of one without the hook.
 func (p *parser) command(v string) []string {
 	s := strings.TrimSpace(v)
 	if s == "" {

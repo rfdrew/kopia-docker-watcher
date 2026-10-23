@@ -102,8 +102,8 @@ func TestValidate(t *testing.T) {
 		},
 		{
 			name:   "shell hook",
-			args:   []string{"kopia.enable=true", "kopia.path=/data", "kopia.post-exec=rm -f /data/db.sql"},
-			stdout: []string{`kopia.post-exec ["sh","-c","rm -f /data/db.sql"]`, "kopia.hook-timeout 10m0s"},
+			args:   []string{"kopia.enable=true", "kopia.path=/data", "kopia.post-exec=rm -f /data/db.sql && echo done > /data/log"},
+			stdout: []string{`kopia.post-exec ["sh","-c","rm -f /data/db.sql && echo done > /data/log"]`, "kopia.hook-timeout 10m0s"},
 		},
 		{
 			name:   "error",

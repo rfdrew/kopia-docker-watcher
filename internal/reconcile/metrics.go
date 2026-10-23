@@ -59,8 +59,9 @@ type HookResult struct {
 	Hook string
 	// Container is the name of the container the command ran in.
 	Container string
-	// Duration is how long the command ran; zero when it did not start,
-	// as when the container's hook labels have an error.
+	// Duration is how long the command ran; zero when it did not start:
+	// the container's hook labels have an error, or Docker refused the
+	// exec.
 	Duration time.Duration
 	// Error tells why the hook failed; empty when it succeeded.
 	Error string

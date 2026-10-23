@@ -22,8 +22,10 @@ const (
 	// scheduleTimes is how many upcoming times the watcher asks kopia
 	// server for: the first that is after the watcher's clock is taken, so
 	// one that kopia server's clock, a little behind, still sees ahead
-	// does not come twice.
-	scheduleTimes = previewCount
+	// does not come twice. When kopia server's clock is so far behind
+	// that none is, it asks for scheduleTimesFar.
+	scheduleTimes    = previewCount
+	scheduleTimesFar = 100
 )
 
 // nextSchedule is the next time of a schedule and what the effective
@@ -42,19 +44,20 @@ type nextSchedule struct {
 //
 // A time is due once it has passed. It is taken when this process had armed
 // a timer for it and the source was not paused meanwhile; one that passed
-// while the watcher did not run, or while no owner ran, is a missed one,
-// which is taken late only when the effective schedule has an interval, or
-// runs missed snapshots and the next time is more than missedWindow away,
-// as kopia server does. While no owner runs, nothing is taken, and a time
-// that comes meanwhile is judged once one runs again. While a snapshot
-// with hooks is under way, a time that is taken waits for it to end, as
-// kopia server queues a scheduled snapshot behind the upload that runs.
+// while the watcher did not run, while no owner ran, or while a snapshot
+// with hooks was under way, is a missed one, which is taken late only when
+// the effective schedule has an interval, or runs missed snapshots and the
+// next time is more than missedWindow away, as kopia server does once its
+// upload has ended. While no owner runs, nothing is taken, and a time that
+// comes meanwhile is judged once one runs again; a source whose containers
+// are all gone keeps its schedule for when they come back.
 //
 // The next time is worked out again from now once the due one is taken or
-// skipped, when the scheduling section of the path's policy changes, and
-// at every full reconcile, which sees changes of the parent policies; that
-// one only brings the time forward, so that clocks that differ a little
-// cannot skip a time.
+// skipped, when the scheduling section of the path's policy changes, which
+// drops a time of the old schedule that is due, and at every full
+// reconcile, which sees changes of the parent policies; that one keeps a
+// time due within clockSkew, which kopia server's clock, a little ahead,
+// may already be past.
 func (ps *pass) ownSchedule(rec state.Record) ([]snapRequest, error) {
 	ps.sched = rec.Schedule
 
@@ -99,21 +102,28 @@ func (ps *pass) ownSchedule(rec state.Record) ([]snapRequest, error) {
 	due := !sched.Next.IsZero() && !now.Before(sched.Next)
 
 	switch {
-	case due && !sched.Paused:
-		reqs, err = ps.dueRequest(rec, &sched, now)
-		if err != nil {
-			return nil, err
-		}
-	case !due && (fresh || sched.Basis != basis || ps.sweepDue):
+	case fresh || sched.Basis != basis:
+		// A new schedule: a time of the old one is not taken, even if due.
 		ns, err := ps.nextScheduled(now)
 		if err != nil {
 			return nil, err
 		}
 
-		if !fresh && sched.Basis == basis && sched.Next.After(now) && (ns.next.IsZero() || sched.Next.Before(ns.next)) {
-			// A full reconcile keeps a time that is still ahead: kopia
-			// server's clock, a little ahead of the watcher's, may already
-			// be past it.
+		setNext(&sched, ns)
+	case due && !sched.Paused:
+		reqs, err = ps.dueRequest(rec, &sched, now)
+		if err != nil {
+			return nil, err
+		}
+	case !due && ps.sweepDue:
+		ns, err := ps.nextScheduled(now)
+		if err != nil {
+			return nil, err
+		}
+
+		if sched.Next.After(now) && !sched.Next.After(now.Add(clockSkew)) && (ns.next.IsZero() || sched.Next.Before(ns.next)) {
+			// A time due within moments stays: kopia server's clock, a
+			// little ahead of the watcher's, may already be past it.
 			ns.next = sched.Next
 		}
 
@@ -149,7 +159,11 @@ func (ps *pass) dueRequest(rec state.Record, sched *state.Schedule, now time.Tim
 	attrs := []any{"source", ps.src.String(), "due", at.Format(timeFormat)}
 
 	if onTime && rec.HookRun != nil {
-		ps.log.Debug("the scheduled snapshot waits for the snapshot with hooks under way", attrs...)
+		// As kopia server does with a time that comes during an upload,
+		// it is judged as a missed one when the run has ended.
+		ps.disarm()
+		ps.log.Debug("the scheduled time came while a snapshot with hooks is under way; it counts as missed", attrs...)
+
 		return nil, nil
 	}
 
@@ -235,13 +249,18 @@ func (ps *pass) nextScheduled(after time.Time) (nextSchedule, error) {
 		preview = &p
 	}
 
-	var ns nextSchedule
+	ns := nextSchedule{next: firstAfter(preview.Times, after)}
 
-	for _, t := range preview.Times {
-		if t.After(after) {
-			ns.next = t
-			break
+	if ns.next.IsZero() && len(preview.Times) > 0 {
+		far, err := ps.backend.PreviewSchedule(ps.ctx, ps.src, ps.plan.Unpaused, scheduleTimesFar)
+		if err != nil {
+			return nextSchedule{}, err
 		}
+
+		ns.next = firstAfter(far.Times, after)
+		ps.warnOnce("clock "+ps.path, "kopia server's clock is behind the watcher's by more than the time between two "+
+			"scheduled snapshots; the watcher's schedule of sources with hooks follows the watcher's clock",
+			"source", ps.src.String(), "watcher_time", after.Format(timeFormat), "next_by_kopia", formatTime(preview.Times[0]))
 	}
 
 	var eff struct {
@@ -264,6 +283,17 @@ func (ps *pass) nextScheduled(after time.Time) (nextSchedule, error) {
 	return ns, nil
 }
 
+// firstAfter returns the first of times that is after t; zero if none.
+func firstAfter(times []time.Time, t time.Time) time.Time {
+	for _, x := range times {
+		if x.After(t) {
+			return x
+		}
+	}
+
+	return time.Time{}
+}
+
 // armSchedule arms the timer of the watcher's schedule of the source for
 // its next time, or disarms it while the source is paused or has no
 // schedule. A time that has passed is not armed again: the pass that takes
@@ -284,6 +314,14 @@ func (ps *pass) armSchedule() {
 	}
 }
 
+// disarm forgets the time armed for the path of the pass.
+func (ps *pass) disarm() {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	delete(ps.armed, ps.path)
+}
+
 // armedAt reports whether this process armed the timer of path for t.
 func (r *Reconciler) armedAt(path string, t time.Time) bool {
 	r.mu.Lock()
@@ -294,12 +332,12 @@ func (r *Reconciler) armedAt(path string, t time.Time) bool {
 	return ok && a.Equal(t)
 }
 
-// dropSchedule hands the schedule of a source that no longer has hooks back
-// to kopia server: the policy step of the pass has put back its scheduling
-// section.
+// dropSchedule hands the schedule of a source whose containers no longer
+// have hooks back to kopia server: the policy step of the pass has put
+// back its scheduling section, unless the source is paused.
 func (ps *pass) dropSchedule() {
-	ps.log.Info("kopia server takes the scheduled snapshots of the source again: no container of it runs hooks",
-		"source", ps.src.String(), "owners", ownerNames(ps.owners))
+	ps.log.Info("kopia server takes the scheduled snapshots of the source again: no container of it has hooks",
+		"source", ps.src.String(), "owners", ownerNames(ps.owners), "paused", ps.want.Paused)
 
 	ps.updateRecord(ps.src, func(r *state.Record) bool {
 		if r.Schedule == nil {
@@ -311,9 +349,7 @@ func (ps *pass) dropSchedule() {
 		return true
 	})
 
-	ps.mu.Lock()
-	delete(ps.armed, ps.path)
-	ps.mu.Unlock()
+	ps.disarm()
 }
 
 // schedulingBasis returns the scheduling section of policy as compact

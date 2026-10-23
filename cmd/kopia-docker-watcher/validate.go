@@ -822,18 +822,23 @@ func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 	printPolicyFields(w, spec.Policy)
 }
 
-// hookCommand shows the arguments of a hook command as a JSON array.
+// hookCommand shows the arguments of a hook command as a JSON array, with
+// <, > and & as they are.
 func hookCommand(args []string) string {
 	if len(args) == 0 {
 		return "(none)"
 	}
 
-	b, err := json.Marshal(args)
-	if err != nil {
+	var b strings.Builder
+
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+
+	if err := enc.Encode(args); err != nil {
 		return strings.Join(args, " ")
 	}
 
-	return string(b)
+	return strings.TrimSuffix(b.String(), "\n")
 }
 
 // scheduleOf returns the cron expressions the policy fields set, those of

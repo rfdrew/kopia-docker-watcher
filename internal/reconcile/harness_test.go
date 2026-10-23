@@ -32,6 +32,8 @@ type harness struct {
 	// opts are the options r was made with, for another Reconciler on the
 	// same fakes and state.
 	opts Options
+	// stopHooks ends the context withHooks gave the hooks and waiters.
+	stopHooks func()
 }
 
 type harnessOption func(*Options)

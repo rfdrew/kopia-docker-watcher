@@ -152,8 +152,8 @@ reported it makes its series appear at 1.
 
 ### `kopia_watcher_hook_duration_seconds`
 
-How long the hook commands ran, by `hook`, those that failed included; a hook that could not start does not
-count. The buckets are 0.1 s, 0.5 s, 1 s, 5 s, 15 s, 30 s, 1 min, 5 min, 15 min, 30 min, 1 h and 2 h. Both series
+How long the hook commands ran, by `hook`, those that failed included; a hook that did not start, as Docker
+refused the exec or its labels have an error, does not count. The buckets are 0.1 s, 0.5 s, 1 s, 5 s, 15 s, 30 s, 1 min, 5 min, 15 min, 30 min, 1 h and 2 h. Both series
 are always there.
 
 ### `kopia_watcher_notifications_total`

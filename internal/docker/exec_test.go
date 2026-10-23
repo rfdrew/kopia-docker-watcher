@@ -26,6 +26,12 @@ type fakeExecSpec struct {
 	exitCode       int
 	// hold, if set, keeps the command running until it is closed.
 	hold chan struct{}
+	// cut closes the stream after the output, before the command ends;
+	// inspects counts how many inspections report it running then.
+	cut      bool
+	inspects int
+	// raw labels the stream as raw, as daemons before API 1.42 do.
+	raw bool
 }
 
 // fakeExec is an exec created in the fake daemon.
@@ -95,6 +101,11 @@ func (f *fakeDocker) serveExec(w http.ResponseWriter, r *http.Request, path stri
 		if ok {
 			code := ex.spec.exitCode
 			resp = container.ExecInspectResponse{ID: eid, ContainerID: ex.container, Running: ex.running, ExitCode: &code}
+
+			if ex.spec.cut && ex.spec.inspects > 0 {
+				ex.spec.inspects--
+				resp.Running = true
+			}
 		}
 		f.mu.Unlock()
 
@@ -134,11 +145,21 @@ func (f *fakeDocker) startExec(w http.ResponseWriter, eid string) {
 
 	defer conn.Close()
 
-	_, _ = buf.WriteString("HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.multiplexed-stream\r\n" +
+	contentType := "application/vnd.docker.multiplexed-stream"
+	if ex.spec.raw {
+		contentType = "application/vnd.docker.raw-stream"
+	}
+
+	_, _ = buf.WriteString("HTTP/1.1 101 UPGRADED\r\nContent-Type: " + contentType + "\r\n" +
 		"Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
 	writeFrame(buf, 1, ex.spec.stdout)
 	writeFrame(buf, 2, ex.spec.stderr)
 	_ = buf.Flush()
+
+	if ex.spec.cut {
+		// A proxy closes the connection; the command goes on.
+		_ = conn.Close()
+	}
 
 	if ex.spec.hold != nil {
 		<-ex.spec.hold
@@ -181,7 +202,7 @@ func TestExec(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if res.ExitCode != 0 || string(res.Output) != "dumped\nwarning: x\n" || res.Truncated {
+	if !res.Started || res.ExitCode != 0 || string(res.Output) != "dumped\nwarning: x\n" || res.Truncated {
 		t.Fatalf("result %+v (%q)", res, res.Output)
 	}
 
@@ -198,12 +219,51 @@ func TestExec(t *testing.T) {
 		t.Fatalf("result %+v, %v", res, err)
 	}
 
-	if _, err := c.Exec(ctx, "stopped", []string{"true"}); !errors.Is(err, ErrNotRunning) {
-		t.Fatalf("stopped container: %v", err)
+	if res, err := c.Exec(ctx, "stopped", []string{"true"}); !errors.Is(err, ErrNotRunning) || res.Started {
+		t.Fatalf("stopped container: %+v, %v", res, err)
 	}
 
-	if _, err := c.Exec(ctx, "gone", []string{"true"}); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("missing container: %v", err)
+	if res, err := c.Exec(ctx, "gone", []string{"true"}); !errors.Is(err, ErrNotFound) || res.Started {
+		t.Fatalf("missing container: %+v, %v", res, err)
+	}
+}
+
+// A stream that ends before the command, as when a proxy closes a silent
+// connection, does not end the wait: Exec asks for the exit code until the
+// command has exited.
+func TestExecStreamCut(t *testing.T) {
+	f := newFakeDocker()
+	f.execSpecs = map[string]fakeExecSpec{"db": {stdout: "dumping\n", exitCode: 3, cut: true, inspects: 3}}
+	c := newFakeDockerClient(t, f)
+
+	res, err := c.Exec(t.Context(), "db", []string{"pg_dump"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !res.Started || res.ExitCode != 3 || string(res.Output) != "dumping\n" {
+		t.Fatalf("result %+v (%q)", res, res.Output)
+	}
+
+	f.mu.Lock()
+	left := f.execs["exec-1"].spec.inspects
+	f.mu.Unlock()
+
+	if left != 0 {
+		t.Fatalf("%d inspections reporting the command running left", left)
+	}
+}
+
+// A daemon before API 1.42 labels the multiplexed stream as raw; Exec reads
+// it as multiplexed all the same.
+func TestExecRawLabel(t *testing.T) {
+	f := newFakeDocker()
+	f.execSpecs = map[string]fakeExecSpec{"db": {stdout: "out\n", stderr: "err\n", raw: true}}
+	c := newFakeDockerClient(t, f)
+
+	res, err := c.Exec(t.Context(), "db", []string{"true"})
+	if err != nil || string(res.Output) != "out\nerr\n" {
+		t.Fatalf("result %+v (%q), %v", res, res.Output, err)
 	}
 }
 
@@ -239,9 +299,14 @@ func TestExecCanceled(t *testing.T) {
 
 	start := time.Now()
 
-	_, err := c.Exec(ctx, "db", []string{"sleep", "3600"})
+	res, err := c.Exec(ctx, "db", []string{"sleep", "3600"})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error %v", err)
+	}
+
+	// The output so far comes with the error.
+	if !res.Started || string(res.Output) != "started\n" {
+		t.Fatalf("result %+v (%q)", res, res.Output)
 	}
 
 	if d := time.Since(start); d > 5*time.Second {

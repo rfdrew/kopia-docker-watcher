@@ -59,8 +59,8 @@ type snapRequest struct {
 	// container is the container that asks, for the description: it may
 	// be gone already.
 	container describedContainer
-	// event is the start event to keep when the decision is put off to a
-	// later pass.
+	// event is the event to keep when the decision is put off to a later
+	// pass.
 	event *docker.Event
 
 	// retry marks a snapshot taken once more because the first was lost.
@@ -726,7 +726,7 @@ func (ps *pass) requests() []snapRequest {
 				reason += " without an event"
 			}
 
-			reqs = append(reqs, snapRequest{stop: true, reason: reason, container: sl.described})
+			reqs = append(reqs, snapRequest{stop: true, reason: reason, container: sl.described, event: s.died})
 		}
 	}
 
@@ -744,7 +744,9 @@ func (ps *pass) requests() []snapRequest {
 // schedule was in force: the policy of a source with hooks stays manual
 // while its owners run, and the schedule records the pause.
 func (ps *pass) unseenRequests(startAsked, stopAsked bool) []snapRequest {
-	if !ps.plan.Known || ps.sched == nil && ps.plan.Action == backend.ActionNone {
+	// A source that goes on the watcher's schedule keeps a manual policy,
+	// so a pause lifted meanwhile needs no write.
+	if !ps.plan.Known || ps.sched == nil && !ps.want.OwnSchedule && ps.plan.Action == backend.ActionNone {
 		return nil
 	}
 
@@ -759,9 +761,11 @@ func (ps *pass) unseenRequests(startAsked, stopAsked bool) []snapRequest {
 		switch {
 		case o.snap.oneOff:
 		case !wasPaused && ps.want.Paused && !stopAsked && o.snap.onStop:
-			ps.events = append(ps.events, docker.Event{Kind: docker.KindDied, Action: unseenStopAction, ContainerID: o.id,
-				Name: o.name, Labels: o.labels, Time: ps.started})
-			reqs = append(reqs, snapRequest{stop: true, reason: "stop of " + o.name + " without an event", container: o.snap.described})
+			ev := docker.Event{Kind: docker.KindDied, Action: unseenStopAction, ContainerID: o.id, Name: o.name,
+				Labels: o.labels, Time: ps.started}
+			ps.events = append(ps.events, ev)
+			reqs = append(reqs, snapRequest{stop: true, reason: "stop of " + o.name + " without an event", container: o.snap.described,
+				event: &ev})
 		case wasPaused && !ps.want.Paused && !startAsked && o.snap.onStart && o.state.Running():
 			ev := docker.Event{Kind: docker.KindStarted, Action: unseenStartAction, ContainerID: o.id, Name: o.name,
 				Labels: o.labels, Time: ps.started}
@@ -833,6 +837,12 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 		st = status.Status
 	}
 
+	if stop && !ps.due.IsZero() {
+		// A scheduled time that comes with a stop is taken by a pass soon
+		// after, with the hooks of the containers that still run.
+		ps.recheckSoon = true
+	}
+
 	switch {
 	case st == backend.StatusStopped:
 		ps.log.Warn("not queuing a snapshot: kopia server does not run snapshots of the source now",
@@ -843,6 +853,14 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 		return nil
 	case !stop && ps.want.OwnSchedule:
 		return ps.triggerHooked(reqs, status, reasons, attrs)
+	case stop && ps.preExecRunning():
+		// The snapshot with hooks under way is queued once its pre-exec
+		// hooks are done, after the stop; one taken now could read a dump
+		// half written.
+		ps.keepEvents(reqs)
+		ps.log.Info("the snapshot at the stop waits for the pre-exec hooks under way", attrs...)
+
+		return nil
 	case stop && st == backend.StatusPending:
 		ps.log.Info("not queuing a snapshot: the pending one starts after the stop and counts as the stop snapshot", attrs...)
 		ps.absorbStop(reqs, "", status)
@@ -877,7 +895,7 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 	}
 
 	if stop && ps.want.OwnSchedule {
-		ps.log.Warn("taking the snapshot at the stop without hooks: they cannot run in a container that has stopped", attrs...)
+		ps.log.Warn("taking the snapshot at the stop without hooks: hooks do not run around a snapshot at a stop", attrs...)
 	}
 
 	ticket, err := ps.backend.TriggerSnapshot(ps.ctx, ps.src)
@@ -964,7 +982,16 @@ func (ps *pass) triggerHooked(reqs []snapRequest, status *backend.SourceStatus, 
 	return ps.startHookRun(reqs, status, reasons)
 }
 
-// keepEvents keeps the start events of reqs for a later pass.
+// preExecRunning reports whether the snapshot with hooks under way of the
+// source has not queued its snapshot yet: its pre-exec hooks run, or have
+// just run.
+func (ps *pass) preExecRunning() bool {
+	rec, _ := ps.store.Get(ps.src)
+
+	return rec.HookRun != nil && rec.HookRun.Phase == state.HookPre
+}
+
+// keepEvents keeps the events of reqs for a later pass.
 func (ps *pass) keepEvents(reqs []snapRequest) {
 	for _, r := range reqs {
 		if r.event != nil {

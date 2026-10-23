@@ -138,6 +138,8 @@ type Fake struct {
 	badCrons map[string]bool
 	upcoming []time.Time
 	schedule func(scheduling json.RawMessage, now time.Time, n int) []time.Time
+	// inherited is the scheduling section the paths inherit, by field.
+	inherited map[string]json.RawMessage
 	// algorithms are the compression algorithms kopia server supports.
 	algorithms []backend.Algorithm
 
@@ -410,6 +412,23 @@ func (f *Fake) SetSchedule(fn func(scheduling json.RawMessage, now time.Time, n 
 	defer f.mu.Unlock()
 
 	f.schedule = fn
+}
+
+// SetInheritedScheduling sets the scheduling section every path inherits,
+// as from the global policy: PreviewSchedule merges its fields under those
+// of the previewed policy into the effective section, which SetSchedule's
+// function gets too. kopia server's default policy has
+// {"runMissed": true}. It panics on a section that is not a JSON object.
+func (f *Fake) SetInheritedScheduling(section string) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(section), &m); err != nil || m == nil {
+		panic("backendtest: SetInheritedScheduling needs a JSON object, got " + section)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.inherited = m
 }
 
 // QueueSnapshotResult queues the result of the next WaitSnapshot for src.
@@ -1013,6 +1032,12 @@ func (f *Fake) PreviewSchedule(ctx context.Context, src backend.Source, policy j
 
 	if sched == nil {
 		sched = map[string]json.RawMessage{}
+	}
+
+	for k, v := range f.inherited {
+		if _, ok := sched[k]; !ok {
+			sched[k] = v
+		}
 	}
 
 	section, err := json.Marshal(sched)

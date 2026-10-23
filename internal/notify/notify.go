@@ -13,9 +13,10 @@
 //     queued count: those kopia server takes on its schedule are for the
 //     notification profiles of kopia server;
 //   - a hook command that fails, as when it exits with a code other than
-//     zero, makes the hook of the path failing; the next run of that hook
-//     that succeeds makes it fine again. pre-exec and post-exec are
-//     followed apart;
+//     zero, makes that hook of that container failing; the next run of it
+//     that succeeds makes it fine again. Each hook of each container is
+//     followed apart, and forgotten when the container no longer backs the
+//     path up or has no hooks;
 //   - a pass that ends with an error, or with a problem with the labels,
 //     makes the path failing: at once for an error the watcher does not
 //     retry, such as a policy kopia server rejects, and for an error it
@@ -143,8 +144,8 @@ type Notifier struct {
 	reasons   map[string][]reconcile.Reason
 }
 
-// hookKey is a hook of the containers of a path.
-type hookKey struct{ path, hook string }
+// hookKey is a hook of a container of a path.
+type hookKey struct{ path, hook, container string }
 
 // track is a failing path.
 type track struct {
@@ -262,6 +263,15 @@ func (n *Notifier) Source(path string, s reconcile.SourceMetrics) {
 	defer n.mu.Unlock()
 
 	n.owners[path] = slices.Clone(s.Owners)
+
+	// The failing hooks of containers that no longer back the path up, or
+	// no longer have hooks, are forgotten: a failure after they come back
+	// is a new one.
+	for k := range n.hooks {
+		if k.path == path && (!s.Hooks || !slices.Contains(s.Owners, k.container)) {
+			delete(n.hooks, k)
+		}
+	}
 }
 
 // LastSuccess implements reconcile.Metrics; it does nothing.
@@ -283,12 +293,12 @@ func (n *Notifier) ForgetSource(path string) {
 	}
 }
 
-// HookFinished implements reconcile.Metrics: a hook of a path that fails
-// makes it failing, the next one that succeeds fine again, each hook on its
-// own.
+// HookFinished implements reconcile.Metrics: a hook of a container of a
+// path that fails makes it failing, the next run of it that succeeds fine
+// again, each hook of each container on its own.
 func (n *Notifier) HookFinished(path string, res reconcile.HookResult) {
 	now := n.opts.Now()
-	key := hookKey{path: path, hook: res.Hook}
+	key := hookKey{path: path, hook: res.Hook, container: res.Container}
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -302,10 +312,16 @@ func (n *Notifier) HookFinished(path string, res reconcile.HookResult) {
 		}
 
 		n.hooks[key] = &track{since: now, notified: true}
-		n.enqueue(n.event(HookFailed, path, now, now, res.Hook, res.Container+": "+res.Error))
+
+		e := n.event(HookFailed, path, now, now, res.Hook, res.Error)
+		e.Container = res.Container
+		n.enqueue(e)
 	case t != nil:
 		delete(n.hooks, key)
-		n.enqueue(n.event(HookRecovered, path, now, t.since, res.Hook, ""))
+
+		e := n.event(HookRecovered, path, now, t.since, res.Hook, "")
+		e.Container = res.Container
+		n.enqueue(e)
 	}
 }
 

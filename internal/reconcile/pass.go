@@ -93,6 +93,9 @@ type pass struct {
 	// whether the state has a record of it.
 	last backend.Applied
 	had  bool
+	// hadSchedule reports that the record held the watcher's own schedule
+	// of the source when the pass began.
+	hadSchedule bool
 
 	owners []owner
 	want   backend.Desired
@@ -293,6 +296,7 @@ func (ps *pass) run() error {
 
 	rec, had := ps.store.Get(src)
 	ps.last, ps.had = rec.Applied, had
+	ps.hadSchedule = rec.Schedule != nil
 	ps.owned = ownership{owners: rec.Owners, orphaned: rec.OrphanedSince}
 
 	// The owners go into the state with the changes of the record the pass
@@ -377,9 +381,12 @@ func (ps *pass) desire() bool {
 		}
 
 		// The containers are gone or no longer back the path up: pause
-		// the source and leave its fields as they are.
+		// the source and leave its fields as they are. A source on the
+		// watcher's own schedule stays on it, paused, so that a container
+		// recreated with hooks finds the times it missed.
 		ps.want.Patch = ps.last.Patch.Clone()
 		ps.want.Paused = true
+		ps.want.OwnSchedule = ps.hadSchedule
 		ps.fallback = true
 
 		return true

@@ -292,8 +292,8 @@ reports what only it sees:
   when it restarted. The next snapshot of the path the watcher takes that succeeds, or that saves nothing because
   nothing changed, sends "works again". Incomplete and canceled snapshots change nothing;
 - **a [hook](labels.md#hooks) that failed**: a `kopia.pre-exec` command, after which no snapshot was taken, or a
-  `kopia.post-exec` command. Each hook of a path is followed apart; its next run that succeeds sends "works
-  again";
+  `kopia.post-exec` command. Each hook of each container is followed apart; its next run that succeeds sends
+  "works again". A container that no longer backs the path up, or no longer has hooks, is forgotten;
 - **labels that cannot be applied** to a path: kopia server rejects the schedule, the policy or the path,
   containers that share the path disagree, a container's labels have errors, or `STATE_FILE` refuses a change.
   The first pass that applies the labels sends "works again".
@@ -367,7 +367,8 @@ The `json` format posts:
 | `containers` | the containers that back the path up, if the watcher manages it; may be empty |
 | `host` | kopia server's host name, the one its sources carry |
 | `reason` | for a snapshot its outcome (`failed`, `unknown`, `succeeded`, `identical`); for a hook `pre-exec` or `post-exec`; for the labels the kind of error, as the `kind` of [`kopia_watcher_reconcile_errors_total`](metrics.md#kopia_watcher_reconcile_errors_total); empty for `reconcile_recovered` |
-| `error` | what went wrong, at most 1000 characters, for a hook with the container first (`db: exited with code 1`); empty for a recovery |
+| `container` | for a hook, the container it ran in; left out for the other events |
+| `error` | what went wrong, at most 1000 characters; empty for a recovery |
 | `since` | when the path started failing |
 | `time` | when the notification was made |
 
@@ -426,8 +427,14 @@ What the watcher asks of Docker:
 Without hooks the watcher only reads, and the proxy can keep `POST=0`. With hooks it needs `POST=1`, which the
 proxy does not narrow down further: it then lets through every `POST` to the sections it allows, so with
 `CONTAINERS=1` also starting, stopping and removing containers. That is still less than the socket itself, which
-allows everything. A hook needs the upgraded connection of `POST /exec/{id}/start`, which docker-socket-proxy
-passes through.
+allows everything.
+
+A hook's output comes over the upgraded connection of `POST /exec/{id}/start`, which docker-socket-proxy passes
+through, but closes once nothing has gone over it for 10 minutes (HAProxy's `timeout client` and `timeout
+server`; set `timeout tunnel` in a proxy of your own for more). A hook that is silent for longer, such as
+`pg_dump -f` of a large database, still works: when the output ends early, the watcher asks Docker every few
+seconds whether the command has ended, until `kopia.hook-timeout`. Only the output after the cut is not
+logged.
 
 Unless `DOCKER_API_VERSION` sets it, the watcher negotiates the API version with the daemon; any daemon with API
 1.40 (Docker 19.03) or later works. The [health check](#health-check) pings the daemon (`/_ping`).

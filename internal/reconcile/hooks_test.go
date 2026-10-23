@@ -137,7 +137,8 @@ func TestKopiaSchedule(t *testing.T) {
 }
 
 // withHooks makes the passes of h run hooks and follow snapshots, as under
-// Run, and gives the fake kopia server's way of working out schedules.
+// Run, and gives the fake kopia server's way of working out schedules,
+// with runMissed from its default policy.
 func withHooks(h *harness) {
 	h.t.Helper()
 
@@ -147,12 +148,18 @@ func withHooks(h *harness) {
 		h.settle()
 	})
 
+	h.stopHooks = func() {
+		cancel()
+		h.settle()
+	}
+
 	h.r.mu.Lock()
 	h.r.runCtx = ctx
 	h.r.hookCtx = ctx
 	h.r.mu.Unlock()
 
 	h.fake.SetSchedule(kopiaSchedule)
+	h.fake.SetInheritedScheduling(`{"runMissed":true}`)
 }
 
 // settle waits until no hook runs and no snapshot is followed.
@@ -317,7 +324,7 @@ func TestHooksIntervalSchedule(t *testing.T) {
 	h.passAndSettle(app)
 	h.mustNext(app, t0.Add(30*time.Minute))
 
-	if s := h.schedule(app); !s.Interval || s.RunMissed {
+	if s := h.schedule(app); !s.Interval || !s.RunMissed {
 		t.Fatalf("schedule %+v", s)
 	}
 
@@ -362,6 +369,7 @@ func TestHooksMissedTimeOfDay(t *testing.T) {
 		taken     bool
 	}{
 		{"run missed", "true", 15 * time.Hour, true},
+		{"kopia's default", "", 15 * time.Hour, true},
 		{"without run missed", "false", 15 * time.Hour, false},
 		{"next one soon", "true", 38*time.Hour + 10*time.Minute, false},
 	} {
@@ -651,51 +659,79 @@ func TestHooksStartSnapshot(t *testing.T) {
 	h.mustTriggers(app, 1)
 }
 
-// A scheduled time that comes while a snapshot with hooks is under way
-// waits for it to end, then is taken.
+// A scheduled time that comes while a snapshot with hooks is under way is
+// judged as a missed one once it ends, as kopia server does once its
+// upload ends: taken with runMissed when the next time is far enough.
 func TestHooksScheduleWaitsForRun(t *testing.T) {
-	h := newHarness(t)
-	c := withClock(h)
-	withHooks(h)
-	h.engine.run("db", enable, pathLabel(app), noOnStart, preExec)
+	for _, tt := range []struct {
+		name      string
+		runMissed string
+		taken     bool
+	}{
+		{"run missed", "", true},
+		{"without run missed", "false", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			c := withClock(h)
+			withHooks(h)
+			h.engine.run("db", enable, pathLabel(app), noOnStart, preExec, "kopia.run-missed="+tt.runMissed)
 
-	release := make(chan struct{})
-	h.engine.setExec(func(ctx context.Context, _ docker.Container, _ []string) (docker.ExecResult, error) {
-		select {
-		case <-release:
-		case <-ctx.Done():
-		}
+			release := make(chan struct{})
+			h.engine.setExec(func(ctx context.Context, _ docker.Container, _ []string) (docker.ExecResult, error) {
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
 
-		return docker.ExecResult{}, ctx.Err()
-	})
+				return docker.ExecResult{}, ctx.Err()
+			})
 
-	h.passAndSettle(app)
+			h.passAndSettle(app)
 
-	c.add(time.Hour)
-	h.mustPass(app)
-	h.mustNext(app, t0.Add(2*time.Hour))
+			c.add(time.Hour)
+			h.mustPass(app)
+			h.mustNext(app, t0.Add(2*time.Hour))
 
-	// The pre-exec hook still runs at the next time.
-	c.add(time.Hour)
-	h.mustPass(app)
-	h.mustNext(app, t0.Add(2*time.Hour))
+			// The pre-exec hook still runs at the next time.
+			c.add(time.Hour)
+			h.mustPass(app)
+			h.mustNext(app, t0.Add(2*time.Hour))
 
-	if run := h.record(app).HookRun; run == nil || run.Reason != "schedule" || run.PreDone {
-		t.Fatalf("hook run %+v", run)
+			if run := h.record(app).HookRun; run == nil || run.Reason != "schedule" || run.PreDone {
+				t.Fatalf("hook run %+v", run)
+			}
+
+			close(release)
+			h.settle()
+
+			// The first run queues its snapshot and ends; the time that came
+			// meanwhile is judged then.
+			h.passAndSettle(app)
+			h.passAndSettle(app)
+			h.mustTriggers(app, 1)
+			h.mustNext(app, t0.Add(3*time.Hour))
+
+			if !tt.taken {
+				if run := h.record(app).HookRun; run != nil {
+					t.Fatalf("hook run %+v", run)
+				}
+
+				if !h.logged("skipping a scheduled snapshot the watcher missed") {
+					t.Fatalf("no skip logged:\n%s", h.logs)
+				}
+
+				return
+			}
+
+			if run := h.record(app).HookRun; run == nil || !strings.HasPrefix(run.Reason, "missed schedule at ") {
+				t.Fatalf("hook run %+v\nlog:\n%s", run, h.logs)
+			}
+
+			h.takeScheduled(app)
+			h.mustTriggers(app, 2)
+		})
 	}
-
-	close(release)
-	h.settle()
-
-	// The first run queues its snapshot and ends; the waiting time is
-	// taken next.
-	h.passAndSettle(app)
-	h.passAndSettle(app)
-	h.mustTriggers(app, 1)
-
-	h.takeScheduled(app)
-	h.mustTriggers(app, 2)
-	h.mustNext(app, t0.Add(3*time.Hour))
 }
 
 // A stop of the watcher that cut the pre-exec hooks short takes no

@@ -84,7 +84,7 @@ func (f *fakeEngine) Inspect(ctx context.Context, id string) (docker.Container, 
 
 // Exec implements docker.Engine: a container that does not exist is
 // docker.ErrNotFound, one that does not run docker.ErrNotRunning; any
-// other runs f.exec.
+// other runs f.exec, and the command counts as started.
 func (f *fakeEngine) Exec(ctx context.Context, id string, cmd []string) (docker.ExecResult, error) {
 	f.mu.Lock()
 
@@ -102,10 +102,13 @@ func (f *fakeEngine) Exec(ctx context.Context, id string, cmd []string) (docker.
 	case c.State != docker.StateRunning:
 		return docker.ExecResult{}, fmt.Errorf("exec in container %s: %w", id, docker.ErrNotRunning)
 	case run == nil:
-		return docker.ExecResult{}, ctx.Err()
+		return docker.ExecResult{Started: true}, ctx.Err()
 	}
 
-	return run(ctx, cloneContainer(c), cmd)
+	res, err := run(ctx, cloneContainer(c), cmd)
+	res.Started = true
+
+	return res, err
 }
 
 // containerID returns the ID of the container with the name.
