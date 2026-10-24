@@ -223,7 +223,7 @@ translation lags behind. `make docs-check` reports missing and outdated translat
 
 Releases publish the same image to GitHub Container Registry as `ghcr.io/rfdrew/kopia-docker-watcher` and to
 Docker Hub as [`rfdrew/kopia-docker-watcher`](https://hub.docker.com/r/rfdrew/kopia-docker-watcher), for
-linux/amd64 and linux/arm64, tagged with the version (`0.1.0`), `major.minor` (`0.1`) and `latest`; pre-releases
+linux/amd64 and linux/arm64, tagged with the version (`0.2.0`), `major.minor` (`0.2`) and `latest`; pre-releases
 get only their own tag. The image is distroless and runs as the non-root user 65532, which needs access to the
 Docker socket (see the example).
 
