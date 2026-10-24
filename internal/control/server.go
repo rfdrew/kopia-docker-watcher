@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/rfdrew/kopia-docker-watcher/internal/config"
 )
 
 const (
@@ -29,6 +31,9 @@ const (
 	// socketMode lets only the watcher's user connect.
 	socketMode = 0o600
 	dirMode    = 0o700
+	// maxAcceptDelay bounds the delay before Accept is tried again after
+	// an error, as when the process ran out of file descriptors.
+	maxAcceptDelay = time.Second
 )
 
 // Handler serves a valid request. It may call progress to send progress
@@ -52,7 +57,10 @@ type Server struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	conns  sync.WaitGroup
-	closed atomic.Bool
+	// mu guards closed and the conns.Add of a new connection, so that
+	// Close's Wait never races an Add.
+	mu     sync.Mutex
+	closed bool
 }
 
 // Listen creates the socket at path, readable and writable by the user of
@@ -61,8 +69,8 @@ type Server struct {
 // there, or a file that is no socket, is an error. Until SetHandler, every
 // request is answered with an error that the watcher is starting.
 func Listen(path string, log *slog.Logger) (*Server, error) {
-	if !filepath.IsAbs(path) {
-		return nil, fmt.Errorf("control socket %q is not an absolute path", path)
+	if err := config.ValidateControlSocket(path); err != nil {
+		return nil, fmt.Errorf("control socket: %w", err)
 	}
 
 	if log == nil {
@@ -84,10 +92,17 @@ func Listen(path string, log *slog.Logger) (*Server, error) {
 		return nil, fmt.Errorf("control socket %s: another watcher answers there", path)
 	}
 
-	// The socket is made under a temporary name and renamed into place
-	// once only the user can connect, so that it is never open to others.
-	tmp := filepath.Join(dir, fmt.Sprintf(".ctl%d", os.Getpid()))
-	_ = os.Remove(tmp)
+	// The socket is made in a directory only the user can enter, and
+	// moved into place once only the user can connect to it, so that it
+	// is never open to others, whatever the umask.
+	tmpDir, err := os.MkdirTemp(dir, ".")
+	if err != nil {
+		return nil, fmt.Errorf("create the control socket: %w", err)
+	}
+
+	defer os.RemoveAll(tmpDir)
+
+	tmp := filepath.Join(tmpDir, "s")
 
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: tmp, Net: "unix"})
 	if err != nil {
@@ -98,8 +113,6 @@ func Listen(path string, log *slog.Logger) (*Server, error) {
 
 	fail := func(err error) (*Server, error) {
 		_ = ln.Close()
-		_ = os.Remove(tmp)
-
 		return nil, err
 	}
 
@@ -113,8 +126,7 @@ func Listen(path string, log *slog.Logger) (*Server, error) {
 
 	info, err := os.Lstat(path)
 	if err != nil {
-		_ = ln.Close()
-		return nil, fmt.Errorf("control socket %s: %w", path, err)
+		return fail(fmt.Errorf("control socket %s: %w", path, err))
 	}
 
 	s := NewServer(ln, log)
@@ -172,24 +184,42 @@ func (s *Server) SetHandler(h Handler) {
 // SetNotReady sets the error the requests get while there is no handler.
 func (s *Server) SetNotReady(msg string) { s.notReady.Store(&msg) }
 
-// Serve accepts connections until Close and returns nil then.
+// Serve accepts connections until Close and returns nil then. An error
+// of Accept, as when the process ran out of file descriptors, is logged
+// and Accept tried again after a delay.
 func (s *Server) Serve() error {
+	var delay time.Duration
+
 	for {
 		conn, err := s.ln.Accept()
 		if err != nil {
-			if s.closed.Load() {
+			if s.isClosed() {
 				return nil
 			}
 
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				continue
+			delay = min(max(2*delay, 5*time.Millisecond), maxAcceptDelay)
+			s.log.Warn("accept on the control socket failed; trying again", "error", err.Error(), "delay", delay.String())
+
+			if !s.sleep(delay) {
+				return nil
 			}
 
-			return fmt.Errorf("accept on the control socket: %w", err)
+			continue
+		}
+
+		delay = 0
+
+		s.mu.Lock()
+
+		if s.closed {
+			s.mu.Unlock()
+			_ = conn.Close()
+
+			return nil
 		}
 
 		s.conns.Add(1)
+		s.mu.Unlock()
 
 		go func() {
 			defer s.conns.Done()
@@ -198,12 +228,38 @@ func (s *Server) Serve() error {
 	}
 }
 
+func (s *Server) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.closed
+}
+
+// sleep waits d, or until Close, and reports whether d passed.
+func (s *Server) sleep(d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+
+	select {
+	case <-s.ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 // Close stops accepting connections, ends the context of the requests
 // being served, waits for them until ctx ends and removes the socket.
 func (s *Server) Close(ctx context.Context) error {
-	if !s.closed.CompareAndSwap(false, true) {
+	s.mu.Lock()
+
+	if s.closed {
+		s.mu.Unlock()
 		return nil
 	}
+
+	s.closed = true
+	s.mu.Unlock()
 
 	err := s.ln.Close()
 

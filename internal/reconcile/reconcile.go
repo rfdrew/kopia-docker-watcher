@@ -427,6 +427,11 @@ type Options struct {
 	// without an owner before cleanup-on-remove deletes anything of it;
 	// zero means config.DefaultCleanupGrace.
 	CleanupGrace time.Duration
+
+	// RestoreTaskRunning reports whether kopia server's restore task with
+	// the ID still runs, for the containers StopOwnersFor stopped, which
+	// stay down until it has ended; nil brings them back regardless.
+	RestoreTaskRunning func(ctx context.Context, taskID string) (bool, error)
 }
 
 // Reconciler reconciles source paths. Create it with New, start it with
@@ -454,6 +459,7 @@ type Reconciler struct {
 	shutdownGrace          time.Duration
 	snapshotOnWatcherStart bool
 	cleanupGrace           time.Duration
+	restoreTaskRunning     func(ctx context.Context, taskID string) (bool, error)
 
 	// now is the clock of the snapshot steps; tests replace it.
 	now func() time.Time
@@ -676,6 +682,7 @@ func New(opts Options) (*Reconciler, error) {
 		status:         map[string]*pathStatus{},
 
 		snapshotOnWatcherStart: opts.SnapshotOnWatcherStart,
+		restoreTaskRunning:     opts.RestoreTaskRunning,
 		cleanupGrace:           orDefault(opts.CleanupGrace, config.DefaultCleanupGrace),
 	}
 

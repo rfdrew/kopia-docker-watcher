@@ -71,7 +71,15 @@ func (f *fakeKopia) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.getErr = f.getErr[1:]
 
 			w.WriteHeader(code)
-			_, _ = io.WriteString(w, `{"code":"NOT_FOUND","error":"task not found"}`)
+
+			switch {
+			case code == http.StatusNotFound:
+				_, _ = io.WriteString(w, `{"code":"NOT_FOUND","error":"task not found"}`)
+			case code >= http.StatusInternalServerError:
+				_, _ = io.WriteString(w, `{"code":"INTERNAL","error":"failed"}`)
+			default:
+				_, _ = io.WriteString(w, `{"code":"ACCESS_DENIED","error":"access denied"}`)
+			}
 
 			return
 		}
@@ -211,13 +219,17 @@ func TestRun(t *testing.T) {
 	}}
 	c := newClient(t, f)
 
-	var progress []int64
+	var (
+		progress []int64
+		started  string
+	)
 
 	res, err := Run(t.Context(), c, Options{
 		Snapshot:     Snapshot{ID: "k1", RootID: "root-k1"},
 		Target:       "/restore/app/",
 		PollInterval: time.Millisecond,
 		Progress:     func(p Progress) { progress = append(progress, p.Files) },
+		Started:      func(id string) { started = id },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -238,8 +250,12 @@ func TestRun(t *testing.T) {
 	req := f.restores[0]
 	if req.Root != "root-k1" || req.Filesystem.TargetPath != "/restore/app" || req.Filesystem.OverwriteFiles ||
 		req.Filesystem.OverwriteDirectories || req.Filesystem.OverwriteSymlinks || !req.Filesystem.WriteFilesAtomically ||
-		req.Options.Incremental || req.Options.IgnoreErrors {
+		req.Options.Incremental || req.Options.IgnoreErrors || req.Options.RestoreDirEntryAtDepth != kopiaclient.FullDepth {
 		t.Errorf("request = %+v %+v", req, req.Filesystem)
+	}
+
+	if started != "1f" {
+		t.Errorf("started = %q", started)
 	}
 }
 
@@ -309,23 +325,58 @@ func TestRunLostTask(t *testing.T) {
 	}
 }
 
-// When the context ends, the task is canceled with CancelOnStop, and left
-// to run without it.
+// When the context ends, the task is canceled with CancelOnStop, and Run
+// waits for it to end; without, it is left to run.
 func TestRunCanceled(t *testing.T) {
-	for _, cancelOnStop := range []bool{true, false} {
-		f := &fakeKopia{tasks: []kopiaclient.TaskInfo{task(kopiaclient.TaskRunning, 0, "")}}
-		c := newClient(t, f)
+	for _, tt := range []struct {
+		name         string
+		cancelOnStop bool
+		tasks        []kopiaclient.TaskInfo
+		cancels      int
+		status       kopiaclient.TaskStatus
+		msg          string
+	}{
+		{"cancel", true, []kopiaclient.TaskInfo{task(kopiaclient.TaskRunning, 0, ""), task(kopiaclient.TaskCanceling, 1, ""),
+			task(kopiaclient.TaskCanceled, 2, "")}, 1, kopiaclient.TaskCanceled, "canceled: the watcher stops"},
+		{"still running", true, []kopiaclient.TaskInfo{task(kopiaclient.TaskRunning, 0, "")}, 1, "", "has not ended yet"},
+		{"leave", false, []kopiaclient.TaskInfo{task(kopiaclient.TaskRunning, 0, "")}, 0, "", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fakeKopia{tasks: tt.tasks}
+			c := newClient(t, f)
 
-		ctx, cancel := context.WithCancel(t.Context())
+			ctx, cancel := context.WithCancel(t.Context())
 
-		res, err := Run(ctx, c, Options{Snapshot: Snapshot{RootID: "r"}, Target: "/x", PollInterval: time.Millisecond,
-			CancelOnStop: cancelOnStop, Progress: func(Progress) { cancel() }})
-		if !errors.Is(err, context.Canceled) || res.TaskID != "1f" {
-			t.Fatalf("Run = %+v, %v", res, err)
-		}
+			res, err := Run(ctx, c, Options{Snapshot: Snapshot{RootID: "r"}, Target: "/x", PollInterval: time.Millisecond,
+				CancelOnStop: tt.cancelOnStop, CancelWait: 50 * time.Millisecond, Progress: func(Progress) { cancel() }})
+			if !errors.Is(err, context.Canceled) || res.TaskID != "1f" || res.Status != tt.status || !strings.Contains(res.Error, tt.msg) {
+				t.Fatalf("Run = %+v, %v", res, err)
+			}
 
-		if want := map[bool]int{true: 1, false: 0}[cancelOnStop]; len(f.cancels) != want {
-			t.Errorf("cancelOnStop %v: cancels = %v", cancelOnStop, f.cancels)
-		}
+			if len(f.cancels) != tt.cancels {
+				t.Errorf("cancels = %v", f.cancels)
+			}
+		})
+	}
+}
+
+// With CancelOnStop, an error that is not retried keeps the follow going:
+// the containers come back only once the task has ended.
+func TestRunCancelOnStopRetries(t *testing.T) {
+	f := &fakeKopia{tasks: []kopiaclient.TaskInfo{task(kopiaclient.TaskRunning, 0, ""), task(kopiaclient.TaskSuccess, 1, "")},
+		getErr: []int{400, 403}}
+	c := newClient(t, f)
+
+	res, err := Run(t.Context(), c, Options{Snapshot: Snapshot{RootID: "r"}, Target: "/x", PollInterval: time.Millisecond,
+		CancelOnStop: true})
+	if err != nil || !res.OK() {
+		t.Fatalf("Run = %+v, %v", res, err)
+	}
+
+	f = &fakeKopia{tasks: []kopiaclient.TaskInfo{task(kopiaclient.TaskRunning, 0, "")}, getErr: []int{400}}
+	c = newClient(t, f)
+
+	if _, err := Run(t.Context(), c, Options{Snapshot: Snapshot{RootID: "r"}, Target: "/x", PollInterval: time.Millisecond}); err == nil {
+		t.Fatal("no error without CancelOnStop")
 	}
 }

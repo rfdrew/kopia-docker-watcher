@@ -3,6 +3,7 @@ package kopiaclient
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"path"
 )
@@ -54,7 +55,18 @@ type RestoreOptions struct {
 	Incremental bool `json:"incremental"`
 	// IgnoreErrors goes on after an error, counting it.
 	IgnoreErrors bool `json:"ignoreErrors"`
+	// RestoreDirEntryAtDepth is the depth below which kopia server writes
+	// placeholders (.kopia-entry files) instead of the files: zero
+	// restores only the top directory for real. FullDepth restores
+	// everything, as kopia's CLI does by default.
+	RestoreDirEntryAtDepth int32 `json:"restoreDirEntryAtDepth"`
+	// MinSizeForPlaceholder is the size from which a file below
+	// RestoreDirEntryAtDepth becomes a placeholder.
+	MinSizeForPlaceholder int32 `json:"minSizeForPlaceholder"`
 }
+
+// FullDepth is RestoreDirEntryAtDepth for a restore of every file.
+const FullDepth = math.MaxInt32
 
 // Restore starts a restore and returns its task, which tells how it goes:
 // kopia server restores in the background. A target that is not an

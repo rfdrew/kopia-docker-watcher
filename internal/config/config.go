@@ -71,7 +71,11 @@ const (
 	// MaxControlSocketLen is the longest control socket path every
 	// platform takes: a unix socket address holds 104 bytes on BSD and
 	// macOS, 108 on Linux, the closing NUL included.
-	MaxControlSocketLen        = 103
+	MaxControlSocketLen = 103
+	// controlSocketTmpLen is how much longer than its directory the path
+	// is under which the watcher creates the socket before it moves it
+	// into place: "/." with up to ten digits, then "/s".
+	controlSocketTmpLen        = 14
 	DefaultLabelPrefix         = "kopia"
 	DefaultCleanupGrace        = 24 * time.Hour
 	DefaultNotifyWebhookFormat = WebhookJSON
@@ -783,10 +787,14 @@ func ControlSocket(getenv func(string) string) string {
 // absolute or too long for a unix socket.
 func ValidateControlSocket(p string) error {
 	switch {
-	case !path.IsAbs(p):
-		return fmt.Errorf("%q is not an absolute path", p)
+	case !path.IsAbs(p) || path.Clean(p) == "/":
+		return fmt.Errorf("%q is not an absolute path to a file", p)
 	case len(p) > MaxControlSocketLen:
 		return fmt.Errorf("%q is %d bytes long; a unix socket path may have %d at most", p, len(p), MaxControlSocketLen)
+	case len(path.Dir(p))+controlSocketTmpLen > MaxControlSocketLen:
+		return fmt.Errorf("the directory of %q is too long: the watcher creates the socket in a directory in it first, "+
+			"and a unix socket path may have %d bytes at most; use a directory of %d bytes at most",
+			p, MaxControlSocketLen, MaxControlSocketLen-controlSocketTmpLen)
 	}
 
 	return nil

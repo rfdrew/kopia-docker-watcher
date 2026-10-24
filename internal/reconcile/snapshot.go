@@ -1671,6 +1671,10 @@ func (r *Reconciler) wait(ctx context.Context, w state.SnapshotWait) {
 				result.SnapshotStart = res.Snapshot.StartTime
 			}
 
+			// The triggers of a snapshot with hooks get the result before a
+			// pass can see it and end the run.
+			r.waitEnded(src, w.ID, result, "")
+
 			// Reported along with the result, with the store locked: no pass
 			// can act on the result, and forget the source, before. A run
 			// kopia server lost track of may have saved its snapshot all the
@@ -1684,8 +1688,6 @@ func (r *Reconciler) wait(ctx context.Context, w state.SnapshotWait) {
 			}) {
 				r.queue.addUnlessRetrying(src.Path)
 			}
-
-			r.waitEnded(src, w.ID, result, "")
 
 			return
 		case errors.Is(err, backend.ErrNotImplemented):

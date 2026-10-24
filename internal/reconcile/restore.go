@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
+	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
 	"github.com/rfdrew/kopia-docker-watcher/internal/state"
 )
 
@@ -19,6 +21,30 @@ const restoreRunPrefix = "restore-"
 // farFuture stands in for the return time of the containers a restore
 // stops: they come back when the restore ends, not after a max-downtime.
 var farFuture = time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+
+const (
+	// taskRecheck is how soon a container stopped for a restore is looked
+	// at again while kopia server's restore task still runs.
+	taskRecheck = 10 * time.Second
+	// taskCheckTimeout bounds the question whether the task runs.
+	taskCheckTimeout = 30 * time.Second
+)
+
+// runningOnly takes a container down for a snapshot only while it runs:
+// one that is restarting or paused is left as it is.
+func runningOnly(s docker.State) bool { return s == docker.StateRunning }
+
+// takeable reports whether the run with the ID takes down a container in
+// state s: a snapshot only a running one, a restore also one that is
+// restarting, as in a crash loop, or paused, which would otherwise use
+// the files under the restore.
+func takeable(run string, s docker.State) bool {
+	if strings.HasPrefix(run, restoreRunPrefix) {
+		return s.Running()
+	}
+
+	return runningOnly(s)
+}
 
 // RestoreTarget is the source of one path, for a restore.
 type RestoreTarget struct {
@@ -71,19 +97,26 @@ func (r *Reconciler) RestoreTarget(ctx context.Context, target string) (RestoreT
 // StopOwnersFor stops the running containers that back up the source of
 // path p, with every running container that depends on them by the
 // depends-on labels, as a snapshot with stop-during-backup does, runs fn,
-// and brings them back once fn returns. fn runs on a context that ends
-// when the watcher stops; the containers then come back within
-// ShutdownGrace, or at the next start. The containers are held in the
-// state as for a snapshot, and their events are the watcher's own, so
-// their source is not paused and takes no snapshot at their stop or start.
-// While fn runs, the source takes no snapshot the watcher queues. Progress
-// is told what is done, for the user.
+// and brings them back once fn returns. Containers that are restarting or
+// paused are stopped too. fn runs on a context that ends when the watcher
+// stops; the containers then come back within ShutdownGrace, or at the
+// next start. The containers are held in the state as for a snapshot, and
+// their events are the watcher's own, so their source is not paused and
+// takes no snapshot at their stop or start. While fn runs, the source
+// takes no snapshot the watcher queues. Progress is told what is done, for
+// the user.
+//
+// fn tells started the ID of kopia server's restore task once it has one.
+// It is stored with the held containers, and none of them is brought back
+// while Options.RestoreTaskRunning reports the task running: not after fn
+// returns, not when the watcher stops and not at the next start, so that
+// no container runs on files kopia server still writes.
 //
 // It fails, without stopping anything, while hooks or a snapshot with
 // hooks of the source run, while a container it needs is held down for a
 // snapshot, and when the state cannot be written.
 func (r *Reconciler) StopOwnersFor(ctx context.Context, src backend.Source, progress func(string),
-	fn func(context.Context) error,
+	fn func(ctx context.Context, started func(taskID string)) error,
 ) error {
 	if r.dryRun {
 		return ErrNotRunning
@@ -117,7 +150,7 @@ func (r *Reconciler) StopOwnersFor(ctx context.Context, src backend.Source, prog
 		return fmt.Errorf("a snapshot with hooks of the source is under way (phase %s); try again once it is done", rec.HookRun.Phase)
 	}
 
-	group, members, err := r.stopGroup(ids, containers)
+	group, members, err := r.stopGroup(ids, containers, docker.State.Running)
 	if err != nil {
 		return fmt.Errorf("cannot stop the containers of the source: %w", err)
 	}
@@ -154,7 +187,7 @@ func (r *Reconciler) StopOwnersFor(ctx context.Context, src backend.Source, prog
 
 	if failure == "" {
 		fnCtx, cancel := context.WithCancel(runCtx)
-		err = fn(fnCtx)
+		err = fn(fnCtx, func(taskID string) { r.setRestoreTask(src, runID, taskID) })
 
 		cancel()
 	} else {
@@ -173,7 +206,7 @@ func (r *Reconciler) StopOwnersFor(ctx context.Context, src backend.Source, prog
 				}
 			}
 
-			progress("could not start " + strings.Join(names, ", ") + " again; the watcher keeps trying")
+			progress(strings.Join(names, ", ") + " not started yet: the watcher starts them as soon as it can; its log says why")
 		}
 	}
 
@@ -263,6 +296,60 @@ func (r *Reconciler) holdForRestore(src backend.Source, runID string, items []do
 	}
 
 	return nil
+}
+
+// setRestoreTask stores the restore task the containers held for the run
+// wait for.
+func (r *Reconciler) setRestoreTask(src backend.Source, runID, taskID string) {
+	err := r.store.UpdateHeld(func(held []state.Held) ([]state.Held, error) {
+		for i := range held {
+			if held[i].Source == src && held[i].Run == runID {
+				held[i].RestoreTask = taskID
+			}
+		}
+
+		return held, nil
+	})
+	if err != nil && !errors.Is(err, state.ErrNotPersisted) {
+		r.log.Error("cannot store the restore task the containers wait for", "source", src.String(), "task", taskID,
+			"error", err.Error())
+	}
+}
+
+// restoreTaskRuns returns why the held container h stays down: kopia
+// server's restore task it waits for still runs, or it cannot be told
+// whether it does; empty when it may come back. The retry loop looks at it
+// again.
+func (r *Reconciler) restoreTaskRuns(ctx context.Context, log *slog.Logger, h state.Held, attrs []any) string {
+	if h.RestoreTask == "" || r.restoreTaskRunning == nil {
+		return ""
+	}
+
+	tctx, cancel := context.WithTimeout(ctx, taskCheckTimeout)
+	defer cancel()
+
+	running, err := r.restoreTaskRunning(tctx, h.RestoreTask)
+
+	switch {
+	case err != nil:
+		return r.returnFailed(log, h, append(attrs, "restore_task", h.RestoreTask),
+			fmt.Errorf("cannot tell whether kopia server's restore task %s still runs: %w", h.RestoreTask, err))
+	case running:
+		log.Info("not bringing back a container while kopia server's restore task still runs", append(attrs, "restore_task",
+			h.RestoreTask)...)
+
+		r.mu.Lock()
+		r.returnRetry[h.ID] = r.now().Add(taskRecheck)
+		r.mu.Unlock()
+
+		if !h.Released {
+			r.markHeld(h.ID, func(x *state.Held) { x.Released = true })
+		}
+
+		return "the restore task runs"
+	}
+
+	return ""
 }
 
 // restoring reports whether a restore that stopped the containers of the

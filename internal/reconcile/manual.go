@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path"
 	"slices"
 	"strings"
@@ -73,6 +74,8 @@ type Trigger struct {
 	// applies, and the description names it.
 	container, containerID string
 	force                  bool
+	// log gets the result.
+	log *slog.Logger
 
 	once   sync.Once
 	done   chan struct{}
@@ -100,12 +103,15 @@ func (t *Trigger) Result() TriggerResult {
 	}
 }
 
-// resolve sets the result once.
+// resolve sets the result once, and logs it.
 func (t *Trigger) resolve(res TriggerResult) {
 	t.once.Do(func() {
 		res.Path = t.path
 		t.result = res
 		close(t.done)
+
+		t.log.Info("snapshot asked for by hand done", "path", res.Path, "outcome", res.Outcome, "message", res.Message,
+			"task", res.TaskID, "post_exec_error", res.PostError)
 	})
 }
 
@@ -148,7 +154,7 @@ func (r *Reconciler) Trigger(ctx context.Context, target string, force bool) ([]
 	}
 
 	for i, p := range paths {
-		t := &Trigger{path: p, container: c.Name, containerID: c.ID, force: force, done: make(chan struct{})}
+		t := &Trigger{path: p, container: c.Name, containerID: c.ID, force: force, done: make(chan struct{}), log: r.log}
 		r.manual[p] = append(r.manual[p], t)
 		out[i] = t
 	}
@@ -527,6 +533,43 @@ func (ps *pass) finishManual(err error, retry bool) {
 	}
 
 	ps.restoreManual(ps.path, append(back, ps.keptManual...))
+}
+
+// endManualOf ends the manual triggers followed under another kopia server
+// identity than userName@host: the passes no longer follow their
+// snapshots.
+func (r *Reconciler) endManualOf(userName, host string) {
+	other := func(src backend.Source) bool { return src.UserName != userName || src.Host != host }
+
+	r.mu.Lock()
+
+	var ts []*Trigger
+
+	for k, l := range r.manualWaits {
+		if other(k.src) {
+			ts = append(ts, l...)
+			delete(r.manualWaits, k)
+		}
+	}
+
+	for k, l := range r.manualRuns {
+		if other(k.src) {
+			ts = append(ts, l...)
+			delete(r.manualRuns, k)
+		}
+	}
+
+	for k := range r.runOfWait {
+		if other(k.src) {
+			delete(r.runOfWait, k)
+		}
+	}
+	r.mu.Unlock()
+
+	for _, t := range ts {
+		t.resolve(TriggerResult{Outcome: string(backend.SnapshotUnknown),
+			Message: "kopia server's identity changed, so the watcher no longer follows the snapshot"})
+	}
 }
 
 // endManual ends every manual trigger still open: the watcher stops.

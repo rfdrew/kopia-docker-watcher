@@ -114,7 +114,6 @@ func (w *watcher) serveTrigger(ctx context.Context, rec *reconcile.Reconciler, r
 			return control.Message{}, ctx.Err()
 		}
 
-		w.log.Info("manual trigger done", "path", results[i].Path, "outcome", results[i].Outcome, "message", results[i].Message)
 	}
 
 	return control.Message{Triggers: results}, nil
@@ -165,7 +164,7 @@ func (w *watcher) serveRestore(ctx context.Context, rec *reconcile.Reconciler, k
 
 	var res restore.Result
 
-	run := func(ctx context.Context) error {
+	run := func(ctx context.Context, started func(string)) error {
 		var err error
 
 		res, err = restore.Run(ctx, kopia, restore.Options{
@@ -173,6 +172,7 @@ func (w *watcher) serveRestore(ctx context.Context, rec *reconcile.Reconciler, k
 			Target:       into,
 			Overwrite:    req.Overwrite,
 			CancelOnStop: req.Stop,
+			Started:      started,
 			Progress:     func(p restore.Progress) { progress(control.Message{RestoreProgress: &p}) },
 		})
 		if res.TaskID != "" && err == nil {
@@ -185,7 +185,7 @@ func (w *watcher) serveRestore(ctx context.Context, rec *reconcile.Reconciler, k
 	if req.Stop {
 		err = rec.StopOwnersFor(ctx, tgt.Source, text, run)
 	} else {
-		err = run(ctx)
+		err = run(ctx, nil)
 	}
 
 	switch {

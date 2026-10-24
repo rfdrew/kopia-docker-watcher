@@ -28,6 +28,10 @@ const (
 	// cancelTimeout bounds the request that cancels the task of a restore
 	// whose context ended.
 	cancelTimeout = 10 * time.Second
+	// DefaultCancelWait is how long a restore canceled at the watcher's
+	// stop waits for kopia server's task to end: kopia server finishes
+	// the files it is writing first.
+	DefaultCancelWait = 5 * time.Second
 	// minPrefixLen is how many characters of a snapshot ID name it at
 	// least.
 	minPrefixLen = 6
@@ -125,9 +129,17 @@ type Options struct {
 	// Overwrite restores into a directory that is not empty, replacing
 	// the files and symlinks it finds there.
 	Overwrite bool
-	// CancelOnStop cancels kopia server's task when ctx ends; otherwise
-	// the task goes on and only following it stops.
+	// CancelOnStop cancels kopia server's task when ctx ends, and waits
+	// CancelWait for it to end; otherwise the task goes on and only
+	// following it stops. With it, an error kopia server answers while the
+	// task is followed is tried again rather than ending the follow, so
+	// that Run returns only once the task has ended or ctx has. Zero
+	// CancelWait means DefaultCancelWait.
 	CancelOnStop bool
+	CancelWait   time.Duration
+	// Started is told the ID of kopia server's task once it has started;
+	// nil tells nothing.
+	Started func(taskID string)
 	// Progress is told how the restore goes; nil tells nothing.
 	Progress func(Progress)
 	// PollInterval is how often the task is looked at; zero means
@@ -195,12 +207,17 @@ func Run(ctx context.Context, k Kopia, opts Options) (Result, error) {
 			OverwriteSymlinks:    opts.Overwrite,
 			WriteFilesAtomically: true,
 		},
+		Options: kopiaclient.RestoreOptions{RestoreDirEntryAtDepth: kopiaclient.FullDepth},
 	})
 	if err != nil {
 		return res, fmt.Errorf("start the restore: %w", err)
 	}
 
 	res.TaskID = task.ID
+
+	if opts.Started != nil {
+		opts.Started(task.ID)
+	}
 
 	return follow(ctx, k, opts, res, task)
 }
@@ -238,16 +255,7 @@ func follow(ctx context.Context, k Kopia, opts Options, res Result, task *kopiac
 			t.Stop()
 
 			if opts.CancelOnStop {
-				cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cancelTimeout)
-				err := k.CancelTask(cctx, task.ID)
-
-				cancel()
-
-				if err != nil {
-					return res, fmt.Errorf("cancel kopia server's restore task %s: %w", task.ID, err)
-				}
-
-				res.Error = "canceled: the watcher stops"
+				return cancelTask(ctx, k, opts, res)
 			}
 
 			return res, ctx.Err()
@@ -266,11 +274,64 @@ func follow(ctx context.Context, k Kopia, opts Options, res Result, task *kopiac
 				", as after a restart: whether the restore finished is not known"
 
 			return res, nil
-		case kopiaclient.IsRetryable(err):
+		case kopiaclient.IsRetryable(err), opts.CancelOnStop:
 			delay = min(2*delay, maxPollDelay)
 		default:
 			return res, fmt.Errorf("follow kopia server's restore task %s: %w", task.ID, err)
 		}
+	}
+}
+
+// cancelTask cancels the task of res once ctx has ended, and waits up to
+// CancelWait for it to end: kopia server stops between files, and the
+// files it is writing are finished first.
+func cancelTask(ctx context.Context, k Kopia, opts Options, res Result) (Result, error) {
+	wait := opts.CancelWait
+	if wait <= 0 {
+		wait = DefaultCancelWait
+	}
+
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cancelTimeout+wait)
+	defer cancel()
+
+	if err := k.CancelTask(cctx, res.TaskID); err != nil {
+		return res, fmt.Errorf("cancel kopia server's restore task %s: %w", res.TaskID, err)
+	}
+
+	res.Error = "canceled: the watcher stops"
+	deadline := time.Now().Add(wait)
+
+	for time.Now().Before(deadline) {
+		task, err := k.GetTask(cctx, res.TaskID)
+
+		switch {
+		case errors.Is(err, kopiaclient.ErrNotFound):
+			return res, ctx.Err()
+		case err == nil && task.Status.IsFinished():
+			res.Progress, res.Status = progressOf(task), task.Status
+			return res, ctx.Err()
+		}
+
+		if !sleep(cctx, min(opts.PollInterval+time.Millisecond, time.Second)) {
+			break
+		}
+	}
+
+	res.Error = "canceled: the watcher stops, and kopia server's restore task " + res.TaskID + " has not ended yet"
+
+	return res, ctx.Err()
+}
+
+// sleep waits d, or until ctx ends, and reports whether d passed.
+func sleep(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 

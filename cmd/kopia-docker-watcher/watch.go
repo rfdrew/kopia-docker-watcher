@@ -471,7 +471,26 @@ func (w *watcher) reconciler(kopia *kopiaclient.Client, store *state.Store, engi
 		WatcherPathPrefix:      w.cfg.WatcherPathPrefix,
 		SnapshotOnWatcherStart: w.cfg.SnapshotOnWatcherStart,
 		CleanupGrace:           w.cfg.CleanupGrace,
+		RestoreTaskRunning:     restoreTaskRunning(kopia),
 	})
+}
+
+// restoreTaskRunning reports whether kopia server's restore task with the
+// ID still runs. A task kopia server no longer knows, as after its
+// restart, or that is another one under the same ID, has ended.
+func restoreTaskRunning(kopia *kopiaclient.Client) func(context.Context, string) (bool, error) {
+	return func(ctx context.Context, id string) (bool, error) {
+		t, err := kopia.GetTask(ctx, id)
+
+		switch {
+		case errors.Is(err, kopiaclient.ErrNotFound):
+			return false, nil
+		case err != nil:
+			return false, err
+		}
+
+		return t.Kind == kopiaclient.TaskKindRestore && !t.Status.IsFinished(), nil
+	}
 }
 
 // waitForKopia asks kopia server for the repository status until it

@@ -144,6 +144,47 @@ func TestLoadAllSet(t *testing.T) {
 	}
 }
 
+func TestControlSocket(t *testing.T) {
+	for _, tt := range []struct {
+		env  []string
+		want string
+	}{
+		{nil, "/var/lib/kopia-docker-watcher/control.sock"},
+		{[]string{EnvStateFile, "/data/state.json"}, "/data/control.sock"},
+		{[]string{EnvStateFile, "/data/state.json", EnvControlSocket, " /run/kdw.sock "}, "/run/kdw.sock"},
+	} {
+		if got := ControlSocket(env(tt.env...)); got != tt.want {
+			t.Errorf("ControlSocket(%q) = %q, want %q", tt.env, got, tt.want)
+		}
+	}
+
+	long := "/" + strings.Repeat("d", 88)
+
+	for p, ok := range map[string]bool{
+		"/run/kdw.sock":                true,
+		"relative.sock":                false,
+		"/":                            false,
+		"/" + strings.Repeat("x", 103): false,
+		long + "/s":                    true,
+		long + "d/s":                   false,
+		"/" + strings.Repeat("x", 102): true,
+	} {
+		if err := ValidateControlSocket(p); (err == nil) != ok {
+			t.Errorf("ValidateControlSocket(%q) = %v", p, err)
+		}
+	}
+
+	// A path set explicitly is checked; one next to STATE_FILE only warns.
+	if _, err := Load(base(EnvControlSocket, "relative.sock")); err == nil || !strings.Contains(err.Error(), EnvControlSocket) {
+		t.Errorf("relative CONTROL_SOCKET: %v", err)
+	}
+
+	cfg, err := Load(base(EnvStateFile, long+"d/state.json"))
+	if err != nil || len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], EnvControlSocket) {
+		t.Errorf("long STATE_FILE: %v, %q", err, cfg.Warnings)
+	}
+}
+
 func TestEmptyIsUnset(t *testing.T) {
 	cfg, err := Load(base(
 		EnvKopiaServerCertFingerprint, "",

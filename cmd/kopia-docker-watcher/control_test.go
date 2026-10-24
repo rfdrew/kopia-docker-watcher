@@ -103,7 +103,8 @@ func TestControlCommands(t *testing.T) {
 
 	reqs := k.restoreRequests()
 	if len(reqs) != 1 || reqs[0].Root != "root2" || reqs[0].Filesystem.TargetPath != "/restore/app" ||
-		reqs[0].Filesystem.OverwriteFiles || reqs[0].Filesystem.OverwriteDirectories || reqs[0].Filesystem.OverwriteSymlinks {
+		reqs[0].Filesystem.OverwriteFiles || reqs[0].Filesystem.OverwriteDirectories || reqs[0].Filesystem.OverwriteSymlinks ||
+		reqs[0].Options.RestoreDirEntryAtDepth != kopiaclient.FullDepth {
 		t.Fatalf("restore requests = %+v", reqs)
 	}
 

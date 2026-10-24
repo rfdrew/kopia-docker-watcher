@@ -58,6 +58,9 @@ type SourcesReport struct {
 	Warning string `json:"warning,omitempty"`
 }
 
+// listSourcesTimeout bounds the question to kopia server of Sources.
+const listSourcesTimeout = 10 * time.Second
+
 // pathStatus is what the passes over a path last found.
 type pathStatus struct {
 	src backend.Source
@@ -155,11 +158,16 @@ func (r *Reconciler) Sources(ctx context.Context) (SourcesReport, error) {
 		return SourcesReport{}, ErrNotRunning
 	}
 
-	var rep SourcesReport
+	rep := SourcesReport{Sources: []SourceReport{}}
 
 	live := map[string]backend.SourceStatus{}
 
-	statuses, err := r.backend.ListSources(ctx)
+	// kopia server may hang: the rest is reported all the same.
+	lctx, cancel := context.WithTimeout(ctx, listSourcesTimeout)
+	statuses, err := r.backend.ListSources(lctx)
+
+	cancel()
+
 	if err != nil {
 		if ctx.Err() != nil {
 			return SourcesReport{}, ctx.Err()

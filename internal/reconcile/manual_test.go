@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -500,7 +501,7 @@ func TestStopOwnersFor(t *testing.T) {
 	var progress []string
 
 	err := h.r.StopOwnersFor(context.Background(), h.src(app), func(s string) { progress = append(progress, s) },
-		func(ctx context.Context) error {
+		func(ctx context.Context, _ func(string)) error {
 			h.mustState(db, docker.StateExited)
 			h.mustState(web, docker.StateExited)
 
@@ -560,7 +561,7 @@ func TestStopOwnersForBusy(t *testing.T) {
 	h.engine.run("db", enable, pathLabel(app), noOnStart)
 	h.passAndSettle(app)
 
-	noop := func(context.Context) error { return nil }
+	noop := func(context.Context, func(string)) error { return nil }
 
 	if err := h.store.Update(h.src(app), func(r *state.Record) error {
 		r.HookRun = &state.HookRun{ID: "x", Phase: state.HookPre}
@@ -581,7 +582,7 @@ func TestStopOwnersForBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := h.r.StopOwnersFor(context.Background(), h.src(app), func(string) {}, func(context.Context) error {
+	err := h.r.StopOwnersFor(context.Background(), h.src(app), func(string) {}, func(context.Context, func(string)) error {
 		err := h.r.StopOwnersFor(context.Background(), h.src(app), func(string) {}, noop)
 		if err == nil || !strings.Contains(err.Error(), "another restore") {
 			t.Errorf("nested err = %v", err)
@@ -610,7 +611,7 @@ func TestStopOwnersForWatcherStops(t *testing.T) {
 	h.r.runCtx = runCtx
 	h.r.mu.Unlock()
 
-	err := h.r.StopOwnersFor(context.Background(), h.src(app), func(string) {}, func(ctx context.Context) error {
+	err := h.r.StopOwnersFor(context.Background(), h.src(app), func(string) {}, func(ctx context.Context, _ func(string)) error {
 		h.mustState(db, docker.StateExited)
 		stop()
 		<-ctx.Done()
@@ -623,4 +624,129 @@ func TestStopOwnersForWatcherStops(t *testing.T) {
 
 	h.mustState(db, docker.StateRunning)
 	h.mustNotHeld()
+}
+
+// A restore stops an owner that is restarting, as in a crash loop, or
+// paused, too: it would use the files under the restore.
+func TestStopOwnersForRestarting(t *testing.T) {
+	h := newHarness(t)
+	withClock(h)
+	withHooks(h)
+	db := h.engine.run("db", enable, pathLabel(app), noOnStart)
+	cache := h.engine.run("cache", enable, pathLabel(app), noOnStart)
+	h.passAndSettle(app)
+	h.engine.setState(db, docker.StateRestarting)
+	h.engine.setState(cache, docker.StatePaused)
+
+	err := h.r.StopOwnersFor(context.Background(), h.src(app), func(string) {}, func(context.Context, func(string)) error {
+		h.mustState(db, docker.StateExited)
+		h.mustState(cache, docker.StateExited)
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h.mustState(db, docker.StateRunning)
+	h.mustState(cache, docker.StateRunning)
+	h.mustNotHeld()
+}
+
+// The containers stay down while kopia server's restore task runs: after
+// the restore returned, as when the watcher stopped while it ran, and
+// after a restart; the retry loop brings them back once it has ended.
+func TestStopOwnersForWaitsForTask(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		running = true
+		asked   []string
+	)
+
+	taskRunning := func(_ context.Context, id string) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		asked = append(asked, id)
+
+		return running, nil
+	}
+
+	h := newHarness(t, func(o *Options) { o.RestoreTaskRunning = taskRunning })
+	withClock(h)
+	withHooks(h)
+	db := h.engine.run("db", enable, pathLabel(app), noOnStart)
+	h.passAndSettle(app)
+
+	err := h.r.StopOwnersFor(context.Background(), h.src(app), func(string) {}, func(_ context.Context, started func(string)) error {
+		started("2a")
+		return errors.New("canceled: the watcher stops")
+	})
+	if err == nil {
+		t.Fatal("no error")
+	}
+
+	h.mustState(db, docker.StateExited)
+
+	held := h.store.Held()
+	if len(held) != 1 || held[0].RestoreTask != "2a" || !held[0].Released {
+		t.Fatalf("held = %+v", held)
+	}
+
+	// After a restart of the watcher, the task still runs.
+	h.r.returnLeftDown(context.Background())
+	h.mustState(db, docker.StateExited)
+
+	mu.Lock()
+	running = false
+	mu.Unlock()
+
+	h.r.returnLeftDown(context.Background())
+	h.mustState(db, docker.StateRunning)
+	h.mustNotHeld()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(asked) != 3 || asked[0] != "2a" {
+		t.Errorf("asked = %q", asked)
+	}
+}
+
+// When kopia server's identity changes, the triggers it was following
+// end: their snapshots are no longer followed.
+func TestTriggerIdentityChange(t *testing.T) {
+	h := newHarness(t)
+	withClock(h)
+	withHooks(h)
+	h.engine.run("app", enable, pathLabel(app), noOnStart)
+	h.passAndSettle(app)
+	h.fake.HoldSnapshots(h.src(app))
+
+	tr := h.mustTrigger("app", false)
+	h.mustPass(app)
+	h.mustOpen(tr)
+
+	// The pass that meets the new identity forgets the old one; the next
+	// one asks for it.
+	h.fake.SetIdentity("other", "nas2")
+	h.pass(app)
+	h.mustPass(app)
+
+	if res := h.mustResult(tr); res.Outcome != string(backend.SnapshotUnknown) || !strings.Contains(res.Message, "identity changed") {
+		t.Fatalf("result = %+v", res)
+	}
+
+	h.stopHooks()
+}
+
+// Sources lists no source as an empty list.
+func TestSourcesEmpty(t *testing.T) {
+	h := newHarness(t)
+	withHooks(h)
+
+	rep, err := h.r.Sources(context.Background())
+	if err != nil || rep.Sources == nil || len(rep.Sources) != 0 {
+		t.Fatalf("Sources = %#v, %v", rep, err)
+	}
 }

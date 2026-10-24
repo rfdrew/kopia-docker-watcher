@@ -125,9 +125,9 @@ snapshot; kopia server usually runs as root, which can set them.
 ### Which snapshot
 
 By default the newest complete snapshot. Incomplete ones, checkpoints of an upload and canceled snapshots, are
-taken only by their ID. Give a snapshot as the last argument: its ID, or the start of it, at least six
-characters. KopiaUI shows the IDs under Snapshots, as does `kopia snapshot list --all` in the kopia server
-container.
+taken only by their ID. Give a snapshot as the last argument: its manifest ID, or the start of it, at least six
+characters. In the kopia server container, `kopia snapshot list --all --manifest-id --incomplete --show-identical`
+lists them; without `--manifest-id` it shows the root object IDs instead, which `restore` does not take.
 
 ```bash
 docker compose exec watcher kopia-docker-watcher restore --target /restore/app app 9a1f3c
@@ -151,8 +151,9 @@ A restore that fails half-way leaves the files it has written.
 Restoring under a running application can corrupt it: a database that has its files open, an application that
 writes while the files change. `--stop` stops the path's running containers before the restore, with every
 running container that depends on them by `kopia.depends-on`, dependents first, as
-[stop-during-backup](labels.md#stopping-and-pausing) does, and starts them again in the reverse order once the
-restore has ended, whether it succeeded or not:
+[stop-during-backup](labels.md#stopping-and-pausing) does, and starts them again in the reverse order once
+kopia server's restore task has ended, whether it succeeded or not. Containers that are restarting, as in a crash
+loop, or paused are stopped too, and come back running:
 
 ```bash
 docker compose exec watcher kopia-docker-watcher restore --stop --overwrite --target /host/srv/db db
@@ -166,11 +167,17 @@ docker compose exec watcher kopia-docker-watcher restore --stop --overwrite --ta
   restore. Restore when no snapshot is due, as `list` shows.
 - Interrupting `restore` stops only the output: the watcher follows the restore and starts the containers when
   it has ended. To stop the restore, cancel its task in KopiaUI; the containers come back then.
-- When the watcher stops during the restore, it cancels kopia server's restore task and starts the containers
-  within its shutdown grace; after a crash, they are started when the watcher starts again. A restore cut short
-  this way leaves the files it has written.
+- No container comes back while kopia server's restore task still runs: the watcher stores the task with the
+  containers it stopped, and asks kopia server about it before it starts one, every 10 seconds until the task
+  has ended. When the watcher stops during the restore, it cancels the task, waits a few seconds for kopia server
+  to finish the files it is writing, and starts the containers if the task has ended by then; otherwise they stay
+  down and the watcher starts them after its next start, once the task has ended. After a crash of the watcher,
+  kopia server's task goes on, and the watcher starts the containers after its next start, once the task has
+  ended. A task kopia server no longer knows, as after its restart, counts as ended. While the watcher cannot
+  ask kopia server, the containers stay down, and that is logged and [notified](configuration.md#notifications)
+  like a container that cannot be brought back. A canceled restore leaves the files it has written.
 - A container that someone else starts meanwhile is left running; one that cannot be started is tried again,
-  logged and [notified](configuration.md#notifications) like after a snapshot.
+  logged and notified like after a snapshot.
 - `--stop` is refused while a snapshot with hooks of the source, or another restore of it, is under way, and
   while a container it needs is held down for a snapshot: try again once it is done. Stopping and starting
   containers needs `POST=1` with docker-socket-proxy (see [Docker](configuration.md#docker)).
