@@ -1,4 +1,4 @@
-<!-- translated-from: README.md @ d697bf00e12a9b05382727b0e42110a6222e7f12 -->
+<!-- translated-from: README.md @ d509c06f4f196a937bfeeb3284a671d52c490a3b -->
 [English](README.md) | Українська
 
 # kopia-docker-watcher
@@ -218,7 +218,7 @@ kopia server чи Docker. Кожна з них завершується з ко�
 - [docs/uk/migration.md](docs/uk/migration.md): перехід із програми на Python `kopia-docker-operator`.
 - [examples/](examples/): файл compose із kopia server, watcher і контейнером із мітками.
 
-Це український переклад документації; першоджерело — англійський текст (`README.md` і `docs/`). Змінюючи
+Це український переклад документації; першоджерело — англійський текст (`README.md` і `docs/en/`). Змінюючи
 англійський текст, оновіть його український відповідник у тому самому pull request, використовуючи терміни з
 [docs/uk/GLOSSARY.md](docs/uk/GLOSSARY.md), або напишіть у pull request, що переклад відстає. `make docs-check`
 показує відсутні й застарілі переклади та биті посилання.

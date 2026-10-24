@@ -8,7 +8,7 @@ snapshot source in your kopia server, keeps its schedule in line with the labels
 is stopped, and takes snapshots when the container starts or stops.
 
 It is the Go successor of the Python `kopia-docker-operator`. The labels are compatible; the deployment of the
-watcher itself is not. See [docs/migration.md](docs/migration.md).
+watcher itself is not. See [docs/en/migration.md](docs/en/migration.md).
 
 ## How it works
 
@@ -40,8 +40,8 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
 - Registers a source per path of `kopia.path` and keeps `scheduling.cron` in line with `kopia.schedule`.
 - Finds the host paths of a container's volumes and bind mounts from Docker with `kopia.volumes` (`data`, a mount
   destination such as `/var/lib/postgresql/data`, or `*`), leaving out `kopia.exclude-volumes`. See
-  [docs/labels.md](docs/labels.md#kopiavolumes).
-- Sets the fields of the path's policy that the [policy labels](docs/labels.md#policy-labels) ask for: an
+  [docs/en/labels.md](docs/en/labels.md#kopiavolumes).
+- Sets the fields of the path's policy that the [policy labels](docs/en/labels.md#policy-labels) ask for: an
   interval or times of day, retention, ignore rules and file limits, error handling, compression (checked
   against the algorithms kopia server has), parallel file reads, and any other field with `kopia.policy-json`.
 - Pauses a source (`scheduling.manual=true`) while all its containers are stopped and restores the previous
@@ -50,12 +50,12 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
   at a stop (`kopia.snapshot-on-stop`), follows it to the end and logs the result.
 - Pins the stop snapshot with `kopia.pin-on-stop` (such as `before-update-{date}`), so that retention keeps
   the state from before an update; the cleanup keeps pinned snapshots too.
-- Runs [hooks](docs/labels.md#hooks) in the container around its snapshots: `kopia.pre-exec` before (a database
+- Runs [hooks](docs/en/labels.md#hooks) in the container around its snapshots: `kopia.pre-exec` before (a database
   dump, say; when it fails, no snapshot is taken) and `kopia.post-exec` after, whatever became of the snapshot,
   each within `kopia.hook-timeout`. kopia server would take scheduled snapshots without the hooks, so the watcher
   takes the scheduled snapshots of such a source itself, at the times kopia server's policy gives, with
   `runMissed` honored, and keeps kopia server's schedule of it off.
-- [Stops or pauses](docs/labels.md#stopping-and-pausing) a container for its snapshots
+- [Stops or pauses](docs/en/labels.md#stopping-and-pausing) a container for its snapshots
   (`kopia.stop-during-backup`, `kopia.pause-during-backup`), with the containers that depend on it
   (`kopia.depends-on`), and starts it again after, at the latest after `kopia.max-downtime`, also when the
   watcher stops; one the watcher left down when it crashed comes back when it starts again.
@@ -70,22 +70,22 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
 - `validate` checks labels before you deploy them; `run --dry-run` prints what the watcher would do without
   changing anything.
 - `list`, `trigger` and `restore`, run with `docker exec` in the watcher's container, ask the running watcher
-  through its [control socket](docs/configuration.md#control_socket): `list` shows the managed sources and their
+  through its [control socket](docs/en/configuration.md#control_socket): `list` shows the managed sources and their
   state, `trigger` takes a snapshot through the watcher's queue, with the hooks, the downtime and the minimum
   interval of the labels, and `restore` restores a snapshot into a directory on kopia server. See
-  [docs/restore.md](docs/restore.md).
+  [docs/en/restore.md](docs/en/restore.md).
 - Serves Prometheus metrics on `/metrics`: when each source last had a complete snapshot (scheduled ones
   included), failures and durations of the watcher's own snapshots and of the hooks, reconcile errors, and the
-  managed sources with their containers. See [docs/metrics.md](docs/metrics.md).
+  managed sources with their containers. See [docs/en/metrics.md](docs/en/metrics.md).
 - Checks on `/healthz` that Docker answers, that kopia server answers with a repository connected, and that the
   reconcile loop is not stuck, and answers 503 when one of them has failed for a while; the image's
-  `HEALTHCHECK` uses it. See [the health check](docs/configuration.md#health-check).
+  `HEALTHCHECK` uses it. See [the health check](docs/en/configuration.md#health-check).
 - Posts a notification to `NOTIFY_WEBHOOK_URL` when a path starts failing (a failed snapshot of the watcher, a
   failed hook, labels that cannot be applied, kopia server failing for a while) and when it works again, once
-  each, as JSON or for ntfy, Slack or Telegram. See [notifications](docs/configuration.md#notifications).
+  each, as JSON or for ntfy, Slack or Telegram. See [notifications](docs/en/configuration.md#notifications).
 - Sets kopia server's upload, download and storage operation limits from the `KOPIA_THROTTLE_` variables; unset,
-  it leaves them to kopia server or Terraform. See [throttle](docs/configuration.md#throttle).
-  [docs/terraform.md](docs/terraform.md) splits kopia server's configuration between the watcher and
+  it leaves them to kopia server or Terraform. See [throttle](docs/en/configuration.md#throttle).
+  [docs/en/terraform.md](docs/en/terraform.md) splits kopia server's configuration between the watcher and
   terraform-provider-kopia.
 
 Not supported yet:
@@ -98,10 +98,10 @@ Not supported yet:
 container list, container inspect and the event stream: through `/var/run/docker.sock`, or through a
 [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) that allows `CONTAINERS` and `EVENTS`
 (see [examples/docker-compose.yml](examples/docker-compose.yml)). The health check pings the daemon (`/_ping`),
-which docker-socket-proxy allows by default. [Hooks](docs/labels.md#hooks) run with `docker exec`, which with
+which docker-socket-proxy allows by default. [Hooks](docs/en/labels.md#hooks) run with `docker exec`, which with
 docker-socket-proxy needs `EXEC=1` and `POST=1` as well, and [stopping and
-pausing](docs/labels.md#stopping-and-pausing) containers needs `POST=1` (see
-[Docker](docs/configuration.md#docker)).
+pausing](docs/en/labels.md#stopping-and-pausing) containers needs `POST=1` (see
+[Docker](docs/en/configuration.md#docker)).
 
 **kopia server.** The watcher is tested against the latest Kopia release, 0.23.1. kopia server must run with:
 
@@ -115,7 +115,7 @@ pausing](docs/labels.md#stopping-and-pausing) containers needs `POST=1` (see
 - **no need for `--disable-csrf-token-checks`.** The watcher gets a CSRF token like the web UI does and gets a
   new one after kopia server restarts, so you can keep the CSRF checks on.
 - **the paths visible.** Every path in `kopia.path` must exist inside the kopia server container, at the same
-  path or under `HOST_PREFIX` (see [HOST_PREFIX](docs/configuration.md#host_prefix)). kopia server checks that
+  path or under `HOST_PREFIX` (see [HOST_PREFIX](docs/en/configuration.md#host_prefix)). kopia server checks that
   the path exists when the watcher registers it. For `kopia.volumes`, kopia server must see Docker's volume
   directory, `/var/lib/docker/volumes` by default, and the host paths of the bind mounts: mount them read-only,
   for example `/var/lib/docker/volumes:/var/lib/docker/volumes:ro`.
@@ -178,7 +178,7 @@ The image runs `kopia-docker-watcher run` by default.
 | `validate [--strict] --all` | Check every container with `kopia.enable`, stopped ones included. |
 | `list [--json]` | List the sources the running watcher manages: path, containers, paused, who schedules the snapshots and the next one, the last complete snapshot, kopia server's status and the last problem. |
 | `trigger [--force] [--no-wait] CONTAINER\|PATH` | Take a snapshot of each path of a container, or of one path, through the running watcher's queue, with the hooks, stop/pause and `kopia.min-interval`, and wait for its result. `--force` ignores `kopia.min-interval`; `--no-wait` returns once it is asked for. |
-| `restore --target DIR [--overwrite] [--stop] CONTAINER\|PATH [SNAPSHOT]` | Restore a snapshot, by default the newest complete one, into `DIR` on kopia server through the running watcher (`POST /api/v1/restore`), and follow kopia server's task to the end. Refuses a `DIR` that is not empty unless `--overwrite`; `--stop` stops the path's containers while it runs. See [docs/restore.md](docs/restore.md). |
+| `restore --target DIR [--overwrite] [--stop] CONTAINER\|PATH [SNAPSHOT]` | Restore a snapshot, by default the newest complete one, into `DIR` on kopia server through the running watcher (`POST /api/v1/restore`), and follow kopia server's task to the end. Refuses a `DIR` that is not empty unless `--overwrite`; `--stop` stops the path's containers while it runs. See [docs/en/restore.md](docs/en/restore.md). |
 | `healthcheck` | Exit 0 if the watcher in the same container answers 200 on `/healthz`, that is, is not unhealthy; used by the image's `HEALTHCHECK`. |
 | `version` | Print the version. |
 
@@ -206,16 +206,16 @@ Logs are JSON lines on stderr.
 
 ## Documentation
 
-- [docs/configuration.md](docs/configuration.md): environment variables.
-- [docs/labels.md](docs/labels.md): container labels.
-- [docs/metrics.md](docs/metrics.md): Prometheus metrics, a scrape configuration and example alerts.
-- [docs/restore.md](docs/restore.md): `list`, `trigger` and `restore`, with examples and what to watch out for.
-- [docs/terraform.md](docs/terraform.md): working with terraform-provider-kopia, who owns what.
-- [docs/migration.md](docs/migration.md): moving from the Python `kopia-docker-operator`.
+- [docs/en/configuration.md](docs/en/configuration.md): environment variables.
+- [docs/en/labels.md](docs/en/labels.md): container labels.
+- [docs/en/metrics.md](docs/en/metrics.md): Prometheus metrics, a scrape configuration and example alerts.
+- [docs/en/restore.md](docs/en/restore.md): `list`, `trigger` and `restore`, with examples and what to watch out for.
+- [docs/en/terraform.md](docs/en/terraform.md): working with terraform-provider-kopia, who owns what.
+- [docs/en/migration.md](docs/en/migration.md): moving from the Python `kopia-docker-operator`.
 - [examples/](examples/): a compose file with kopia server, the watcher and a labeled container.
 
 The documentation is also translated into Ukrainian: [README.uk.md](README.uk.md) and [docs/uk/](docs/uk/). English
-is the source. When you change `README.md` or a file under `docs/`, update its Ukrainian counterpart in the same
+is the source. When you change `README.md` or a file under `docs/en/`, update its Ukrainian counterpart in the same
 pull request, using the terms in [docs/uk/GLOSSARY.md](docs/uk/GLOSSARY.md), or say in the pull request that the
 translation lags behind. `make docs-check` reports missing and outdated translations and broken links.
 

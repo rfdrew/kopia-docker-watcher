@@ -1,5 +1,5 @@
-<!-- translated-from: docs/metrics.md @ d697bf00e12a9b05382727b0e42110a6222e7f12 -->
-[English](../metrics.md) | Українська
+<!-- translated-from: docs/en/metrics.md @ d509c06f4f196a937bfeeb3284a671d52c490a3b -->
+[English](../en/metrics.md) | Українська
 
 # <a id="metrics"></a>Метрики
 
