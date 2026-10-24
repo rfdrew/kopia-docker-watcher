@@ -21,7 +21,7 @@ snapshot history.
 | `KOPIA_EXEC_CONTAINER` (exec mode) | Removed. The watcher refuses to start while it is set. |
 | `KOPIA_SERVER_CERT_FINGERPRINT` turned TLS verification off, whatever its value | The fingerprint is verified. It is the hex value after `SERVER CERT SHA256:` in the kopia server log, not the `SHA256:…` value the operator's README suggested. A value that worked before is most likely wrong now. |
 | kopia server needed `--disable-csrf-token-checks` for the API calls to work | Not needed: the watcher handles CSRF tokens. You can remove the flag. |
-| The image `rfdrew/kopia-docker-watcher:0.1.0` on Docker Hub | The watcher is published in the same Docker Hub repository and as `ghcr.io/rfdrew/kopia-docker-watcher`, with the tags in the [README](../../README.md#image). The watcher's release 0.1.0 takes over the tag `0.1.0`, which was the operator's. |
+| The image `rfdrew/kopia-docker-watcher:0.1.0` on Docker Hub | The watcher is published in the same Docker Hub repository and as `ghcr.io/rfdrew/kopia-docker-watcher`, with the tags in the [README](../../README.md#image). The watcher's releases start at 0.2.0, so the tag `0.1.0` stays the operator's. |
 | — | A `stop_grace_period` of 10 s or more (the default) lets the watcher save its state on shutdown. |
 
 `KOPIA_SERVER_URL`, `KOPIA_SERVER_USERNAME`, `KOPIA_SERVER_PASSWORD`, `HOST_PREFIX` and `LOG_LEVEL` keep their

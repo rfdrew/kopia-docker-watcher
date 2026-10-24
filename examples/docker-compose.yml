@@ -65,11 +65,11 @@ services:
       - "127.0.0.1:51515:51515"
 
   watcher:
-    # :0.1 follows the latest 0.1.x release and appears with v0.1.0. To try a
-    # release candidate, name it exactly, as in :0.1.0-rc.2; candidates never
-    # move :0.1 or :latest. The same image is on Docker Hub as
+    # :0.2 follows the latest 0.2.x release and appears with v0.2.0. To try a
+    # release candidate, name it exactly, as in :0.2.0-rc.1; candidates never
+    # move :0.2 or :latest. The same image is on Docker Hub as
     # rfdrew/kopia-docker-watcher.
-    image: ghcr.io/rfdrew/kopia-docker-watcher:0.1
+    image: ghcr.io/rfdrew/kopia-docker-watcher:0.2
     restart: unless-stopped
     # The default command is run. To see the plan first without changing
     # anything, either run it once next to this service:

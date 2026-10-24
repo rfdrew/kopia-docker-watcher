@@ -4,7 +4,7 @@ package version
 // Build information, set with -ldflags "-X ...". goreleaser and
 // `make build` fill all three; a plain `go build` leaves the defaults.
 var (
-	// Version is the release version of the binary, for example "v0.1.0".
+	// Version is the release version of the binary, for example "v0.2.0".
 	Version = "dev"
 	// Commit is the full git commit the binary was built from.
 	Commit = "unknown"

@@ -58,7 +58,7 @@ changelog:
   sort: asc
 
 release:
-  # A tag like v0.1.0-rc.1 becomes a GitHub pre-release.
+  # A tag like v0.2.0-rc.1 becomes a GitHub pre-release.
   prerelease: auto
 
 dockers_v2:
