@@ -6,7 +6,7 @@
 #   # put the hex value into KOPIA_SERVER_CERT_FINGERPRINT in .env
 #   docker compose up -d
 #
-# See ../README.md and ../docs/configuration.md.
+# See ../README.md and ../docs/en/configuration.md.
 
 name: kopia-docker-watcher-example
 
@@ -106,7 +106,7 @@ services:
       WATCHER_PATH_PREFIX: ${WATCHER_PATH_PREFIX:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       # Optional notifications when a path starts failing and when it works
-      # again (../docs/configuration.md#notifications).
+      # again (../docs/en/configuration.md#notifications).
       NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
       NOTIFY_WEBHOOK_FORMAT: ${NOTIFY_WEBHOOK_FORMAT:-}
       # With docker-socket-proxy:
@@ -117,7 +117,7 @@ services:
     # /healthz (Docker, kopia server and the reconcile loop) and the
     # Prometheus metrics, /metrics, are on LISTEN_ADDR
     # (:8080). The port is not published: a Prometheus in this network
-    # scrapes watcher:8080 (see ../docs/metrics.md).
+    # scrapes watcher:8080 (see ../docs/en/metrics.md).
 
   # Least-privilege access to Docker: only GET requests to containers and
   # events (the proxy also allows /_ping and /version, which the Docker
@@ -125,7 +125,7 @@ services:
   # and remove group_add and the docker.sock mount from the watcher.
   # Hooks (kopia.pre-exec, kopia.post-exec) run with docker exec: they need
   # EXEC: 1 and POST: 1, which lets through every POST to containers too
-  # (../docs/configuration.md#docker). kopia.stop-during-backup and
+  # (../docs/en/configuration.md#docker). kopia.stop-during-backup and
   # kopia.pause-during-backup need POST: 1.
   #
   # docker-socket-proxy:

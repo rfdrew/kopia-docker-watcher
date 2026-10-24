@@ -1,5 +1,5 @@
-<!-- translated-from: docs/terraform.md @ d697bf00e12a9b05382727b0e42110a6222e7f12 -->
-[English](../terraform.md) | Українська
+<!-- translated-from: docs/en/terraform.md @ d697bf00e12a9b05382727b0e42110a6222e7f12 -->
+[English](../en/terraform.md) | Українська
 
 # <a id="with-the-terraform-provider"></a>З провайдером Terraform
 

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Checks the Ukrainian translation of the documentation against the English
-# source: README.md and docs/*.md are translated in README.uk.md and
-# docs/uk/*.md (docs/uk/GLOSSARY.md has no English counterpart).
+# source: README.md and docs/en/*.md are translated in README.uk.md and
+# docs/uk/*.md (docs/uk/GLOSSARY.md has no English counterpart). The files
+# directly under docs/ only point to their new place under docs/en/.
 #
 # Each translation starts with a comment naming its source and the commit the
 # translation was made from:
 #
-#   <!-- translated-from: docs/labels.md @ <commit> -->
+#   <!-- translated-from: docs/en/labels.md @ <commit> -->
 #
 # Errors (exit status 1): an English file without a translation, a translation
 # without an English file, a missing or wrong comment, a commit that is not in
@@ -40,7 +41,7 @@ report() {
 translation_of() {
 	case $1 in
 	README.md) echo README.uk.md ;;
-	docs/*) echo "docs/uk/${1#docs/}" ;;
+	docs/en/*) echo "docs/uk/${1#docs/en/}" ;;
 	esac
 }
 
@@ -48,7 +49,7 @@ translation_of() {
 source_of() {
 	case $1 in
 	README.uk.md) echo README.md ;;
-	docs/uk/*) echo "docs/${1#docs/uk/}" ;;
+	docs/uk/*) echo "docs/en/${1#docs/uk/}" ;;
 	esac
 }
 
@@ -59,7 +60,7 @@ has_switcher() {
 }
 
 english=(README.md)
-for f in docs/*.md; do
+for f in docs/en/*.md; do
 	if [ -f "$f" ]; then
 		english+=("$f")
 	fi
@@ -80,7 +81,7 @@ for src in "${english[@]}"; do
 	if [ "$src" = README.md ]; then
 		link=README.uk.md
 	else
-		link=uk/${src#docs/}
+		link=../uk/${src#docs/en/}
 	fi
 	has_switcher "$src" "$link" || report error "$src" "no language switcher linking to $link at the top"
 done
@@ -96,7 +97,7 @@ for uk in "${ukrainian[@]}"; do
 	if [ "$uk" = README.uk.md ]; then
 		link=README.md
 	else
-		link=../${src#docs/}
+		link=../en/${src#docs/en/}
 	fi
 	has_switcher "$uk" "$link" || report error "$uk" "no language switcher linking to $link at the top"
 

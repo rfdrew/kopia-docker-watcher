@@ -110,7 +110,7 @@ func WebhookFormats() []string {
 }
 
 // MigrationGuideURL points to the guide for users of the Python version.
-const MigrationGuideURL = "https://github.com/rfdrew/kopia-docker-watcher/blob/main/docs/migration.md"
+const MigrationGuideURL = "https://github.com/rfdrew/kopia-docker-watcher/blob/main/docs/en/migration.md"
 
 // Config is the complete watcher configuration.
 type Config struct {

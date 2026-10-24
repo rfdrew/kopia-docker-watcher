@@ -218,7 +218,7 @@ kopia server чи Docker. Кожна з них завершується з ко�
 - [docs/uk/migration.md](docs/uk/migration.md): перехід із програми на Python `kopia-docker-operator`.
 - [examples/](examples/): файл compose із kopia server, watcher і контейнером із мітками.
 
-Це український переклад документації; першоджерело — англійський текст (`README.md` і `docs/`). Змінюючи
+Це український переклад документації; першоджерело — англійський текст (`README.md` і `docs/en/`). Змінюючи
 англійський текст, оновіть його український відповідник у тому самому pull request, використовуючи терміни з
 [docs/uk/GLOSSARY.md](docs/uk/GLOSSARY.md), або напишіть у pull request, що переклад відстає. `make docs-check`
 показує відсутні й застарілі переклади та биті посилання.

@@ -1,5 +1,5 @@
-<!-- translated-from: docs/configuration.md @ d697bf00e12a9b05382727b0e42110a6222e7f12 -->
-[English](../configuration.md) | Українська
+<!-- translated-from: docs/en/configuration.md @ d697bf00e12a9b05382727b0e42110a6222e7f12 -->
+[English](../en/configuration.md) | Українська
 
 # <a id="configuration"></a>Конфігурація
 

@@ -69,7 +69,7 @@ Restores a snapshot of a source into the directory DIR on kopia server,
 through the running watcher, with kopia server's POST /api/v1/restore, and
 follows kopia server's restore task until it ends. kopia server writes the
 files: DIR is a path on kopia server, and the volume it lies on must be
-mounted into kopia server writable. See docs/restore.md.
+mounted into kopia server writable. See docs/en/restore.md.
 
 SNAPSHOT is a snapshot ID, or a start of it of at least six characters;
 by default the newest complete snapshot. CONTAINER and PATH are as for

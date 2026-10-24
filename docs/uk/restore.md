@@ -1,5 +1,5 @@
-<!-- translated-from: docs/restore.md @ d697bf00e12a9b05382727b0e42110a6222e7f12 -->
-[English](../restore.md) | Українська
+<!-- translated-from: docs/en/restore.md @ d697bf00e12a9b05382727b0e42110a6222e7f12 -->
+[English](../en/restore.md) | Українська
 
 # <a id="list-trigger-and-restore"></a>list, trigger і restore
 

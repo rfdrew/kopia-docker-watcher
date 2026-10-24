@@ -35,7 +35,7 @@ Commands:
 list, trigger and restore ask the watcher that runs in the same container,
 through CONTROL_SOCKET: run them with docker exec.
 
-Configuration is read from environment variables, see docs/configuration.md.
+Configuration is read from environment variables, see docs/en/configuration.md.
 `
 
 const healthcheckTimeout = 5 * time.Second

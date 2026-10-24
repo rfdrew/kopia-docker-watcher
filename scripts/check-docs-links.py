@@ -110,8 +110,8 @@ def translation_of(path):
     """Returns the Ukrainian counterpart of an English file, or None."""
     if path == "README.md":
         return "README.uk.md"
-    if path.startswith("docs/") and not path.startswith("docs/uk/"):
-        return "docs/uk/" + path[len("docs/"):]
+    if path.startswith("docs/en/"):
+        return "docs/uk/" + path[len("docs/en/"):]
     return None
 
 

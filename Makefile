@@ -56,7 +56,7 @@ release-check:
 snapshot:
 	$(GORELEASER) release --snapshot --clean $(SNAPSHOT_FLAGS)
 
-# The Ukrainian translation of README.md and docs/ (README.uk.md, docs/uk/):
+# The Ukrainian translation of README.md and docs/en/ (README.uk.md, docs/uk/):
 # a missing translation is an error, an outdated one a warning. Then the links
 # and anchors of the documentation in both languages.
 docs-check:
