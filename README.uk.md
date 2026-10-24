@@ -1,4 +1,4 @@
-<!-- translated-from: README.md @ 329ca2ffc8a08a125910c6ba8d19837c70de5f88 -->
+<!-- translated-from: README.md @ 990ac34c92158afde6075bab36b8fde5ebd3f5bc -->
 [English](README.md) | Українська
 
 # kopia-docker-watcher

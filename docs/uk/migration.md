@@ -1,4 +1,4 @@
-<!-- translated-from: docs/en/migration.md @ 329ca2ffc8a08a125910c6ba8d19837c70de5f88 -->
+<!-- translated-from: docs/en/migration.md @ 990ac34c92158afde6075bab36b8fde5ebd3f5bc -->
 [English](../en/migration.md) | Українська
 
 # <a id="migrating-from-kopia-docker-operator"></a>Перехід із kopia-docker-operator
