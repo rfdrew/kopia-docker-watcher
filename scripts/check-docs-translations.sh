@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Checks the Ukrainian translation of the documentation against the English
 # source: README.md and docs/en/*.md are translated in README.uk.md and
-# docs/uk/*.md (docs/uk/GLOSSARY.md has no English counterpart). The files
-# directly under docs/ only point to their new place under docs/en/.
+# docs/uk/*.md (docs/uk/GLOSSARY.md has no English counterpart).
 #
 # Each translation starts with a comment naming its source and the commit the
 # translation was made from:
