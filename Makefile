@@ -1,6 +1,7 @@
 GO            ?= go
 GOLANGCI_LINT ?= golangci-lint
 GORELEASER    ?= goreleaser
+PYTHON        ?= python3
 
 BINARY  := kopia-docker-watcher
 PKG     := github.com/rfdrew/kopia-docker-watcher
@@ -21,7 +22,7 @@ KOPIA_IMAGE ?=
 # without a Docker daemon.
 SNAPSHOT_FLAGS ?=
 
-.PHONY: all build test test-integration lint fmt tidy docker release-check snapshot clean
+.PHONY: all build test test-integration lint fmt tidy docker release-check snapshot docs-check clean
 
 all: lint test build
 
@@ -54,6 +55,13 @@ release-check:
 # per-platform images tagged <version>-amd64/-arm64. Nothing is published.
 snapshot:
 	$(GORELEASER) release --snapshot --clean $(SNAPSHOT_FLAGS)
+
+# The Ukrainian translation of README.md and docs/ (README.uk.md, docs/uk/):
+# a missing translation is an error, an outdated one a warning. Then the links
+# and anchors of the documentation in both languages.
+docs-check:
+	scripts/check-docs-translations.sh
+	$(PYTHON) scripts/check-docs-links.py
 
 clean:
 	rm -rf bin dist
