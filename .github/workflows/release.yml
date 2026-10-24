@@ -4,6 +4,9 @@ on:
   push:
     tags: ['v*']
 
+# docker.io/rfdrew/kopia-docker-watcher is pushed with the secrets
+# DOCKERHUB_USERNAME and DOCKERHUB_TOKEN; without them the release stops
+# before it publishes anything.
 permissions:
   contents: write  # GitHub release and its assets
   packages: write  # ghcr.io/rfdrew/kopia-docker-watcher
@@ -36,6 +39,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           distribution: goreleaser

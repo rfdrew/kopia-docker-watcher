@@ -225,9 +225,11 @@ kopia server чи Docker. Кожна з них завершується з ко�
 
 ## <a id="image"></a>Образ
 
-Релізи публікують `ghcr.io/rfdrew/kopia-docker-watcher` для linux/amd64 і linux/arm64 з тегами: версія (`0.1.0`),
-`major.minor` (`0.1`) і `latest`; передрелізи отримують лише власний тег. Образ побудовано на distroless, і він
-працює від імені некореневого користувача 65532, якому потрібен доступ до сокета Docker (див. приклад).
+Релізи публікують той самий образ у GitHub Container Registry як `ghcr.io/rfdrew/kopia-docker-watcher` і в
+Docker Hub як [`rfdrew/kopia-docker-watcher`](https://hub.docker.com/r/rfdrew/kopia-docker-watcher), для
+linux/amd64 і linux/arm64, з тегами: версія (`0.1.0`), `major.minor` (`0.1`) і `latest`; передрелізи отримують
+лише власний тег. Образ побудовано на distroless, і він працює від імені некореневого користувача 65532, якому
+потрібен доступ до сокета Docker (див. приклад).
 
 ## <a id="license"></a>Ліцензія
 

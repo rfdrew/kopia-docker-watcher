@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://goreleaser.com/static/schema.json
 # Release configuration: binaries, archives, checksums and the multi-arch
-# image in GHCR. Run by .github/workflows/release.yml on a v* tag; check it
-# locally with `make release-check` and `make snapshot`.
+# image in GHCR and Docker Hub. Run by .github/workflows/release.yml on a v*
+# tag; check it locally with `make release-check` and `make snapshot`.
 version: 2
 
 project_name: kopia-docker-watcher
@@ -69,8 +69,10 @@ dockers_v2:
     # the root Dockerfile stays the self-contained build used by CI and
     # `make docker`.
     dockerfile: Dockerfile.goreleaser
+    # The same image and tags in both registries.
     images:
       - ghcr.io/rfdrew/kopia-docker-watcher
+      - docker.io/rfdrew/kopia-docker-watcher
     # major.minor and latest move only on final releases, so a
     # pre-release never replaces what users pull by default.
     tags:
