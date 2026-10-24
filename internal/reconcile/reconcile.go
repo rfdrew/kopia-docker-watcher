@@ -176,6 +176,21 @@
 // the watcher's own stops and starts cause, die, stop and start, are
 // dropped, so they take no snapshot at a start or a stop either.
 //
+// # Manual requests
+//
+// Trigger asks for a snapshot of the paths of a container, or of one path,
+// by hand: the next pass over each path takes it as it takes the snapshot
+// at a container's start, with the hooks and the downtime of the owners
+// and, unless forced, the minimum interval, and the Trigger it returns
+// ends with the snapshot's result, or with why none was taken. Triggers
+// are kept in memory only: a stop of the watcher ends them. Sources reports
+// what the passes last found about each path, with the state and kopia
+// server's status, for the list command. StopOwnersFor stops the running
+// owners of a source and those that depend on them for a restore, as a
+// snapshot with stop-during-backup does, and brings them back once the
+// restore has ended; meanwhile the source takes no snapshot the watcher
+// queues.
+//
 // # Cleanup
 //
 // The state remembers the owners of each source the watcher manages, with
@@ -412,6 +427,11 @@ type Options struct {
 	// without an owner before cleanup-on-remove deletes anything of it;
 	// zero means config.DefaultCleanupGrace.
 	CleanupGrace time.Duration
+
+	// RestoreTaskRunning reports whether kopia server's restore task with
+	// the ID still runs, for the containers StopOwnersFor stopped, which
+	// stay down until it has ended; nil brings them back regardless.
+	RestoreTaskRunning func(ctx context.Context, taskID string) (bool, error)
 }
 
 // Reconciler reconciles source paths. Create it with New, start it with
@@ -439,6 +459,7 @@ type Reconciler struct {
 	shutdownGrace          time.Duration
 	snapshotOnWatcherStart bool
 	cleanupGrace           time.Duration
+	restoreTaskRunning     func(ctx context.Context, taskID string) (bool, error)
 
 	// now is the clock of the snapshot steps; tests replace it.
 	now func() time.Time
@@ -533,6 +554,17 @@ type Reconciler struct {
 	// dependsLogged holds by container ID the problems of its depends-on
 	// label last reported.
 	dependsLogged map[string]string
+
+	// manual holds per path the manual triggers waiting for a pass;
+	// manualWaits those whose snapshot a wait follows, manualRuns those of
+	// a snapshot with hooks, and runOfWait the run of a wait whose result
+	// the triggers of the run take. status holds what the passes last
+	// found per path, for Sources. See manual.go and status.go.
+	manual      map[string][]*Trigger
+	manualWaits map[waitKey][]*Trigger
+	manualRuns  map[runKey][]*Trigger
+	runOfWait   map[waitKey]string
+	status      map[string]*pathStatus
 
 	// dockerTimeout bounds every container listing.
 	dockerTimeout time.Duration
@@ -643,8 +675,14 @@ func New(opts Options) (*Reconciler, error) {
 		execs:          map[string]int{},
 		returnWake:     make(chan struct{}, 1),
 		passStarts:     map[string]time.Time{},
+		manual:         map[string][]*Trigger{},
+		manualWaits:    map[waitKey][]*Trigger{},
+		manualRuns:     map[runKey][]*Trigger{},
+		runOfWait:      map[waitKey]string{},
+		status:         map[string]*pathStatus{},
 
 		snapshotOnWatcherStart: opts.SnapshotOnWatcherStart,
+		restoreTaskRunning:     opts.RestoreTaskRunning,
 		cleanupGrace:           orDefault(opts.CleanupGrace, config.DefaultCleanupGrace),
 	}
 
@@ -749,6 +787,8 @@ func (r *Reconciler) Run(ctx context.Context) {
 
 	// What the goroutines of the runs left down, within ShutdownGrace.
 	r.returnHeld(passCtx, false)
+
+	r.endManual()
 }
 
 // work takes paths until ctx is done and runs their passes with passCtx.

@@ -149,7 +149,7 @@ func (ps *pass) downPlan() downPlan {
 			ids[i] = o.id
 		}
 
-		group, members, err := ps.stopGroup(ids, ps.containers)
+		group, members, err := ps.stopGroup(ids, ps.containers, runningOnly)
 		if err != nil {
 			errs = append(errs, err.Error())
 		}
@@ -337,8 +337,8 @@ func DependsOnProblems(containers []docker.Container, prefix string) map[string]
 // otherwise by name. members are the IDs of the whole group, whatever the
 // state of its containers. A problem with the depends-on label of one of
 // them, or a cycle among them, is an error: the order is not known.
-func (r *Reconciler) stopGroup(targets []string, containers []docker.Container) (group []docker.Container, members []string,
-	err error,
+func (r *Reconciler) stopGroup(targets []string, containers []docker.Container, take func(docker.State) bool) (
+	group []docker.Container, members []string, err error,
 ) {
 	g := newDependsGraph(containers, r.labelPrefix)
 
@@ -398,7 +398,7 @@ func (r *Reconciler) stopGroup(targets []string, containers []docker.Container) 
 			}
 		}
 
-		if c := g.byID[id]; c.State == docker.StateRunning {
+		if c := g.byID[id]; take(c.State) {
 			group = append(group, c)
 		}
 	}
@@ -862,7 +862,7 @@ func (r *Reconciler) takeDown(ctx context.Context, log *slog.Logger, src backend
 			continue
 		case err != nil:
 			return taken, it.name + ": " + err.Error()
-		case c.State != docker.StateRunning:
+		case !takeable(run.ID, c.State):
 			log.Info("not taking down a container that is not running; it is left as it is", append(attrs, "state", string(c.State))...)
 			r.dropHeld(it.id)
 
@@ -1080,6 +1080,10 @@ func (r *Reconciler) bringBackOne(ctx context.Context, log *slog.Logger, h state
 		// Reserved, but never taken down.
 		r.dropHeld(h.ID)
 		return ""
+	}
+
+	if msg := r.restoreTaskRuns(ctx, log, h, attrs); msg != "" {
+		return msg
 	}
 
 	ictx, cancel := context.WithTimeout(ctx, r.dockerTimeout)

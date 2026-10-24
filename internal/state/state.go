@@ -405,6 +405,10 @@ type Held struct {
 	// listed until the post-exec hooks of its run are done, so that no
 	// other snapshot takes it down while they run in it.
 	Back bool `json:"back,omitempty"`
+	// RestoreTask is the ID of kopia server's restore task a container
+	// stopped for a restore waits for: it is not brought back while that
+	// task runs, so that it does not run on files still being written.
+	RestoreTask string `json:"restoreTask,omitempty"`
 }
 
 // validate reports whether h can be stored.

@@ -12,6 +12,7 @@ import (
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend"
 	"github.com/rfdrew/kopia-docker-watcher/internal/backend/rest"
 	"github.com/rfdrew/kopia-docker-watcher/internal/config"
+	"github.com/rfdrew/kopia-docker-watcher/internal/control"
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
 	"github.com/rfdrew/kopia-docker-watcher/internal/health"
 	"github.com/rfdrew/kopia-docker-watcher/internal/kopiaclient"
@@ -140,6 +141,9 @@ type watcher struct {
 	// notifier sends the notifications; nil in a dry run and without
 	// NOTIFY_WEBHOOK_URL.
 	notifier *notify.Notifier
+	// control serves the control socket; nil in a dry run and when it
+	// cannot be served.
+	control *control.Server
 }
 
 // run serves /healthz and /metrics, sends the notifications, waits for
@@ -178,6 +182,8 @@ func (w *watcher) run(ctx context.Context) int {
 	w.log.Info("serving HTTP", "addr", ln.Addr().String())
 
 	go func() { serveErr <- srv.Serve() }()
+
+	closeControl := w.serveControl()
 
 	// A failed HTTP server stops the watcher like a signal does, with exit
 	// status 1.
@@ -225,6 +231,8 @@ func (w *watcher) run(ctx context.Context) int {
 	} else {
 		w.log.Info("HTTP server stopped")
 	}
+
+	closeControl(shutdownCtx)
 
 	// Nothing started here outlives run.
 	if serveErr != nil {
@@ -301,6 +309,15 @@ func (w *watcher) watch(ctx context.Context) (code int) {
 	if err != nil {
 		w.log.Error("cannot create the reconciler", "error", err.Error())
 		return 1
+	}
+
+	if w.control != nil {
+		w.control.SetHandler(w.controlHandler(rec, kopia))
+
+		defer func() {
+			w.control.SetNotReady("the watcher is stopping")
+			w.control.SetHandler(nil)
+		}()
 	}
 
 	stall := max(2*w.cfg.ReconcileInterval, minStall)
@@ -454,7 +471,26 @@ func (w *watcher) reconciler(kopia *kopiaclient.Client, store *state.Store, engi
 		WatcherPathPrefix:      w.cfg.WatcherPathPrefix,
 		SnapshotOnWatcherStart: w.cfg.SnapshotOnWatcherStart,
 		CleanupGrace:           w.cfg.CleanupGrace,
+		RestoreTaskRunning:     restoreTaskRunning(kopia),
 	})
+}
+
+// restoreTaskRunning reports whether kopia server's restore task with the
+// ID still runs. A task kopia server no longer knows, as after its
+// restart, or that is another one under the same ID, has ended.
+func restoreTaskRunning(kopia *kopiaclient.Client) func(context.Context, string) (bool, error) {
+	return func(ctx context.Context, id string) (bool, error) {
+		t, err := kopia.GetTask(ctx, id)
+
+		switch {
+		case errors.Is(err, kopiaclient.ErrNotFound):
+			return false, nil
+		case err != nil:
+			return false, err
+		}
+
+		return t.Kind == kopiaclient.TaskKindRestore && !t.Status.IsFinished(), nil
+	}
 }
 
 // waitForKopia asks kopia server for the repository status until it

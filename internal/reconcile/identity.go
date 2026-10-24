@@ -38,6 +38,7 @@ func (r *Reconciler) source(ctx context.Context, p string) (backend.Source, erro
 		case old.userName != userName || old.host != host:
 			r.log.Warn("kopia server's identity changed; reconciling every path under the new one",
 				"old", old.userName+"@"+old.host, "new", userName+"@"+host)
+			r.endManualOf(userName, host)
 			r.ReconcileAll()
 		}
 	}

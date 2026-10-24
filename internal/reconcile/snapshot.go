@@ -83,6 +83,11 @@ type snapRequest struct {
 	// the minimum interval nor a snapshot that is pending or uploading
 	// holds it back.
 	scheduled bool
+
+	// manual is the trigger of a snapshot asked for by hand, taken like
+	// one at a start; with its force set, the minimum interval does not
+	// hold it back.
+	manual *Trigger
 }
 
 // describedContainer is what a container's labels say about the
@@ -193,6 +198,7 @@ func (ps *pass) snapshots() error {
 	reqs, identical := ps.handleFinished(finished, rec.SnapshotWaits, status, mark)
 	reqs = append(reqs, ps.absorbedRetry(rec, status, mark, identical)...)
 	reqs = append(reqs, ps.requests()...)
+	reqs = append(reqs, ps.manualRequests()...)
 
 	if err := ps.hookRun(status); err != nil {
 		return err
@@ -856,9 +862,16 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 	}
 
 	switch {
+	case ps.restoring():
+		// The files change under the restore until it ends.
+		ps.keepEvents(reqs)
+		ps.log.Info("the snapshot waits for the restore of the source under way", attrs...)
+
+		return nil
 	case st == backend.StatusStopped:
 		ps.log.Warn("not queuing a snapshot: kopia server does not run snapshots of the source now",
 			append(attrs, "status", string(st))...)
+		ps.decline(reqs, "kopia server does not run snapshots of the source now (status "+string(st)+")")
 		ps.settle(reqs, nil)
 		ps.skipDue()
 
@@ -875,12 +888,14 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 		return nil
 	case stop && st == backend.StatusPending:
 		ps.log.Info("not queuing a snapshot: the pending one starts after the stop and counts as the stop snapshot", attrs...)
+		ps.decline(reqs, "a snapshot of the source is pending already")
 		ps.absorbStop(reqs, "", status)
 
 		return nil
 	case stop && st == backend.StatusUploading && ps.queuedWait(status.CurrentTask) != "":
 		ps.log.Info("not queuing a snapshot: one the watcher queued runs after the current upload and counts as the stop snapshot",
 			attrs...)
+		ps.decline(reqs, "a snapshot the watcher queued runs after the current upload")
 		ps.absorbStop(reqs, ps.queuedWait(status.CurrentTask), status)
 
 		return nil
@@ -893,6 +908,7 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 		return nil
 	case st == backend.StatusPending || st == backend.StatusUploading:
 		ps.log.Debug("not queuing a snapshot: one is "+strings.ToLower(string(st)), attrs...)
+		ps.decline(reqs, "a snapshot of the source is "+strings.ToLower(string(st))+" already")
 		ps.settle(reqs, nil)
 
 		return nil
@@ -900,6 +916,7 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 		if next, ok := ps.minIntervalPassed(reqs, status); !ok {
 			ps.log.Debug("not queuing a snapshot: the minimum interval since the last one has not passed",
 				append(attrs, "next_allowed", next.Format(timeFormat))...)
+			ps.decline(reqs, minIntervalMessage(next))
 			ps.settle(reqs, nil)
 
 			return nil
@@ -913,6 +930,7 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 	ticket, err := ps.backend.TriggerSnapshot(ps.ctx, ps.src)
 	if errors.Is(err, backend.ErrNotImplemented) {
 		ps.warnOnce("TriggerSnapshot", "the backend cannot queue snapshots; no snapshot is taken at container starts and stops")
+		ps.decline(reqs, "the backend cannot queue snapshots")
 		ps.settle(reqs, nil)
 
 		return nil
@@ -934,6 +952,7 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 	}
 
 	ps.settle(reqs, &w)
+	ps.attachWait(reqs, w.ID)
 	ps.log.Info("snapshot queued", attrs...)
 	ps.startWait(w)
 
@@ -980,6 +999,7 @@ func (ps *pass) triggerHooked(reqs []snapRequest, status *backend.SourceStatus, 
 	case scheduled:
 	case st == backend.StatusPending || st == backend.StatusUploading:
 		ps.log.Debug("not taking a snapshot: one is "+strings.ToLower(string(st)), attrs...)
+		ps.decline(reqs, "a snapshot of the source is "+strings.ToLower(string(st))+" already")
 		ps.settle(reqs, nil)
 
 		return nil
@@ -987,6 +1007,7 @@ func (ps *pass) triggerHooked(reqs []snapRequest, status *backend.SourceStatus, 
 		if next, ok := ps.minIntervalPassed(reqs, status); !ok {
 			ps.log.Debug("not taking a snapshot: the minimum interval since the last one has not passed",
 				append(attrs, "next_allowed", next.Format(timeFormat))...)
+			ps.decline(reqs, minIntervalMessage(next))
 			ps.settle(reqs, nil)
 
 			return nil
@@ -1022,13 +1043,16 @@ func (ps *pass) preExecRunning() bool {
 	return rec.HookRun != nil && rec.HookRun.Phase == state.HookPre
 }
 
-// keepEvents keeps the events of reqs for a later pass.
+// keepEvents keeps the events and manual triggers of reqs for a later
+// pass.
 func (ps *pass) keepEvents(reqs []snapRequest) {
 	for _, r := range reqs {
 		if r.event != nil {
 			ps.keep = append(ps.keep, *r.event)
 		}
 	}
+
+	ps.keepManual(reqs)
 }
 
 // hooksBusy reports whether a goroutine of this process runs hooks of the
@@ -1076,6 +1100,10 @@ func (ps *pass) minIntervalPassed(reqs []snapRequest, status *backend.SourceStat
 	var first time.Time
 
 	for _, r := range reqs {
+		if r.manual != nil && r.manual.force {
+			return time.Time{}, true
+		}
+
 		last := lastSnapshot
 		if !r.retry && rec.LastTriggered.After(last) {
 			last = rec.LastTriggered
@@ -1643,6 +1671,10 @@ func (r *Reconciler) wait(ctx context.Context, w state.SnapshotWait) {
 				result.SnapshotStart = res.Snapshot.StartTime
 			}
 
+			// The triggers of a snapshot with hooks get the result before a
+			// pass can see it and end the run.
+			r.waitEnded(src, w.ID, result, "")
+
 			// Reported along with the result, with the store locked: no pass
 			// can act on the result, and forget the source, before. A run
 			// kopia server lost track of may have saved its snapshot all the
@@ -1667,6 +1699,7 @@ func (r *Reconciler) wait(ctx context.Context, w state.SnapshotWait) {
 
 				return len(rec.SnapshotWaits) != n
 			})
+			r.waitEnded(src, w.ID, nil, "the backend cannot follow snapshots")
 
 			return
 		case errors.Is(err, backend.ErrWrongIdentity):

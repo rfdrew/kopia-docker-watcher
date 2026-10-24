@@ -194,6 +194,9 @@ func (ps *pass) startHookRun(reqs []snapRequest, status *backend.SourceStatus, r
 		}
 
 		if errors.Is(err, errNoChange) {
+			// Another snapshot with hooks is under way: a manual trigger
+			// waits for it.
+			ps.keepManual(reqs)
 			return nil
 		}
 
@@ -201,6 +204,7 @@ func (ps *pass) startHookRun(reqs []snapRequest, status *backend.SourceStatus, r
 	}
 
 	ps.dropEvents(reqs)
+	ps.attachRun(reqs, run.ID)
 
 	attrs := []any{"source", ps.src.String(), "reasons", reasons, "pre_exec", targetNames(pre),
 		"post_exec", targetNames(hookTargets(ps.owners, HookPostExec))}
@@ -279,7 +283,7 @@ func (ps *pass) hookRun(status *backend.SourceStatus) error {
 	default:
 		ps.log.Warn("dropping a snapshot with hooks in a phase the watcher does not know", "source", ps.src.String(),
 			"phase", run.Phase)
-		ps.endHookRun(run.ID)
+		ps.endHookRun(*run)
 
 		return nil
 	}
@@ -399,6 +403,8 @@ func (ps *pass) queueSnapshot(run state.HookRun) error {
 		return true
 	})
 
+	ps.runWaitQueued(ps.src, run.ID, w.ID)
+
 	ps.log.Info("snapshot queued", "source", ps.src.String(), "reasons", strings.Split(run.Reason, ", "), "hooks", true)
 	ps.startWait(w)
 
@@ -414,7 +420,7 @@ func (ps *pass) toPost(run state.HookRun) error {
 	post := ps.postTargets(run.ID)
 
 	if len(post) == 0 && len(ps.heldFor(ps.src, run.ID)) == 0 {
-		ps.endHookRun(run.ID)
+		ps.endHookRun(run)
 		ps.log.Info("snapshot with hooks done", "source", ps.src.String(), "reason", run.Reason)
 
 		return nil
@@ -476,10 +482,11 @@ func (ps *pass) postTargets(run string) []hookTarget {
 	return out
 }
 
-// endHookRun removes the run with the ID from the record.
-func (ps *pass) endHookRun(id string) {
+// endHookRun removes the run from the record, and ends its manual
+// triggers.
+func (ps *pass) endHookRun(run state.HookRun) {
 	ps.updateRecord(ps.src, func(r *state.Record) bool {
-		if r.HookRun == nil || r.HookRun.ID != id {
+		if r.HookRun == nil || r.HookRun.ID != run.ID {
 			return false
 		}
 
@@ -487,6 +494,8 @@ func (ps *pass) endHookRun(id string) {
 
 		return true
 	})
+
+	ps.runEnded(ps.src, run, "")
 }
 
 // reserveHooks sets up a goroutine to run the hooks of the run with the
@@ -564,6 +573,7 @@ func (ps *pass) goHooks(ctx context.Context, run state.HookRun, hook string, tar
 
 			if hook == HookPostExec {
 				log.Info("snapshot with hooks done", "source", src.String(), "reason", run.Reason)
+				r.runEnded(src, run, failure)
 			}
 		}
 
