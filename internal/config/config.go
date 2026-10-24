@@ -36,6 +36,7 @@ const (
 	EnvWatcherPathPrefix             = "WATCHER_PATH_PREFIX"
 	EnvCleanupGrace                  = "CLEANUP_GRACE"
 	EnvStateFile                     = "STATE_FILE"
+	EnvControlSocket                 = "CONTROL_SOCKET"
 	EnvListenAddr                    = "LISTEN_ADDR"
 	EnvNotifyWebhookURL              = "NOTIFY_WEBHOOK_URL"
 	EnvNotifyWebhookFormat           = "NOTIFY_WEBHOOK_FORMAT"
@@ -64,6 +65,13 @@ const (
 	DefaultReconcileInterval   = 5 * time.Minute
 	DefaultStateFile           = "/var/lib/kopia-docker-watcher/state.json"
 	DefaultListenAddr          = ":8080"
+	// DefaultControlSocketName is the name of the control socket in the
+	// directory of STATE_FILE, unless CONTROL_SOCKET says otherwise.
+	DefaultControlSocketName = "control.sock"
+	// MaxControlSocketLen is the longest control socket path every
+	// platform takes: a unix socket address holds 104 bytes on BSD and
+	// macOS, 108 on Linux, the closing NUL included.
+	MaxControlSocketLen        = 103
 	DefaultLabelPrefix         = "kopia"
 	DefaultCleanupGrace        = 24 * time.Hour
 	DefaultNotifyWebhookFormat = WebhookJSON
@@ -121,8 +129,11 @@ type Config struct {
 	// before the cleanup-on-remove label deletes anything of it.
 	CleanupGrace time.Duration
 
-	StateFile  string
-	ListenAddr string
+	StateFile string
+	// ControlSocket is the path of the unix socket the list, trigger and
+	// restore commands talk to the watcher through.
+	ControlSocket string
+	ListenAddr    string
 
 	// NotifyWebhookURL is where notifications go; empty sends none. It may
 	// carry a token, so it is never logged as a whole.
@@ -269,6 +280,16 @@ func Load(getenv func(string) string) (*Config, error) {
 
 	if v := l.get(EnvStateFile); v != "" {
 		cfg.StateFile = v
+	}
+
+	// A socket path derived from STATE_FILE that cannot be used only
+	// keeps the commands from reaching the watcher.
+	cfg.ControlSocket = ControlSocket(getenv)
+	if err := ValidateControlSocket(cfg.ControlSocket); err != nil && l.get(EnvControlSocket) != "" {
+		l.errorf("%s: %v", EnvControlSocket, err)
+	} else if err != nil {
+		l.warnf("the control socket next to %s cannot be used, so the list, trigger and restore commands will not reach "+
+			"the watcher: %v; set %s", EnvStateFile, err, EnvControlSocket)
 	}
 
 	if v := l.get(EnvListenAddr); v != "" {
@@ -637,6 +658,7 @@ func (c *Config) LogValue() slog.Value {
 		slog.String("watcher_path_prefix", c.WatcherPathPrefix),
 		slog.String("cleanup_grace", c.CleanupGrace.String()),
 		slog.String("state_file", c.StateFile),
+		slog.String("control_socket", c.ControlSocket),
 		slog.String("listen_addr", c.ListenAddr),
 		slog.String("notify_webhook", webhook),
 		slog.String("notify_webhook_format", c.NotifyWebhookFormat),
@@ -738,6 +760,36 @@ func parseHTTPURL(s string, allowQuery bool) (*url.URL, error) {
 	}
 
 	return u, nil
+}
+
+// ControlSocket returns the path of the control socket: CONTROL_SOCKET, or
+// control.sock in the directory of STATE_FILE. Only these two variables
+// are read, so that the list, trigger and restore commands find the
+// socket whatever else the configuration holds.
+func ControlSocket(getenv func(string) string) string {
+	if v := strings.TrimSpace(getenv(EnvControlSocket)); v != "" {
+		return v
+	}
+
+	stateFile := strings.TrimSpace(getenv(EnvStateFile))
+	if stateFile == "" {
+		stateFile = DefaultStateFile
+	}
+
+	return path.Join(path.Dir(stateFile), DefaultControlSocketName)
+}
+
+// ValidateControlSocket reports a control socket path that is not
+// absolute or too long for a unix socket.
+func ValidateControlSocket(p string) error {
+	switch {
+	case !path.IsAbs(p):
+		return fmt.Errorf("%q is not an absolute path", p)
+	case len(p) > MaxControlSocketLen:
+		return fmt.Errorf("%q is %d bytes long; a unix socket path may have %d at most", p, len(p), MaxControlSocketLen)
+	}
+
+	return nil
 }
 
 func validateListenAddr(s string) error {

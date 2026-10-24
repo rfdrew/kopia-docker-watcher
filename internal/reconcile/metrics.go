@@ -157,6 +157,7 @@ func (ps *pass) reportMetrics(err error) {
 	}
 
 	ps.metrics.Source(ps.path, SourceMetrics{Paused: ps.want.Paused, Owners: ownerNames(ps.owners), Hooks: ps.want.OwnSchedule})
+	ps.noteSource(ps.path, ps.src, ps.want.Paused, ownerNames(ps.owners))
 
 	if err != nil {
 		return
@@ -164,6 +165,7 @@ func (ps *pass) reportMetrics(err error) {
 
 	if start, ok := ps.lastSuccess(); ok {
 		ps.metrics.LastSuccess(ps.path, start)
+		ps.noteLastSuccess(ps.path, start)
 	}
 }
 
@@ -238,4 +240,5 @@ func (ps *pass) forgetSource() {
 	ps.mu.Unlock()
 
 	ps.metrics.ForgetSource(ps.path)
+	ps.forgetStatus(ps.path)
 }

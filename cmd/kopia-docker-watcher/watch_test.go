@@ -81,10 +81,15 @@ type runKopia struct {
 	// STORAGE_CONNECTION, as for a repository server.
 	throttle    kopiaclient.ThrottleLimits
 	throttleErr bool
+	// restores are the restore requests; nonEmpty the target directories
+	// that exist and are not empty.
+	restores []kopiaclient.RestoreRequest
+	nonEmpty map[string]bool
 }
 
 func newRunKopia(t *testing.T) *runKopia {
-	return &runKopia{t: t, policies: map[string]json.RawMessage{}, known: map[string]bool{}, snaps: map[string][]kopiaclient.Snapshot{}}
+	return &runKopia{t: t, policies: map[string]json.RawMessage{}, known: map[string]bool{}, snaps: map[string][]kopiaclient.Snapshot{},
+		nonEmpty: map[string]bool{}}
 }
 
 func (f *runKopia) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -279,10 +284,47 @@ func (f *runKopia) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.snaps[p] = append(f.snaps[p], kopiaclient.Snapshot{ID: "snap" + id, StartTime: start, EndTime: end, RootID: "root" + id})
 
 		writeJSONResponse(w, map[string]any{"sources": map[string]any{src: map[string]any{"success": true}}})
+	case "POST /api/v1/restore":
+		f.restore(w, body)
 	default:
 		f.t.Errorf("unexpected request %s %s", r.Method, r.URL)
 		writeKopiaError(w, http.StatusBadRequest, "MALFORMED_REQUEST", "unexpected")
 	}
+}
+
+// restore answers POST /api/v1/restore as kopia server does: a task that
+// fails at a target that is not empty, unless the request overwrites, and
+// succeeds otherwise. f.mu is held.
+func (f *runKopia) restore(w http.ResponseWriter, body []byte) {
+	var req kopiaclient.RestoreRequest
+
+	if err := json.Unmarshal(body, &req); err != nil || req.Filesystem == nil {
+		f.t.Errorf("restore body %s: %v", body, err)
+		writeKopiaError(w, http.StatusBadRequest, "MALFORMED_REQUEST", "malformed request body")
+
+		return
+	}
+
+	f.restores = append(f.restores, req)
+
+	start := time.Now().UTC()
+	end := start.Add(time.Millisecond)
+	task := kopiaclient.TaskInfo{ID: fmt.Sprintf("%x", len(f.tasks)+1), StartTime: start, EndTime: &end, Kind: kopiaclient.TaskKindRestore,
+		Description: "Destination: " + req.Filesystem.TargetPath, Status: kopiaclient.TaskSuccess,
+		Counters: map[string]kopiaclient.CounterValue{
+			kopiaclient.CounterRestoredFiles: {Value: 3},
+			kopiaclient.CounterRestoredDirs:  {Value: 1},
+			kopiaclient.CounterRestoredBytes: {Value: 2048, Units: "bytes"},
+		}}
+
+	if f.nonEmpty[req.Filesystem.TargetPath] && !req.Filesystem.OverwriteDirectories {
+		task.Status = kopiaclient.TaskFailed
+		task.Counters = nil
+		task.ErrorMessage = "error restoring: non-empty directory already exists, not overwriting it: \"" + req.Filesystem.TargetPath + "\""
+	}
+
+	f.tasks = append(f.tasks, task)
+	writeJSONResponse(w, task)
 }
 
 // orEmpty returns s, or an empty slice for nil, which encodes as [].

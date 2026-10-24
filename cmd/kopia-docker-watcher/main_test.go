@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rfdrew/kopia-docker-watcher/internal/control"
+	"github.com/rfdrew/kopia-docker-watcher/internal/control/controltest"
 	"github.com/rfdrew/kopia-docker-watcher/internal/version"
 )
 
@@ -100,6 +102,10 @@ type testDeps struct {
 	stdout, stderr *syncBuffer
 	ln             *memListener
 	listenAddr     string
+	// control is the in-memory listener of the control socket;
+	// controlPath where run asked for it.
+	control     *controltest.Listener
+	controlPath string
 }
 
 func newTestDeps(getenv func(string) string) *testDeps {
@@ -115,6 +121,13 @@ func newTestDeps(getenv func(string) string) *testDeps {
 		},
 		httpClient: &http.Client{Transport: &http.Transport{DialContext: td.ln.dial}, Timeout: 5 * time.Second},
 	}
+
+	td.control = controltest.NewListener()
+	td.listenControl = func(path string) (*control.Server, error) {
+		td.controlPath = path
+		return control.NewServer(td.control, nil), nil
+	}
+	td.dialControl = td.control.Dial
 
 	return td
 }
@@ -186,7 +199,7 @@ func TestRunWatcherStartsAndStops(t *testing.T) {
 	}
 
 	want := []string{"WARN KOPIA_PASSWORD is ignored", "INFO starting kopia-docker-watcher", "INFO serving HTTP",
-		"INFO HTTP server stopped", "INFO stopped"}
+		"INFO serving the control socket", "INFO HTTP server stopped", "INFO stopped"}
 	if len(msgs) != len(want) {
 		t.Fatalf("log = %q, want %q", msgs, want)
 	}

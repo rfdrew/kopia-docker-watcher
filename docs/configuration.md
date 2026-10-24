@@ -30,6 +30,7 @@ Booleans of this page accept `true`, `True`, `TRUE`, `t`, `T`, `1` and `false`, 
 | [`SNAPSHOT_ON_WATCHER_START`](#snapshot_on_watcher_start) | `false` | boolean |
 | [`CLEANUP_GRACE`](#cleanup_grace) | `24h` | duration, at least `10m` |
 | [`STATE_FILE`](#state_file) | `/var/lib/kopia-docker-watcher/state.json` | path |
+| [`CONTROL_SOCKET`](#control_socket) | `control.sock` next to `STATE_FILE` | absolute path, at most 103 bytes |
 | [`LISTEN_ADDR`](#listen_addr) | `:8080` | `host:port` or `:port` |
 | [`LOG_LEVEL`](#log_level) | `info` | `debug`, `info`, `warning`, `error` |
 | [`NOTIFY_WEBHOOK_URL`](#notify_webhook_url) | — (no notifications) | `http://` or `https://` URL |
@@ -220,6 +221,28 @@ Losing the state is not fatal, but the watcher then treats every source like one
 it does not know the schedule a pause replaced, so it unpauses a source with the schedule of the labels only,
 and it does not remember the containers removed meanwhile, so it leaves their sources as they are and never
 cleans them up.
+
+### `CONTROL_SOCKET`
+
+The unix socket through which the `list`, `trigger` and `restore` commands ask the running watcher. Default
+`control.sock` in the directory of `STATE_FILE`, `/var/lib/kopia-docker-watcher/control.sock` in the image.
+
+- The commands run in the watcher's container with `docker exec`, and read `CONTROL_SOCKET`, or `STATE_FILE`,
+  from the same environment, so they find the socket without options. See [restore.md](restore.md).
+- Only the user the watcher runs as can connect: the socket has mode `0600`, and it is created under a
+  temporary name and only then moved into place. Its directory is created with mode `0700` if it is missing.
+- The watcher serves the socket from its start; until kopia server is ready, the commands get "the watcher is
+  starting". It removes the socket when it stops. A socket left behind by a watcher that crashed is replaced; a
+  watcher that still answers at the path, or a file there that is not a socket, keeps the new watcher from
+  serving the socket.
+- A watcher that cannot serve the socket logs an error and runs on without it; the commands then fail with "no
+  watcher answers". A path set in `CONTROL_SOCKET` that is not absolute, or longer than a unix socket address
+  takes (103 bytes), is a configuration error; a default path next to `STATE_FILE` that is too long is only a
+  warning, so set `CONTROL_SOCKET` then.
+- The socket is a file: put it on a file system that supports unix sockets. A named volume or a bind mount of a
+  local directory does; some network file systems do not.
+
+Nothing that controls the watcher is served on `LISTEN_ADDR`.
 
 ### `LISTEN_ADDR`
 

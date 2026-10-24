@@ -119,6 +119,7 @@ func TestLoadAllSet(t *testing.T) {
 		WatcherPathPrefix:      "/host/var/lib/docker/volumes",
 		CleanupGrace:           168 * time.Hour,
 		StateFile:              "/data/state.json",
+		ControlSocket:          "/data/control.sock",
 		ListenAddr:             "127.0.0.1:9090",
 		NotifyWebhookURL:       "https://ntfy.sh/topic?auth=token",
 		NotifyWebhookFormat:    WebhookNtfy,

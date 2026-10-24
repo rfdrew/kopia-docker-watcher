@@ -82,6 +82,12 @@ type pass struct {
 	// but could not be described or pinned yet.
 	absorbedHeld bool
 
+	// manual are the manual triggers the pass took; handled those it dealt
+	// with, and keptManual those it leaves to the next pass.
+	manual     []*Trigger
+	handled    map[*Trigger]bool
+	keptManual []*Trigger
+
 	// outside reports a path outside WATCHER_PATH_PREFIX, which the pass
 	// leaves alone.
 	outside bool
@@ -144,7 +150,8 @@ type pass struct {
 
 // reconcile runs one pass over path p.
 func (r *Reconciler) reconcile(ctx context.Context, p string) passResult {
-	ps := &pass{Reconciler: r, ctx: ctx, path: p, log: r.log.With("path", p), started: r.now(), events: r.takePending(p)}
+	ps := &pass{Reconciler: r, ctx: ctx, path: p, log: r.log.With("path", p), started: r.now(), events: r.takePending(p),
+		manual: r.takeManual(p), handled: map[*Trigger]bool{}}
 	ps.deferred, ps.sweepDue = r.takeFlags(p)
 	ps.log.Debug("reconciling the path", "events", eventNames(ps.events))
 
@@ -157,12 +164,16 @@ func (r *Reconciler) reconcile(ctx context.Context, p string) passResult {
 	case ctx.Err() != nil:
 		// Shutting down: the error is not the source's.
 		ps.log.Debug("reconcile canceled", "error", err.Error())
+		ps.finishManual(err, false)
 
 		return res
 	default:
 		res.err = err
 		res.retry = ps.fail(err)
 	}
+
+	ps.finishManual(err, res.retry)
+	r.noteStatus(p, res)
 
 	res.outcome, res.paused = ps.summarize(err)
 

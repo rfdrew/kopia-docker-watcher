@@ -67,6 +67,11 @@ watcher itself is not. See [docs/migration.md](docs/migration.md).
 - Verifies kopia server's TLS certificate by its SHA-256 fingerprint, a CA file or the system roots.
 - `validate` checks labels before you deploy them; `run --dry-run` prints what the watcher would do without
   changing anything.
+- `list`, `trigger` and `restore`, run with `docker exec` in the watcher's container, ask the running watcher
+  through its [control socket](docs/configuration.md#control_socket): `list` shows the managed sources and their
+  state, `trigger` takes a snapshot through the watcher's queue, with the hooks, the downtime and the minimum
+  interval of the labels, and `restore` restores a snapshot into a directory on kopia server. See
+  [docs/restore.md](docs/restore.md).
 - Serves Prometheus metrics on `/metrics`: when each source last had a complete snapshot (scheduled ones
   included), failures and durations of the watcher's own snapshots and of the hooks, reconcile errors, and the
   managed sources with their containers. See [docs/metrics.md](docs/metrics.md).
@@ -169,6 +174,9 @@ The image runs `kopia-docker-watcher run` by default.
 | `validate [--strict] label=value… \| -` | Check labels given as arguments, or one per line on stdin with `-`. |
 | `validate [--strict] --container NAME…` | Check the labels of containers. |
 | `validate [--strict] --all` | Check every container with `kopia.enable`, stopped ones included. |
+| `list [--json]` | List the sources the running watcher manages: path, containers, paused, who schedules the snapshots and the next one, the last complete snapshot, kopia server's status and the last problem. |
+| `trigger [--force] [--no-wait] CONTAINER\|PATH` | Take a snapshot of each path of a container, or of one path, through the running watcher's queue, with the hooks, stop/pause and `kopia.min-interval`, and wait for its result. `--force` ignores `kopia.min-interval`; `--no-wait` returns once it is asked for. |
+| `restore --target DIR [--overwrite] [--stop] CONTAINER\|PATH [SNAPSHOT]` | Restore a snapshot, by default the newest complete one, into `DIR` on kopia server through the running watcher (`POST /api/v1/restore`), and follow kopia server's task to the end. Refuses a `DIR` that is not empty unless `--overwrite`; `--stop` stops the path's containers while it runs. See [docs/restore.md](docs/restore.md). |
 | `healthcheck` | Exit 0 if the watcher in the same container answers 200 on `/healthz`, that is, is not unhealthy; used by the image's `HEALTHCHECK`. |
 | `version` | Print the version. |
 
@@ -179,6 +187,19 @@ schedule, which rejects a bad cron expression, and checks the compression algori
 labels can be applied (warnings allowed), 1 if not or if Docker or kopia server could not be asked, and 2 on a
 usage or configuration error. `run --help` and `validate --help` print the full usage and exit codes.
 
+`list`, `trigger` and `restore` talk to the watcher running in the same container, through the unix socket
+`CONTROL_SOCKET`, so run them with `docker exec`:
+
+```bash
+docker compose exec watcher kopia-docker-watcher list
+docker compose exec watcher kopia-docker-watcher trigger app
+docker compose exec watcher kopia-docker-watcher restore --target /restore/app app
+```
+
+When no watcher runs there, they fail and say so; they never act on kopia server or Docker by themselves.
+Each exits 0 on success, 1 when it failed or the watcher cannot be asked, and 2 on a usage error; `--help`
+prints the full usage. Nothing that controls the watcher is served on `LISTEN_ADDR`.
+
 Logs are JSON lines on stderr.
 
 ## Documentation
@@ -186,6 +207,7 @@ Logs are JSON lines on stderr.
 - [docs/configuration.md](docs/configuration.md): environment variables.
 - [docs/labels.md](docs/labels.md): container labels.
 - [docs/metrics.md](docs/metrics.md): Prometheus metrics, a scrape configuration and example alerts.
+- [docs/restore.md](docs/restore.md): `list`, `trigger` and `restore`, with examples and what to watch out for.
 - [docs/terraform.md](docs/terraform.md): working with terraform-provider-kopia, who owns what.
 - [docs/migration.md](docs/migration.md): moving from the Python `kopia-docker-operator`.
 - [examples/](examples/): a compose file with kopia server, the watcher and a labeled container.
