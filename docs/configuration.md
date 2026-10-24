@@ -1,4 +1,10 @@
+English | [Українська](uk/configuration.md)
+
 # Configuration
+
+This page is also translated into Ukrainian: [uk/configuration.md](uk/configuration.md). When you change it,
+update the translation in the same pull request or say in the pull request that it lags behind (see
+[Documentation](../README.md#documentation)).
 
 The watcher is configured with environment variables. An empty variable is the same as an unset one, so a
 compose file can pass `${VAR}` through without forcing a value. Values are trimmed of surrounding spaces, except

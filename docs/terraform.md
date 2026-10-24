@@ -1,3 +1,5 @@
+English | [Українська](uk/terraform.md)
+
 # With the Terraform provider
 
 [terraform-provider-kopia](https://github.com/rfdrew/terraform-provider-kopia) (`rfdrew/kopia`) manages the
