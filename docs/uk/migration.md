@@ -1,4 +1,4 @@
-<!-- translated-from: docs/en/migration.md @ d509c06f4f196a937bfeeb3284a671d52c490a3b -->
+<!-- translated-from: docs/en/migration.md @ 329ca2ffc8a08a125910c6ba8d19837c70de5f88 -->
 [English](../en/migration.md) | Українська
 
 # <a id="migrating-from-kopia-docker-operator"></a>Перехід із kopia-docker-operator
@@ -22,6 +22,7 @@ kopia-docker-watcher замінює `kopia-docker-operator`, написаний 
 | `KOPIA_EXEC_CONTAINER` (режим exec) | Вилучено. Watcher відмовляється запускатися, поки змінну задано. |
 | `KOPIA_SERVER_CERT_FINGERPRINT` вимикав перевірку TLS незалежно від значення | Відбиток перевіряється. Це шістнадцяткове значення після `SERVER CERT SHA256:` у логу kopia server, а не значення `SHA256:…`, яке радив README operator. Значення, що працювало раніше, найімовірніше, тепер неправильне. |
 | kopia server потребував `--disable-csrf-token-checks`, щоб виклики API працювали | Не потрібно: watcher сам обробляє токени CSRF. Прапорець можна прибрати. |
+| Образ `rfdrew/kopia-docker-watcher:0.1.0` у Docker Hub | Watcher публікується в тому самому репозиторії Docker Hub і як `ghcr.io/rfdrew/kopia-docker-watcher`, з тегами з [README](../../README.uk.md#image). Реліз watcher 0.1.0 займає тег `0.1.0`, який був тегом operator. |
 | — | `stop_grace_period` 10 с або більше (типове значення) дає watcher змогу зберегти стан під час завершення роботи. |
 
 `KOPIA_SERVER_URL`, `KOPIA_SERVER_USERNAME`, `KOPIA_SERVER_PASSWORD`, `HOST_PREFIX` і `LOG_LEVEL` зберігають своє

@@ -67,7 +67,8 @@ services:
   watcher:
     # :0.1 follows the latest 0.1.x release and appears with v0.1.0. To try a
     # release candidate, name it exactly, as in :0.1.0-rc.2; candidates never
-    # move :0.1 or :latest.
+    # move :0.1 or :latest. The same image is on Docker Hub as
+    # rfdrew/kopia-docker-watcher.
     image: ghcr.io/rfdrew/kopia-docker-watcher:0.1
     restart: unless-stopped
     # The default command is run. To see the plan first without changing

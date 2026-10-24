@@ -1,0 +1,37 @@
+name: Docker Hub description
+
+# Copies README.md to the overview of docker.io/rfdrew/kopia-docker-watcher
+# and the description of this repository to its short description, with the
+# secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN. The token needs the
+# read/write/delete scope: read/write cannot change the overview.
+on:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - .github/workflows/dockerhub-description.yml
+  # After a change of the repository description, or of the secrets.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dockerhub-description
+  cancel-in-progress: true
+
+jobs:
+  description:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: rfdrew/kopia-docker-watcher
+          short-description: ${{ github.event.repository.description }}
+          # Relative links in README.md become links to the files on GitHub.
+          enable-url-completion: true
