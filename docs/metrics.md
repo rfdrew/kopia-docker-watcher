@@ -1,3 +1,5 @@
+English | [Українська](uk/metrics.md)
+
 # Metrics
 
 The watcher serves [Prometheus](https://prometheus.io) metrics at `GET /metrics` on

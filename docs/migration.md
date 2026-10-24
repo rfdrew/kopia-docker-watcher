@@ -1,3 +1,5 @@
+English | [Українська](uk/migration.md)
+
 # Migrating from kopia-docker-operator
 
 kopia-docker-watcher replaces the Python `kopia-docker-operator`. Both register container paths as sources in

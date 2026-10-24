@@ -1,3 +1,5 @@
+English | [Українська](uk/restore.md)
+
 # list, trigger and restore
 
 Three commands ask the running watcher what it manages, take a snapshot through it and restore one. They run in

@@ -1,3 +1,5 @@
+English | [Українська](README.uk.md)
+
 # kopia-docker-watcher
 
 kopia-docker-watcher manages [Kopia](https://kopia.io) backups from Docker container labels. Put
@@ -211,6 +213,11 @@ Logs are JSON lines on stderr.
 - [docs/terraform.md](docs/terraform.md): working with terraform-provider-kopia, who owns what.
 - [docs/migration.md](docs/migration.md): moving from the Python `kopia-docker-operator`.
 - [examples/](examples/): a compose file with kopia server, the watcher and a labeled container.
+
+The documentation is also translated into Ukrainian: [README.uk.md](README.uk.md) and [docs/uk/](docs/uk/). English
+is the source. When you change `README.md` or a file under `docs/`, update its Ukrainian counterpart in the same
+pull request, using the terms in [docs/uk/GLOSSARY.md](docs/uk/GLOSSARY.md), or say in the pull request that the
+translation lags behind. `make docs-check` reports missing and outdated translations and broken links.
 
 ## Image
 
