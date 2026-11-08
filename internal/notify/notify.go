@@ -1,5 +1,6 @@
-// Package notify sends a notification to NOTIFY_WEBHOOK_URL when a path
-// starts failing and when it is fine again.
+// Package notify sends a notification when a path starts failing and when
+// it is fine again: to NOTIFY_WEBHOOK_URL, by e-mail through
+// NOTIFY_SMTP_HOST, or both.
 //
 // A Notifier follows two things per path: the snapshots the watcher
 // queued, through reconcile.Metrics, and the passes over it, through
@@ -30,23 +31,20 @@
 // What a Notifier remembers is lost when the watcher restarts, so a
 // problem that lasts is notified once more after a restart.
 //
-// Notifications wait in a queue for one sender, which tries each up to
-// Attempts times, with a delay that doubles, and Timeout for each attempt;
-// the reconciler never waits for it. A full queue drops the notification.
-// The URL is never logged, nor shown in an error, as it may hold a token:
-// only its scheme and host are.
+// Each notification goes to every channel. A channel has its own queue
+// and its own sender, which tries each notification up to Attempts times,
+// with a delay that doubles, and Timeout for each attempt, so a channel
+// that is slow or down never holds back another; the reconciler never
+// waits for either. A full queue drops the notification for its channel.
+// Neither the webhook URL, which may hold a token, nor the SMTP password
+// is ever logged or shown in an error.
 package notify
 
 import (
 	"context"
 	"errors"
-	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
-	"net/url"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -58,7 +56,11 @@ import (
 
 // Defaults of Options.
 const (
+	// DefaultTimeout bounds a request to the webhook, DefaultSMTPTimeout a
+	// whole SMTP conversation, from the connection to the end of the
+	// message.
 	DefaultTimeout       = 10 * time.Second
+	DefaultSMTPTimeout   = 30 * time.Second
 	DefaultAttempts      = 4
 	DefaultRetryDelay    = 2 * time.Second
 	DefaultMaxRetryDelay = time.Minute
@@ -73,7 +75,7 @@ type Result string
 
 // Results.
 const (
-	// ResultSent: the webhook accepted it.
+	// ResultSent: the webhook or the SMTP server accepted it.
 	ResultSent Result = "sent"
 	// ResultFailed: every attempt failed, or one failed in a way that
 	// trying again does not fix.
@@ -86,34 +88,39 @@ const (
 // Results returns every Result.
 func Results() []Result { return []Result{ResultSent, ResultFailed, ResultDropped} }
 
-// Metrics counts the notifications by what became of them.
+// Metrics counts the notifications by channel and by what became of them.
 type Metrics interface {
-	Notification(r Result)
+	// NotificationChannel starts the counts of a channel at zero; New calls
+	// it for each channel it sends to.
+	NotificationChannel(c Channel)
+	// Notification counts a notification of a channel.
+	Notification(c Channel, r Result)
 }
 
 // Options configure a Notifier.
 type Options struct {
-	// URL is NOTIFY_WEBHOOK_URL; required.
-	URL string
-	// Format is one of config.WebhookFormats; empty means json.
-	Format string
+	// Webhook posts the notifications to NOTIFY_WEBHOOK_URL, SMTP sends
+	// them by e-mail; nil leaves the channel out. One is required.
+	Webhook *WebhookOptions
+	SMTP    *SMTPOptions
+
 	// ErrorAfter is how long an error the watcher retries must last before
 	// it is notified; zero means config.DefaultNotifyErrorAfter.
 	ErrorAfter time.Duration
 
-	// Timeout bounds one attempt; Attempts is how many are made. The
-	// delay between them starts at RetryDelay and doubles; a Retry-After
-	// of the webhook may make it longer, up to MaxRetryDelay. Zero means
-	// the default.
+	// Each channel uses these on its own. Timeout bounds one attempt:
+	// zero means DefaultTimeout for the webhook and DefaultSMTPTimeout for
+	// SMTP. Attempts is how many are made. The delay between them starts
+	// at RetryDelay and doubles; a Retry-After of the webhook may make it
+	// longer, up to MaxRetryDelay. Zero means the default.
 	Timeout       time.Duration
 	Attempts      int
 	RetryDelay    time.Duration
 	MaxRetryDelay time.Duration
-	// QueueSize is how many notifications may wait for the sender.
+	// QueueSize is how many notifications may wait for the sender of a
+	// channel.
 	QueueSize int
 
-	// Transport sends the requests; nil means http.DefaultTransport.
-	Transport http.RoundTripper
 	// Logger receives the log; nil discards it.
 	Logger *slog.Logger
 	// Metrics counts the notifications; nil counts nothing.
@@ -123,15 +130,12 @@ type Options struct {
 }
 
 // Notifier sends the notifications. Create it with New and start its
-// sender with Run. It implements reconcile.Metrics and reconcile.Observer
+// senders with Run. It implements reconcile.Metrics and reconcile.Observer
 // and is safe for concurrent use.
 type Notifier struct {
-	opts   Options
-	url    *url.URL
-	safe   string
-	client *http.Client
-	log    *slog.Logger
-	queue  chan Event
+	opts Options
+	// outboxes hold a queue for each channel.
+	outboxes []*outbox
 
 	mu sync.Mutex
 	// host is kopia server's host name, for the text.
@@ -165,23 +169,13 @@ var (
 	_ reconcile.Observer = (*Notifier)(nil)
 )
 
-// New returns a Notifier.
+// New returns a Notifier that sends to the channels opts sets up.
 func New(opts Options) (*Notifier, error) {
-	u, err := url.Parse(opts.URL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, errors.New("notify: the webhook URL is not an http or https URL")
-	}
-
-	if opts.Format == "" {
-		opts.Format = config.WebhookJSON
-	}
-
-	if !slices.Contains(config.WebhookFormats(), opts.Format) {
-		return nil, fmt.Errorf("notify: unknown format %q", opts.Format)
+	if opts.Webhook == nil && opts.SMTP == nil {
+		return nil, errors.New("notify: neither a webhook nor SMTP is set up")
 	}
 
 	opts.ErrorAfter = orDefault(opts.ErrorAfter, config.DefaultNotifyErrorAfter)
-	opts.Timeout = orDefault(opts.Timeout, DefaultTimeout)
 	opts.RetryDelay = orDefault(opts.RetryDelay, DefaultRetryDelay)
 	opts.MaxRetryDelay = max(orDefault(opts.MaxRetryDelay, DefaultMaxRetryDelay), opts.RetryDelay)
 
@@ -193,10 +187,6 @@ func New(opts Options) (*Notifier, error) {
 		opts.QueueSize = DefaultQueueSize
 	}
 
-	if opts.Transport == nil {
-		opts.Transport = http.DefaultTransport
-	}
-
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
@@ -206,16 +196,7 @@ func New(opts Options) (*Notifier, error) {
 	}
 
 	n := &Notifier{
-		opts: opts,
-		url:  u,
-		safe: u.Scheme + "://" + u.Host,
-		client: &http.Client{
-			Transport: opts.Transport,
-			// A redirect would send the notification, and maybe the token
-			// in the URL, where the URL does not point.
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		},
-		queue:     make(chan Event, opts.QueueSize),
+		opts:      opts,
 		owners:    map[string][]string{},
 		snapshots: map[string]*track{},
 		passes:    map[string]*track{},
@@ -223,9 +204,43 @@ func New(opts Options) (*Notifier, error) {
 		returns:   map[returnKey]*track{},
 		reasons:   map[string][]reconcile.Reason{},
 	}
-	n.log = opts.Logger.With("webhook", n.safe, "format", opts.Format)
+
+	if opts.Webhook != nil {
+		w, err := newWebhook(*opts.Webhook)
+		if err != nil {
+			return nil, err
+		}
+
+		n.addOutbox(ChannelWebhook, w, DefaultTimeout, "webhook", w.safe, "format", w.format)
+	}
+
+	if opts.SMTP != nil {
+		s, err := newSMTP(*opts.SMTP)
+		if err != nil {
+			return nil, err
+		}
+
+		n.addOutbox(ChannelSMTP, s, DefaultSMTPTimeout, "smtp", s.addr)
+	}
 
 	return n, nil
+}
+
+// addOutbox adds a channel; logAttrs say where it sends to, without
+// secrets.
+func (n *Notifier) addOutbox(c Channel, s sender, timeout time.Duration, logAttrs ...any) {
+	n.outboxes = append(n.outboxes, &outbox{
+		channel: c,
+		sender:  s,
+		timeout: orDefault(n.opts.Timeout, timeout),
+		queue:   make(chan Event, n.opts.QueueSize),
+		log:     n.opts.Logger.With(append([]any{"channel", string(c)}, logAttrs...)...),
+		opts:    &n.opts,
+	})
+
+	if n.opts.Metrics != nil {
+		n.opts.Metrics.NotificationChannel(c)
+	}
 }
 
 func orDefault(d, def time.Duration) time.Duration {
@@ -481,150 +496,23 @@ func (n *Notifier) event(kind Kind, path string, now, since time.Time, reason, e
 	}
 }
 
-// enqueue hands e to the sender without waiting; a full queue drops it.
+// enqueue hands e to the sender of every channel without waiting.
 func (n *Notifier) enqueue(e Event) {
-	select {
-	case n.queue <- e:
-	default:
-		n.count(ResultDropped)
-		n.log.Warn("dropping a notification: too many are waiting to be sent", "event", string(e.Kind), "path", e.Path)
+	for _, o := range n.outboxes {
+		o.enqueue(e)
 	}
 }
 
-func (n *Notifier) count(r Result) {
-	if n.opts.Metrics != nil {
-		n.opts.Metrics.Notification(r)
-	}
-}
-
-// Run sends the queued notifications until ctx is done; those still
-// waiting then are dropped.
+// Run sends the queued notifications, each channel on its own, until ctx
+// is done; those still waiting then are dropped.
 func (n *Notifier) Run(ctx context.Context) {
-	for {
-		select {
-		case e := <-n.queue:
-			n.deliver(ctx, e)
-		case <-ctx.Done():
-			dropped := 0
+	var wg sync.WaitGroup
 
-			for {
-				select {
-				case <-n.queue:
-					dropped++
-
-					n.count(ResultDropped)
-				default:
-					if dropped > 0 {
-						n.log.Warn("dropping the notifications not sent before the stop", "count", dropped)
-					}
-
-					return
-				}
-			}
-		}
-	}
-}
-
-// deliver sends e, trying again after a temporary failure.
-func (n *Notifier) deliver(ctx context.Context, e Event) {
-	delay := n.opts.RetryDelay
-
-	for attempt := 1; ; attempt++ {
-		wait, err := n.send(ctx, e)
-
-		switch {
-		case err == nil:
-			n.count(ResultSent)
-			n.log.Info("notification sent", "event", string(e.Kind), "path", e.Path)
-
-			return
-		case ctx.Err() != nil:
-			n.count(ResultDropped)
-			return
-		case wait < 0 || attempt >= n.opts.Attempts:
-			n.count(ResultFailed)
-			n.log.Warn("cannot send the notification", "event", string(e.Kind), "path", e.Path,
-				"attempts", attempt, "error", err.Error())
-
-			return
-		}
-
-		wait = min(max(wait, delay), n.opts.MaxRetryDelay)
-		n.log.Debug("cannot send the notification; trying again", "event", string(e.Kind), "path", e.Path,
-			"attempt", attempt, "delay", wait.String(), "error", err.Error())
-
-		t := time.NewTimer(wait)
-
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			n.count(ResultDropped)
-
-			return
-		case <-t.C:
-		}
-
-		delay = min(2*delay, n.opts.MaxRetryDelay)
-	}
-}
-
-// send makes one attempt. On failure wait is how long the webhook asked to
-// wait before the next one, zero if it did not ask, negative if trying
-// again cannot help.
-func (n *Notifier) send(ctx context.Context, e Event) (wait time.Duration, err error) {
-	ctx, cancel := context.WithTimeout(ctx, n.opts.Timeout)
-	defer cancel()
-
-	req, err := n.request(ctx, e)
-	if err != nil {
-		return -1, err
+	for _, o := range n.outboxes {
+		wg.Go(func() { o.run(ctx) })
 	}
 
-	resp, err := n.client.Do(req)
-	if err != nil {
-		return 0, n.redact(err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return 0, nil
-	}
-
-	err = fmt.Errorf("%s %s: %s", req.Method, n.safe, resp.Status)
-	if msg := strings.TrimSpace(string(body)); msg != "" {
-		err = fmt.Errorf("%w: %s", err, truncate(msg, 200))
-	}
-
-	switch {
-	case resp.StatusCode == http.StatusTooManyRequests, resp.StatusCode == http.StatusRequestTimeout,
-		resp.StatusCode >= 500:
-		return retryAfter(resp.Header.Get("Retry-After")), err
-	default:
-		return -1, err
-	}
-}
-
-// redact drops the URL, which may hold a token, from an error of the HTTP
-// client.
-func (n *Notifier) redact(err error) error {
-	var ue *url.Error
-	if errors.As(err, &ue) {
-		return fmt.Errorf("%s %s: %w", ue.Op, n.safe, ue.Err)
-	}
-
-	return err
-}
-
-// retryAfter reads a Retry-After header in seconds; zero if there is none.
-func retryAfter(v string) time.Duration {
-	s, err := strconv.Atoi(strings.TrimSpace(v))
-	if err != nil || s <= 0 {
-		return 0
-	}
-
-	return time.Duration(s) * time.Second
+	wg.Wait()
 }
 
 // truncate cuts s to at most n runes, marking the cut.

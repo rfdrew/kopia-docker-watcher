@@ -110,6 +110,13 @@ services:
       # again (../docs/en/configuration.md#notifications).
       NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
       NOTIFY_WEBHOOK_FORMAT: ${NOTIFY_WEBHOOK_FORMAT:-}
+      NOTIFY_SMTP_HOST: ${NOTIFY_SMTP_HOST:-}
+      NOTIFY_SMTP_PORT: ${NOTIFY_SMTP_PORT:-}
+      NOTIFY_SMTP_TLS: ${NOTIFY_SMTP_TLS:-}
+      NOTIFY_SMTP_USERNAME: ${NOTIFY_SMTP_USERNAME:-}
+      NOTIFY_SMTP_PASSWORD: ${NOTIFY_SMTP_PASSWORD:-}
+      NOTIFY_SMTP_FROM: ${NOTIFY_SMTP_FROM:-}
+      NOTIFY_SMTP_TO: ${NOTIFY_SMTP_TO:-}
       # With docker-socket-proxy:
       # DOCKER_HOST: tcp://docker-socket-proxy:2375
     # The watcher finishes its policy writes and saves the state in about

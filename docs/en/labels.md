@@ -668,7 +668,7 @@ Every hook that ran is logged when it ends, "pre-exec hook finished" at info lev
 error level, with the container, the duration and the last 4 KiB of what the command wrote to stdout and stderr,
 up to then for a hook that ran out of time. The command itself is not logged: it may hold a password. A failure
 counts in [`kopia_watcher_hook_failures_total`](metrics.md#kopia_watcher_hook_failures_total) and, with
-`NOTIFY_WEBHOOK_URL`, is [notified](configuration.md#notifications) once, as is the next success of that hook in
+notifications set up, is [notified](configuration.md#notifications) once, as is the next success of that hook in
 that container.
 
 Hooks run around the snapshots the watcher takes: scheduled ones (below) and those at a container start
@@ -809,7 +809,7 @@ around them. A snapshot at a stop is taken without stopping anything: the contai
   container that cannot be started again, say because its port is taken, is tried again with a growing delay, up
   to 5 minutes, until it runs or someone else starts or removes it. Each failure is logged at error level and
   counts in [`kopia_watcher_return_failures_total`](metrics.md#kopia_watcher_return_failures_total); with
-  `NOTIFY_WEBHOOK_URL` the first one is [notified](configuration.md#notifications), and so is its return.
+  notifications set up the first one is [notified](configuration.md#notifications), and so is its return.
 - **Its own events.** The stop and start of a container by the watcher are not starts and stops of the container
   for the rest of the labels: they take no `kopia.snapshot-on-stop` or `kopia.snapshot-on-start` snapshot, add no
   `kopia.pin-on-stop` pin, and while it is down the container still counts as running, so its sources are not

@@ -8,11 +8,13 @@ update the translation in the same pull request or say in the pull request that 
 
 The watcher is configured with environment variables. An empty variable is the same as an unset one, so a
 compose file can pass `${VAR}` through without forcing a value. Values are trimmed of surrounding spaces, except
-`KOPIA_SERVER_USERNAME` and `KOPIA_SERVER_PASSWORD`, which are taken as they are.
+`KOPIA_SERVER_USERNAME`, `KOPIA_SERVER_PASSWORD`, `NOTIFY_SMTP_USERNAME` and `NOTIFY_SMTP_PASSWORD`, which are
+taken as they are.
 
 At start the watcher checks every variable and reports all problems at once, one log line each, then exits with
 status 1. The configuration it runs with is logged at start, without secrets: only whether the password is set,
-and only the scheme and host of `NOTIFY_WEBHOOK_URL`.
+only the scheme and host of `NOTIFY_WEBHOOK_URL`, and of the e-mail only the server, the TLS mode and the number
+of recipients.
 
 Durations are Go durations: `90s`, `10m`, `1h30m`, `24h`. There is no `d` unit; write `168h` for a week.
 
@@ -39,8 +41,15 @@ Booleans of this page accept `true`, `True`, `TRUE`, `t`, `T`, `1` and `false`, 
 | [`CONTROL_SOCKET`](#control_socket) | `control.sock` next to `STATE_FILE` | absolute path, at most 103 bytes, its directory 89 |
 | [`LISTEN_ADDR`](#listen_addr) | `:8080` | `host:port` or `:port` |
 | [`LOG_LEVEL`](#log_level) | `info` | `debug`, `info`, `warning`, `error` |
-| [`NOTIFY_WEBHOOK_URL`](#notify_webhook_url) | — (no notifications) | `http://` or `https://` URL |
+| [`NOTIFY_WEBHOOK_URL`](#notify_webhook_url) | — (no webhook) | `http://` or `https://` URL |
 | [`NOTIFY_WEBHOOK_FORMAT`](#notify_webhook_format) | `json` | `json`, `ntfy`, `slack`, `telegram` |
+| [`NOTIFY_SMTP_HOST`](#notify_smtp_host-and-notify_smtp_port) | — (no e-mail) | host name or IP address |
+| [`NOTIFY_SMTP_PORT`](#notify_smtp_host-and-notify_smtp_port) | `587`, or `465` with `NOTIFY_SMTP_TLS=tls` | 1–65535 |
+| [`NOTIFY_SMTP_TLS`](#notify_smtp_tls) | `starttls` | `starttls`, `tls`, `none` |
+| [`NOTIFY_SMTP_USERNAME`](#notify_smtp_username-and-notify_smtp_password) | — (no login) | the login on the SMTP server |
+| [`NOTIFY_SMTP_PASSWORD`](#notify_smtp_username-and-notify_smtp_password) | — | its password |
+| [`NOTIFY_SMTP_FROM`](#notify_smtp_from-and-notify_smtp_to) | required with `NOTIFY_SMTP_HOST` | e-mail address |
+| [`NOTIFY_SMTP_TO`](#notify_smtp_from-and-notify_smtp_to) | required with `NOTIFY_SMTP_HOST` | e-mail addresses separated by commas |
 | [`NOTIFY_ERROR_AFTER`](#notify_error_after) | `15m` | duration, at least `1m` |
 | [`KOPIA_THROTTLE_UPLOAD_BYTES_PER_SECOND`](#throttle) | — (kopia server's) | bytes per second, units allowed |
 | [`KOPIA_THROTTLE_DOWNLOAD_BYTES_PER_SECOND`](#throttle) | — (kopia server's) | bytes per second, units allowed |
@@ -315,9 +324,11 @@ Python version, mean `error`. Logs are JSON lines on stderr.
 
 ## Notifications
 
-The watcher can post a notification when a path starts failing and when it works again. It complements the
-notification profiles of kopia server, which report the snapshots kopia server takes on its schedule; the watcher
-reports what only it sees:
+The watcher can notify when a path starts failing and when it works again: it posts to a webhook
+([`NOTIFY_WEBHOOK_URL`](#notify_webhook_url)), sends an e-mail through an SMTP server
+([`NOTIFY_SMTP_HOST`](#notify_smtp_host-and-notify_smtp_port)), or both. It complements the notification
+profiles of kopia server, e-mail ones included, which report the snapshots kopia server takes on its schedule;
+the watcher reports what only it sees:
 
 - **a snapshot the watcher took** that failed, or whose end is unknown because kopia server lost track of it, as
   when it restarted. The next snapshot of the path the watcher takes that succeeds, or that saves nothing because
@@ -344,20 +355,26 @@ Each path sends one notification when it starts failing and one when it works ag
 not again at every full reconcile. The watcher remembers this in memory only: a problem that lasts across a
 restart of the watcher is notified once more.
 
-Notifications wait in a queue and go out one at a time, so the watcher never waits for the webhook. Each attempt
-has 10 seconds. A failed one is tried again after 2, 4 and 8 seconds, or after the `Retry-After` the webhook
-asks for, up to a minute, when the webhook did not answer, answered 408 or 429, or answered with a 5xx; any
-other answer counts as a failure at once. When 64 notifications wait, new ones are dropped; on a stop, those
-that wait are dropped. [`kopia_watcher_notifications_total`](metrics.md#kopia_watcher_notifications_total)
-counts them. Redirects are not followed.
+Each notification goes to every channel that is set up, the webhook and the e-mail. Each channel has a queue of
+its own and sends one notification at a time, so the watcher never waits for either, and a webhook or an SMTP
+server that is slow or down holds back only its own notifications. A failed attempt is tried again after 2, 4
+and 8 seconds, four attempts in all, when trying again may help; what that is depends on the channel, see
+[the webhook](#notify_webhook_url) and [the e-mail](#notify_smtp_host-and-notify_smtp_port). When 64
+notifications wait for a channel, new ones are dropped for it; on a stop, those that wait are dropped.
+[`kopia_watcher_notifications_total`](metrics.md#kopia_watcher_notifications_total) counts them by channel.
 
 ### `NOTIFY_WEBHOOK_URL`
 
-Where the notifications go: an `http://` or `https://` URL with a host and no fragment; a query is allowed. Unset,
-no notifications are sent. User and password in the URL (`https://user:pass@host/…`) are sent as HTTP Basic auth.
+Where the notifications are posted: an `http://` or `https://` URL with a host and no fragment; a query is
+allowed. Unset, nothing is posted. User and password in the URL (`https://user:pass@host/…`) are sent as HTTP
+Basic auth.
 
 The URL may hold a token, so the watcher never logs it: the start-up log, the log lines about notifications and
 their errors show only its scheme and host.
+
+Each attempt has 10 seconds. A failed one is tried again, after the `Retry-After` the webhook asks for if that
+is longer, up to a minute, when the webhook did not answer, answered 408 or 429, or answered with a 5xx; any
+other answer counts as a failure at once. Redirects are not followed.
 
 ### `NOTIFY_WEBHOOK_FORMAT`
 
@@ -407,13 +424,89 @@ The `json` format posts:
 | `since` | when the path started failing |
 | `time` | when the notification was made |
 
+### `NOTIFY_SMTP_HOST` and `NOTIFY_SMTP_PORT`
+
+The SMTP server that sends the e-mail: a host name or an IP address, without `smtp://` and without a port, such
+as `smtp.example.com`, or `postfix` for a relay in the watcher's Docker network. Unset, no e-mail is sent; set,
+[`NOTIFY_SMTP_FROM` and `NOTIFY_SMTP_TO`](#notify_smtp_from-and-notify_smtp_to) are required. The port is
+`NOTIFY_SMTP_PORT`: 587 by default, the submission port, or 465 with `NOTIFY_SMTP_TLS=tls`.
+
+Each notification is one e-mail to all the recipients, in a connection of its own. An attempt has 30 seconds,
+from the connection to the server's answer to the message. It is tried again when the connection fails or times
+out, or the server answers with a 4xx, such as 421 or 451. A 5xx, such as a login or a recipient the server
+refuses, a certificate that does not verify, and a server without STARTTLS or AUTH where they are needed count
+as a failure at once. A recipient the server refuses fails the e-mail for all of them, so that a mistyped address
+in `NOTIFY_SMTP_TO` shows as failed notifications. The log line shows the server's answer.
+
+### `NOTIFY_SMTP_TLS`
+
+How the connection to the SMTP server is protected. Default `starttls`.
+
+| Mode | Connection | Usual port |
+|---|---|---|
+| `starttls` | starts in plain text and switches to TLS with STARTTLS before anything else; a server that does not offer STARTTLS fails the e-mail | 587 |
+| `tls` | TLS from the start (implicit TLS, SMTPS) | 465 |
+| `none` | plain text throughout, for a relay on a network you trust; see the [login](#notify_smtp_username-and-notify_smtp_password) | 25 |
+
+With `starttls` and `tls` the watcher uses TLS 1.2 or later and checks the server's certificate against the
+system's certificate authorities and against `NOTIFY_SMTP_HOST`, so a self-signed certificate, or a host name the
+certificate does not hold, fails the e-mail. A mode that does not fit the port either fails or waits until the
+attempt times out, so the watcher warns at start about port 465 with `starttls` and about `tls` with port 587 or
+25.
+
+### `NOTIFY_SMTP_USERNAME` and `NOTIFY_SMTP_PASSWORD`
+
+The login on the SMTP server, if it wants one; unset, the watcher does not log in. Both are taken as they are,
+spaces included, and one without the other is a configuration error. Providers with two-step sign-in usually want
+an app password here.
+
+The watcher logs in with AUTH PLAIN, or with AUTH LOGIN when the server offers only that. A server that offers
+neither, or no AUTH at all, fails the e-mail.
+
+The password is never logged. With `NOTIFY_SMTP_TLS=none` it would cross the network unencrypted, so a login with
+`none` is a configuration error unless `NOTIFY_SMTP_HOST` is `localhost`, `127.0.0.1` or `::1`. A relay without
+TLS goes without a login.
+
+### `NOTIFY_SMTP_FROM` and `NOTIFY_SMTP_TO`
+
+The sender and the recipients. `NOTIFY_SMTP_FROM` is one address, with a name if you like:
+`backups@example.com` or `Kopia backups <backups@example.com>`. Many servers send only from the address of the
+login. `NOTIFY_SMTP_TO` is one or more addresses separated by commas, such as
+`ops@example.com, On call <oncall@example.com>`; a name with a comma goes in double quotes.
+
+The e-mail is plain text in UTF-8:
+
+- the subject is the `title` of the [`json` format](#notify_webhook_format), such as
+  `Backup hook failed: /srv/app/data`;
+- the body is its `message`, then the fields of the `json` format that are set, one per line: `event`,
+  `status`, `path`, `containers`, `container`, `host`, `reason`, `error`, `since`, `time` and
+  `watcher_version`;
+- `Date` is when the notification was made, and `Auto-Submitted: auto-generated` keeps vacation replies away.
+
+```text
+The pre-exec hook in app-db-1 for /srv/app/data on nas (app-db-1) failed, so no snapshot was taken: exited with code 1.
+
+event: hook_failed
+status: failing
+path: /srv/app/data
+containers: app-db-1
+container: app-db-1
+host: nas
+reason: pre-exec
+error: exited with code 1
+since: 2026-11-08T03:00:05Z
+time: 2026-11-08T03:00:05Z
+watcher_version: v0.3.0
+```
+
 ### `NOTIFY_ERROR_AFTER`
 
 How long an error the watcher retries, such as kopia server being unavailable, must last for a path, without a
 successful pass in between, before the watcher notifies it. Default `15m`, minimum `1m`. Errors the watcher does not retry, such as a schedule kopia server
 rejects, and problems with the labels are notified at once.
 
-While kopia server is down every path fails, so each path the watcher handles sends its own notification.
+While kopia server is down every path fails, so each path the watcher handles sends its own notification, on
+each channel.
 
 ## Throttle
 
