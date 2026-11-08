@@ -80,9 +80,10 @@ watcher itself is not. See [docs/en/migration.md](docs/en/migration.md).
 - Checks on `/healthz` that Docker answers, that kopia server answers with a repository connected, and that the
   reconcile loop is not stuck, and answers 503 when one of them has failed for a while; the image's
   `HEALTHCHECK` uses it. See [the health check](docs/en/configuration.md#health-check).
-- Posts a notification to `NOTIFY_WEBHOOK_URL` when a path starts failing (a failed snapshot of the watcher, a
-  failed hook, labels that cannot be applied, kopia server failing for a while) and when it works again, once
-  each, as JSON or for ntfy, Slack or Telegram. See [notifications](docs/en/configuration.md#notifications).
+- Notifies when a path starts failing (a failed snapshot of the watcher, a failed hook, labels that cannot be
+  applied, kopia server failing for a while) and when it works again, once each: posts to a webhook, as JSON or
+  for ntfy, Slack or Telegram, sends an e-mail through an SMTP server, or both. See
+  [notifications](docs/en/configuration.md#notifications).
 - Sets kopia server's upload, download and storage operation limits from the `KOPIA_THROTTLE_` variables; unset,
   it leaves them to kopia server or Terraform. See [throttle](docs/en/configuration.md#throttle).
   [docs/en/terraform.md](docs/en/terraform.md) splits kopia server's configuration between the watcher and

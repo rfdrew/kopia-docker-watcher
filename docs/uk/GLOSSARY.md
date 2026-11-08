@@ -22,10 +22,12 @@ request, що переклад відстає. `make docs-check` показує 
 | English | Українською | Примітка |
 |---|---|---|
 | alert | алерт, правило алерту | Prometheus |
+| app password | пароль застосунку | для входу на SMTP-сервер |
 | backed-up directory | каталог, що потрапляє в резервну копію | |
 | backup | резервна копія, резервне копіювання | |
 | bind mount | bind-монтування | |
 | boolean | булеве значення | |
+| channel | канал | канал сповіщень: вебхук або пошта |
 | checkpoint | контрольна точка | вивантаження знімка |
 | cleanup | очищення | `kopia.cleanup-on-remove` |
 | complete, incomplete snapshot | повний, неповний знімок | |
@@ -41,6 +43,7 @@ request, що переклад відстає. `make docs-check` показує 
 | dry run | пробний запуск | `run --dry-run` |
 | dump | дамп | дамп бази даних |
 | duration | тривалість | Go duration — тривалість у форматі Go |
+| e-mail | лист, електронна пошта; листом, поштою | сповіщення через SMTP |
 | effective policy | чинна політика | |
 | endpoint | ендпоінт | |
 | environment variable | змінна середовища | |
@@ -60,6 +63,7 @@ request, що переклад відстає. `make docs-check` показує 
 | interval | інтервал | |
 | label | мітка | Docker label; label prefix — префікс міток |
 | log; is logged | лог, у логу; записується в лог | не «у лозі», не «пише в лог» |
+| login (on a server) | вхід; входити | SMTP AUTH |
 | managed source | кероване джерело | |
 | mount | монтування | |
 | mount destination | точка монтування | шлях у контейнері |
@@ -73,12 +77,14 @@ request, що переклад відстає. `make docs-check` показує 
 | pause (of a source) | пауза; ставити на паузу, знімати з паузи | `scheduling.manual=true` |
 | pin, pinned snapshot | закріплення; закріплений знімок | `kopia.pin-on-stop` |
 | placeholder | заповнювач | `{date}`, `{time}` |
+| plain text | відкритий текст | з'єднання без TLS |
 | policy | політика | політика Kopia |
 | policy field | поле політики | |
 | policy labels | мітки політики | |
 | queue | черга; поставити в чергу | |
 | reconcile | звіряння; звіряти | узгодження джерела з мітками |
 | reconcile loop | цикл звіряння | |
+| relay | релей | поштовий сервер, що пересилає листи |
 | release, pre-release | реліз, передреліз | |
 | repository | репозиторій | Kopia |
 | restart policy | політика перезапуску | Docker |
@@ -89,6 +95,7 @@ request, що переклад відстає. `make docs-check` показує 
 | scheduled snapshot | запланований знімок | |
 | scrape, scrape configuration | збирання метрик, конфігурація збирання | Prometheus |
 | self-signed certificate | самопідписаний сертифікат | |
+| sender, recipient | відправник, одержувач | листа |
 | series, histogram bucket | ряд, кошик гістограми | Prometheus |
 | shell command | команда оболонки | |
 | snapshot | знімок | |

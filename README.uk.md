@@ -1,4 +1,4 @@
-<!-- translated-from: README.md @ 990ac34c92158afde6075bab36b8fde5ebd3f5bc -->
+<!-- translated-from: README.md @ 21917df235e3560b6f7978cddb9e317b2dc46272 -->
 [English](README.md) | Українська
 
 # kopia-docker-watcher
@@ -81,9 +81,10 @@ kopia-docker-watcher керує резервним копіюванням [Kopia
 - Перевіряє на `/healthz`, що Docker відповідає, що kopia server відповідає і має під'єднаний репозиторій і що цикл
   звіряння не завис, і відповідає 503, коли щось із цього не працює вже деякий час; його використовує `HEALTHCHECK`
   образу. Див. [перевірку стану](docs/uk/configuration.md#health-check).
-- Надсилає сповіщення на `NOTIFY_WEBHOOK_URL`, коли шлях починає давати збої (невдалий знімок watcher, невдалий
-  хук, мітки, які неможливо застосувати, kopia server, що не працює вже деякий час), і коли він знову працює —
-  по одному разу, у форматі JSON або для ntfy, Slack чи Telegram. Див. [сповіщення](docs/uk/configuration.md#notifications).
+- Надсилає сповіщення, коли шлях починає давати збої (невдалий знімок watcher, невдалий хук, мітки, які
+  неможливо застосувати, kopia server, що не працює вже деякий час), і коли він знову працює — по одному разу:
+  на вебхук, у форматі JSON або для ntfy, Slack чи Telegram, листом через SMTP-сервер або обома способами. Див.
+  [сповіщення](docs/uk/configuration.md#notifications).
 - Задає обмеження kopia server на вивантаження, завантаження та операції зі сховищем зі змінних `KOPIA_THROTTLE_`;
   якщо їх не задано, залишає їх на розсуд kopia server або Terraform. Див. [обмеження швидкості](docs/uk/configuration.md#throttle).
   [docs/uk/terraform.md](docs/uk/terraform.md) розподіляє конфігурацію kopia server між watcher і

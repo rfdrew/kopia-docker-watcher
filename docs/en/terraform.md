@@ -17,7 +17,7 @@ watcher what follows the containers.
 | Throttle (`/api/v1/repo/throttle`) | Terraform | One set of limits per server. Leave the watcher's `KOPIA_THROTTLE_` variables unset. |
 | The policies of the paths of containers, `user@host:/path` | the watcher | Their schedule and pause follow the labels and the state of the containers. |
 | Snapshots of the watcher, their descriptions, the cleanup of removed containers | the watcher | They follow container events. |
-| Notifications about the watcher's own snapshots and labels | the watcher, `NOTIFY_WEBHOOK_URL` | kopia server does not know about labels; see [configuration.md](configuration.md#notifications). |
+| Notifications about the watcher's own snapshots and labels | the watcher, `NOTIFY_WEBHOOK_URL` and `NOTIFY_SMTP_HOST` | kopia server does not know about labels; see [configuration.md](configuration.md#notifications). |
 
 The rules behind the table:
 
@@ -38,11 +38,11 @@ The rules behind the table:
 ## Notifications from both
 
 kopia server's notification profiles report the snapshots kopia server runs: those on the schedule of the
-policies, and those the watcher asks for at a container start or stop. The watcher's `NOTIFY_WEBHOOK_URL`
-reports what kopia server cannot: a snapshot of the watcher whose end got lost, as when kopia server restarted,
+policies, and those the watcher asks for at a container start or stop. The watcher's notifications, by webhook
+or e-mail, report what kopia server cannot: a snapshot of the watcher whose end got lost, as when kopia server restarted,
 labels kopia server rejects, and kopia server failing for a path for a while after the watcher started. It also reports a failed
 snapshot of the watcher, once per path until one succeeds again. Both may post to the same ntfy topic or Slack
-channel.
+channel, or e-mail the same people.
 
 ## Credentials
 

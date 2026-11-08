@@ -23,6 +23,7 @@ import (
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
 	"github.com/rfdrew/kopia-docker-watcher/internal/kopiaclient"
 	"github.com/rfdrew/kopia-docker-watcher/internal/reconcile"
+	"github.com/rfdrew/kopia-docker-watcher/internal/smtptest"
 )
 
 // Identity of runKopia.
@@ -593,8 +594,9 @@ type watcherOptions struct {
 	grace time.Duration
 	// retry is the first delay between attempts to reach kopia server.
 	retry time.Duration
-	// webhook receives the notifications.
+	// webhook receives the notifications; so does smtp, if set.
 	webhook http.RoundTripper
+	smtp    *smtptest.Server
 }
 
 func startWatcher(t *testing.T, k *runKopia, e *watchEngine, opts watcherOptions) *watcherRun {
@@ -621,6 +623,10 @@ func startWatcher(t *testing.T, k *runKopia, e *watchEngine, opts watcherOptions
 	wr.td.maxKopiaRetry = 2 * time.Millisecond
 	wr.td.shutdownGrace = opts.grace
 	wr.td.webhookTransport = opts.webhook
+
+	if opts.smtp != nil {
+		wr.td.smtpDial, wr.td.smtpTLS = opts.smtp.Dial, smtptest.ClientTLS()
+	}
 	wr.td.newTicker = func(d time.Duration) (<-chan time.Time, func()) {
 		wr.interval <- d
 		return wr.ticks, func() {}
