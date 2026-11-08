@@ -285,6 +285,9 @@ func (n *Notifier) Source(path string, s reconcile.SourceMetrics) {
 // LastSuccess implements reconcile.Metrics; it does nothing.
 func (n *Notifier) LastSuccess(string, time.Time) {}
 
+// UnhealthySkip implements reconcile.Metrics; it does nothing.
+func (n *Notifier) UnhealthySkip(string) {}
+
 // ForgetSource implements reconcile.Metrics: the watcher no longer manages
 // the path, so its snapshots are forgotten, failing or not.
 func (n *Notifier) ForgetSource(path string) {

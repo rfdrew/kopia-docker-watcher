@@ -56,6 +56,7 @@ kopia-docker-watcher validate --all
 | [`kopia.pause-during-backup`](#kopiapause-during-backup) | `false` | boolean |
 | [`kopia.max-downtime`](#kopiamax-downtime) | `1h` | Go duration |
 | [`kopia.depends-on`](#kopiadepends-on) | — | container or compose service names, separated by `,` |
+| [`kopia.require-healthy`](#kopiarequire-healthy) | `false` | boolean |
 
 The [policy labels](#policy-labels) set fields of the path's Kopia policy. Each is unset by default: the path
 inherits the field from its parent policies.
@@ -90,8 +91,8 @@ inherits the field from its parent policies.
 
 The names, defaults and boolean values of the Python version's labels (`enable`, `path`, `schedule`,
 `snapshot-on-start`, `snapshot-on-stop`, `description`, `tags`) are kept. `volumes`, `exclude-volumes`,
-`min-interval`, `pin-on-stop`, `cleanup-on-remove`, `cleanup-delete-pinned`, the policy labels, the [hooks](#hooks) and
-[stopping and pausing](#stopping-and-pausing) are new.
+`min-interval`, `pin-on-stop`, `cleanup-on-remove`, `cleanup-delete-pinned`, the policy labels, the [hooks](#hooks),
+[stopping and pausing](#stopping-and-pausing) and [`require-healthy`](#health) are new.
 
 ## Warnings, errors and strict mode
 
@@ -116,8 +117,8 @@ What happens to a container with an error:
   is paused while the container is stopped and unpaused while it runs.
 - `kopia.description` and `kopia.tags` are not used; its snapshots are described by the container name.
 - `kopia.snapshot-on-start`, `kopia.snapshot-on-stop`, `kopia.min-interval`, `kopia.pin-on-stop`,
-  `kopia.cleanup-on-remove` and `kopia.cleanup-delete-pinned` still apply as long as that label itself has no
-  error. A cleanup label with an
+  `kopia.cleanup-on-remove`, `kopia.cleanup-delete-pinned` and `kopia.require-healthy` still apply as long as that
+  label itself has no error. A cleanup label with an
   error counts as `pause`.
 - A hook whose label, or `kopia.hook-timeout`, has an error does not run: a `kopia.pre-exec` with an error takes
   no snapshot instead of one without it, a `kopia.post-exec` with an error fails after the snapshot.
@@ -285,8 +286,11 @@ handles the event.
 - One-off containers of `docker compose run` take none.
 - A start the watcher missed while it was down counts when the watcher sees that the source should no longer be
   paused.
+- With [`kopia.require-healthy`](#kopiarequire-healthy) the snapshot waits until Docker reports the container
+  healthy, and is not taken once it is unhealthy.
 - With [hooks](#hooks), `kopia.pre-exec` runs before the snapshot, right after the container started. A database
-  may not take connections yet: make the hook wait for it, or set `kopia.snapshot-on-start=false`.
+  may not take connections yet: give the container a health check and set `kopia.require-healthy=true`, make the
+  hook wait for it, or set `kopia.snapshot-on-start=false`.
 
 ### `kopia.snapshot-on-stop`
 
@@ -375,8 +379,9 @@ Go duration: `30m`, `1h`, `24h` (there is no `d` unit).
 
 It counts from the later of the start of the source's last snapshot and the last time the watcher queued one,
 which also counts a snapshot that failed, and a snapshot with hooks whose `kopia.pre-exec` failed. It does not
-apply to stop snapshots or to scheduled snapshots, kopia server's or the watcher's own of a source with
-[hooks](#hooks).
+apply to stop snapshots or to scheduled snapshots, kopia server's or those of
+[the watcher's schedule](#the-watchers-schedule). A snapshot at a start that waits for
+[the health](#health) of the container is checked against it once the container is healthy.
 
 An empty, invalid or negative value keeps the default, with a warning.
 
@@ -488,8 +493,9 @@ Before it writes a new schedule, the watcher asks kopia server for the next snap
 would be (`policy/resolve`), also while the source is paused. `validate` with `KOPIA_SERVER_URL` shows those
 times.
 
-A source with [hooks](#hooks) keeps `{"manual": true}` while its containers run too: the watcher takes its
-scheduled snapshots itself, at the times of the kept section.
+A source with [hooks](#hooks), [stopping or pausing](#stopping-and-pausing) or
+[`kopia.require-healthy`](#kopiarequire-healthy) keeps `{"manual": true}` while its containers run too: the watcher
+takes its scheduled snapshots itself, at the times of the kept section.
 
 ### `kopia.retention.*`
 
@@ -687,7 +693,9 @@ gives running hooks the same few seconds as its passes, and starts no new ones.
 
 kopia server would take its scheduled snapshots without the hooks. So once a container of a path, running or
 stopped, has `kopia.pre-exec` or `kopia.post-exec`, even one with an error, the watcher takes the scheduled
-snapshots of the path's source itself:
+snapshots of the path's source itself. [Stopping and pausing](#stopping-and-pausing) do the same, and so does
+[`kopia.require-healthy`](#kopiarequire-healthy), which holds the snapshots back while the container is not
+healthy:
 
 - The `scheduling` section of the path's policy stays `{"manual": true}`, also while the containers run; the
   Kopia web UI shows the source as manual. The section it replaces, with the fields of `kopia.schedule`,
@@ -704,13 +712,14 @@ snapshots of the path's source itself:
 - While all containers of the path are stopped, no scheduled snapshot is taken. Nothing is written to kopia
   server for that: the policy is manual already. A source whose containers are all removed keeps the watcher's
   schedule, paused, until a container comes back or the cleanup removes the source.
-- A time that passed while the watcher was not running, while all containers were stopped, or while a snapshot
-  with hooks ran, is a missed one. As kopia server does with `runMissed`, also for a time that came during an
-  upload, it is taken right away when the schedule has an interval, or when `runMissed` is on (kopia's default)
-  and the next time is more than 30 minutes away; otherwise it is skipped, with a line in the log.
+- A time that passed while the watcher was not running, while all containers were stopped, while a snapshot with
+  hooks ran, or while a container with `kopia.require-healthy` was not healthy, is a missed one. As kopia server
+  does with `runMissed`, also for a time that came during an upload, it is taken right away when the schedule has
+  an interval, or when `runMissed` is on (kopia's default) and the next time is more than 30 minutes away;
+  otherwise it is skipped, with a line in the log.
 - `kopia.min-interval` does not hold back a scheduled snapshot, as it does not hold back kopia server's.
-- Once the containers of the path have no hooks, kopia server takes the schedule back: the kept section returns to
-  the policy, as after a pause.
+- Once the containers of the path have no hooks, stop or pause labels or `kopia.require-healthy`, kopia server takes
+  the schedule back: the kept section returns to the policy, as after a pause.
 
 ### Commands
 
@@ -860,6 +869,93 @@ depend on each other in a circle, are errors: no container of the group is stopp
 full reconcile logs them once, and again when they change, and each snapshot they keep from being taken is
 logged and counted as a label error of its path; `validate --container` checks the names against the containers.
 Compose's own `depends_on` is not read: write `kopia.depends-on` where a container should go down with another.
+
+## Health
+
+A container that runs is not always one to back up: a database that is still starting, or one that has gone
+wrong, may leave files that make a poor snapshot. With `kopia.require-healthy` the watcher holds back the
+snapshots of the container's sources while the container runs and Docker does not report it `healthy`.
+
+```yaml
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: example
+    volumes:
+      - /srv/db/data:/var/lib/postgresql/data
+      - /srv/db/dump:/dump
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 1m
+    labels:
+      kopia.enable: "true"
+      kopia.path: "/srv/db/dump"
+      kopia.schedule: "0 3 * * *"
+      # The dump at a start waits until the database takes connections.
+      kopia.require-healthy: "true"
+      kopia.pre-exec: '["pg_dump", "-U", "postgres", "-f", "/dump/postgres.sql", "postgres"]'
+      kopia.post-exec: '["rm", "-f", "/dump/postgres.sql"]'
+```
+
+The health is the status of Docker's health check: the `HEALTHCHECK` of the image, or `healthcheck:` in compose.
+Docker reports `starting` from a start until a check succeeds, then `healthy`, and `unhealthy` once `retries`
+checks in a row have failed; failures within `start_period` do not count.
+
+- **At a start.** The snapshot at a start ([`kopia.snapshot-on-start`](#kopiasnapshot-on-start)) waits while the
+  container is `starting`, and is taken once it is `healthy`, if [`kopia.min-interval`](#kopiamin-interval) allows
+  it then. Once the container is `unhealthy`, or stops, it is not taken. There is no time limit of its own:
+  `start_period`, `interval` and `retries` of the health check decide how long a container stays `starting`. The
+  same holds for the snapshots of [`SNAPSHOT_ON_WATCHER_START`](configuration.md#snapshot_on_watcher_start) and for
+  a start the watcher missed. The watcher keeps a start that waits in memory only: a restart of the watcher
+  meanwhile drops it. With [hooks](#hooks), `kopia.pre-exec` runs once the container is healthy, so a dump at a
+  start no longer has to wait for the database itself.
+- **On schedule.** Like a hook, the label puts the container's sources on [the watcher's
+  schedule](#the-watchers-schedule): the Kopia web UI shows them as manual, and the scheduled snapshots are taken
+  only while the watcher runs. A scheduled time that comes while the container is not healthy is held back; the
+  watcher logs "the scheduled snapshot is held back" once, at warning level. Once the container is healthy again,
+  the time counts as a missed one, and the rules for missed times decide: with an interval, or with `runMissed`
+  and the next time more than 30 minutes away, it is taken at once, otherwise skipped.
+- **At a stop.** The snapshot at a stop ([`kopia.snapshot-on-stop`](#kopiasnapshot-on-stop)) is taken regardless:
+  Docker reports a stopped container with a health check `unhealthy`, and its files are at rest.
+- **By hand.** `trigger` ends with "no snapshot taken: not healthy:" and the containers with their status, such as
+  `db (starting)`. `trigger --force` takes the snapshot all the same, as it does before `kopia.min-interval` has
+  passed.
+- **Paused.** Docker runs no checks in a paused container and reports it `unhealthy`, also after `docker unpause`
+  until a check succeeds again. A container the watcher stops or pauses for a snapshot ([stopping and
+  pausing](#stopping-and-pausing)) does not count while it is down: its health was looked at when the snapshot
+  began. Once it is back, Docker reports it `starting` or `unhealthy` until its next check. The snapshots of its
+  sources wait for that check, as they waited while it was down, for 5 minutes at most: a scheduled time is then
+  taken on time once the container is healthy. When Docker reports no new health within 5 minutes, the status
+  counts as it is.
+- **Several containers.** When containers share a path, every running one with the label must be healthy.
+  Stopped containers, and those without the label, do not count.
+- **No health check.** A container without one has no health status, and the label holds back none of its
+  snapshots. Its sources still go on [the watcher's schedule](#the-watchers-schedule). The watcher logs "the
+  container has no health check" once per container while it runs. `validate --container` warns about a running
+  one; with `--strict` that is an error. `run --strict` only logs it, as it depends on the container, not on its
+  labels.
+
+Docker sends a `health_status` event when the health of a container changes, not at every check. The watcher
+looks at the paths of a container with the label then, so it does not poll. It reads the status from the
+container list, where Docker 29 (API 1.52) and later report it and older versions write it into the status text,
+and inspects a container the list does not tell about, such as a paused one on an older Docker. With a
+docker-socket-proxy the label needs nothing more than `CONTAINERS=1` and `EVENTS=1` (see
+[Docker](configuration.md#docker)).
+
+[`kopia_watcher_source_unhealthy`](metrics.md#kopia_watcher_source_unhealthy) is 1 while a container with the
+label runs and is not healthy, and
+[`kopia_watcher_unhealthy_skips_total`](metrics.md#kopia_watcher_unhealthy_skips_total) counts the snapshots not
+taken for it.
+
+### `kopia.require-healthy`
+
+`true` holds back the snapshots of the container's sources while the container runs and Docker does not report it
+healthy; see [health](#health). Default `false`. A [boolean](#booleans): a value that is not one counts as
+`false`, with a warning, or, in strict mode, is an error of the labels, and the label then has no effect.
 
 ## Cleanup
 

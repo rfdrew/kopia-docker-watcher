@@ -74,6 +74,14 @@ type ContainerSpec struct {
 	// container, as a template for PinName; empty for none.
 	PinOnStop string
 
+	// RequireHealthy holds back the snapshots of the container's sources
+	// while the container runs and Docker does not report it healthy: a
+	// snapshot at its start waits until it is, the scheduled ones wait and
+	// count as missed, and the watcher takes the scheduled snapshots
+	// itself, as with hooks. A snapshot at a stop is taken regardless. A
+	// container without a health check is not held back.
+	RequireHealthy bool
+
 	// Policy holds the fields written to the Kopia policy of every path.
 	// A field left unset is inherited from the parent policies: those of
 	// parent directories, then user@host, host and global. The schedule

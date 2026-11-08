@@ -21,6 +21,11 @@ type fakeEngine struct {
 	fail       []error
 	nextID     int
 	starts     int
+	// unlisted holds the containers whose health Containers leaves
+	// unknown, as a daemon before API 1.52 does for a paused one; Inspect
+	// tells it. inspects counts the Inspect calls by container ID or name.
+	unlisted map[string]bool
+	inspects map[string]int
 
 	// exec runs the commands of Exec; nil succeeds at once with no
 	// output. execs records them as "container: arg arg".
@@ -37,7 +42,7 @@ type fakeEngine struct {
 var _ docker.Engine = (*fakeEngine)(nil)
 
 func newFakeEngine() *fakeEngine {
-	return &fakeEngine{containers: map[string]docker.Container{}}
+	return &fakeEngine{containers: map[string]docker.Container{}, unlisted: map[string]bool{}, inspects: map[string]int{}}
 }
 
 func cloneContainer(c docker.Container) docker.Container {
@@ -65,7 +70,12 @@ func (f *fakeEngine) Containers(ctx context.Context) ([]docker.Container, error)
 
 	out := make([]docker.Container, 0, len(f.containers))
 	for _, id := range slices.Sorted(maps.Keys(f.containers)) {
-		out = append(out, cloneContainer(f.containers[id]))
+		c := cloneContainer(f.containers[id])
+		if f.unlisted[id] {
+			c.Health = docker.HealthUnknown
+		}
+
+		out = append(out, c)
 	}
 
 	return out, nil
@@ -79,6 +89,8 @@ func (f *fakeEngine) Inspect(ctx context.Context, id string) (docker.Container, 
 	if err := ctx.Err(); err != nil {
 		return docker.Container{}, err
 	}
+
+	f.inspects[id]++
 
 	for _, c := range f.containers {
 		if c.ID == id || c.Name == id {
@@ -334,6 +346,40 @@ func labelMap(labels ...string) map[string]string {
 	}
 
 	return m
+}
+
+// setHealth sets the health of a container and returns the event Docker
+// sends about the change.
+func (f *fakeEngine) setHealth(id string, health docker.Health) docker.Event {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	c, ok := f.containers[id]
+	if !ok {
+		panic("no container " + id)
+	}
+
+	c.Health = health
+	f.containers[id] = c
+
+	return docker.Event{Kind: docker.KindHealth, Action: "health_status: " + string(health), ContainerID: id, Name: c.Name,
+		Labels: maps.Clone(c.Labels), Time: time.Now()}
+}
+
+// unlist makes Containers leave the health of a container unknown.
+func (f *fakeEngine) unlist(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.unlisted[id] = true
+}
+
+// inspected returns how often a container was inspected by its ID.
+func (f *fakeEngine) inspected(id string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.inspects[id]
 }
 
 func (f *fakeEngine) setState(id string, st docker.State) {

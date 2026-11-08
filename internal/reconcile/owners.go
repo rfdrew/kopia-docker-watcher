@@ -123,6 +123,11 @@ type owner struct {
 	// held reports that the watcher holds the container down for a
 	// snapshot: stopped, it still counts as running.
 	held bool
+	// requireHealthy reports that its labels ask that the snapshots of the
+	// source wait while it is not healthy; health is its health as the
+	// listing reports it, or as an inspect found it.
+	requireHealthy bool
+	health         docker.Health
 	// cleanup and deletePinned are what its labels ask of the cleanup of
 	// the path's source once no container backs it up: the most cautious
 	// values when the label in question has an error.
@@ -146,6 +151,8 @@ func (r *Reconciler) owners(p string, containers []docker.Container) []owner {
 		o := owner{id: c.ID, name: c.Name, state: c.State, labels: c.Labels, valid: pc.valid(), issues: pc.issues,
 			snap: r.snapshotLabels(pc), hooks: r.hookLabels(pc), down: r.downLabels(pc), cleanup: labels.CleanupPause}
 		_, o.held = held[c.ID]
+		o.requireHealthy, o.health = r.requiresHealthy(pc), c.Health
+
 		if o.valid {
 			o.patch = pc.patch()
 		}

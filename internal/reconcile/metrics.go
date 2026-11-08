@@ -51,6 +51,13 @@ type Metrics interface {
 	// running again, and each time an attempt fails. It comes from the
 	// goroutine that brought it back.
 	ContainerReturned(path string, res ReturnResult)
+
+	// UnhealthySkip counts one snapshot of the source of a path that the
+	// watcher did not take when it was asked for, as a container that asks
+	// for health with the require-healthy label was not healthy: a snapshot
+	// at a start that was dropped, a scheduled time held back, once, and a
+	// manual trigger declined.
+	UnhealthySkip(path string)
 }
 
 // Modes a container is taken down in, as ReturnResult.Mode has them.
@@ -108,6 +115,11 @@ type SourceMetrics struct {
 	// Hooks reports that a container of the source runs hooks around its
 	// snapshots.
 	Hooks bool
+	// HealthGated reports that a container of the source asks with the
+	// require-healthy label that its snapshots wait while it is not
+	// healthy; Unhealthy that such a container runs and is not healthy
+	// now.
+	HealthGated, Unhealthy bool
 }
 
 type noMetrics struct{}
@@ -119,6 +131,7 @@ func (noMetrics) ForgetSource(string)                             {}
 func (noMetrics) SnapshotFinished(string, backend.SnapshotResult) {}
 func (noMetrics) HookFinished(string, HookResult)                 {}
 func (noMetrics) ContainerReturned(string, ReturnResult)          {}
+func (noMetrics) UnhealthySkip(string)                            {}
 
 // reportMetrics reports the source of the pass as managed, once its policy
 // step has succeeded, or drops what was reported about it when the
@@ -156,7 +169,8 @@ func (ps *pass) reportMetrics(err error) {
 		return
 	}
 
-	ps.metrics.Source(ps.path, SourceMetrics{Paused: ps.want.Paused, Owners: ownerNames(ps.owners), Hooks: ps.want.OwnSchedule})
+	ps.metrics.Source(ps.path, SourceMetrics{Paused: ps.want.Paused, Owners: ownerNames(ps.owners), Hooks: ps.hooksReported(),
+		HealthGated: healthGated(ps.owners), Unhealthy: len(ps.unhealthy) > 0})
 	ps.noteSource(ps.path, ps.src, ps.want.Paused, ownerNames(ps.owners))
 
 	if err != nil {
@@ -167,6 +181,28 @@ func (ps *pass) reportMetrics(err error) {
 		ps.metrics.LastSuccess(ps.path, start)
 		ps.noteLastSuccess(ps.path, start)
 	}
+}
+
+// hooksReported reports whether the source counts as one with hooks for
+// the metrics: an owner runs hooks, or stops or pauses around a snapshot.
+// A source that has lost its owners counts as its owners did when this
+// process last saw them; after a restart of the watcher, as one with hooks
+// while it stays on the watcher's schedule. A source on it only for the
+// require-healthy label has no hooks.
+func (ps *pass) hooksReported() bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if len(ps.owners) > 0 {
+		ps.hookedPaths[ps.path] = hooked(ps.owners)
+		return ps.hookedPaths[ps.path]
+	}
+
+	if h, ok := ps.hookedPaths[ps.path]; ok {
+		return h && ps.want.OwnSchedule
+	}
+
+	return ps.want.OwnSchedule
 }
 
 // lastComplete is the last complete snapshot of a source found by listing
@@ -237,6 +273,7 @@ func (ps *pass) lastSuccess() (start time.Time, ok bool) {
 func (ps *pass) forgetSource() {
 	ps.mu.Lock()
 	delete(ps.lastComplete, ps.path)
+	delete(ps.hookedPaths, ps.path)
 	ps.mu.Unlock()
 
 	ps.metrics.ForgetSource(ps.path)

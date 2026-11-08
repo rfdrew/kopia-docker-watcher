@@ -393,3 +393,40 @@ func TestContainerReturned(t *testing.T) {
 		}
 	}
 }
+
+// A source with a container that asks for health has its health series:
+// the gauge follows the reports, the skips start at zero and count; both go
+// when no container asks for health any more, or the source is forgotten.
+func TestUnhealthy(t *testing.T) {
+	m := New()
+	m.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"db"}})
+
+	assertAbsent(t, scrape(t, m), `kopia_watcher_source_unhealthy{path="/data/app"}`,
+		`kopia_watcher_unhealthy_skips_total{path="/data/app"}`)
+
+	m.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"db"}, HealthGated: true})
+	assertSamples(t, scrape(t, m), map[string]float64{
+		`kopia_watcher_source_unhealthy{path="/data/app"}`:      0,
+		`kopia_watcher_unhealthy_skips_total{path="/data/app"}`: 0,
+	})
+
+	m.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"db"}, HealthGated: true, Unhealthy: true})
+	m.UnhealthySkip("/data/app")
+	m.UnhealthySkip("/data/app")
+	assertSamples(t, scrape(t, m), map[string]float64{
+		`kopia_watcher_source_unhealthy{path="/data/app"}`:      1,
+		`kopia_watcher_unhealthy_skips_total{path="/data/app"}`: 2,
+	})
+
+	m.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"db"}})
+	assertAbsent(t, scrape(t, m), `kopia_watcher_source_unhealthy{path="/data/app"}`,
+		`kopia_watcher_unhealthy_skips_total{path="/data/app"}`)
+
+	m.Source("/data/app", reconcile.SourceMetrics{Owners: []string{"db"}, HealthGated: true, Unhealthy: true})
+	m.UnhealthySkip("/data/app")
+	m.ForgetSource("/data/app")
+
+	if s := watcherSeries(scrape(t, m), "/data/app"); len(s) != 0 {
+		t.Errorf("series left of a forgotten source: %q", s)
+	}
+}

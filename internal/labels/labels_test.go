@@ -273,6 +273,7 @@ func TestParseBooleans(t *testing.T) {
 		KeyEnable:          func(s ContainerSpec) bool { return s.Enable },
 		KeySnapshotOnStart: func(s ContainerSpec) bool { return s.SnapshotOnStart },
 		KeySnapshotOnStop:  func(s ContainerSpec) bool { return s.SnapshotOnStop },
+		KeyRequireHealthy:  func(s ContainerSpec) bool { return s.RequireHealthy },
 	}
 
 	for key, get := range field {

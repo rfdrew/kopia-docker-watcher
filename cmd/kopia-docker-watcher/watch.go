@@ -720,6 +720,11 @@ func (t teeMetrics) ContainerReturned(path string, res reconcile.ReturnResult) {
 	t.n.ContainerReturned(path, res)
 }
 
+func (t teeMetrics) UnhealthySkip(path string) {
+	t.m.UnhealthySkip(path)
+	t.n.UnhealthySkip(path)
+}
+
 // logKopiaError explains an error of kopia server that retrying cannot fix.
 func (w *watcher) logKopiaError(err error) {
 	var msg string

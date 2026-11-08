@@ -1,4 +1,4 @@
-<!-- translated-from: README.md @ 990ac34c92158afde6075bab36b8fde5ebd3f5bc -->
+<!-- translated-from: README.md @ acc608bdd59ddf5e30e623678ee11dec802a1314 -->
 [English](README.md) | Українська
 
 # kopia-docker-watcher
@@ -61,6 +61,9 @@ kopia-docker-watcher керує резервним копіюванням [Kopia
   (`kopia.depends-on`), і запускає його знову після цього, найпізніше через `kopia.max-downtime`, а також коли
   watcher зупиняється; контейнер, який watcher залишив вимкненим під час свого збою, повертається, коли watcher
   знову запускається.
+- Стримує знімки контейнера, про який Docker не повідомляє, що він у стані `healthy`
+  ([`kopia.require-healthy`](docs/uk/labels.md#health)): знімок під час запуску чекає, доки контейнер не буде в
+  стані `healthy`, а запланований чекає й потім вважається пропущеним.
 - Записує `kopia.description` і `kopia.tags` в опис знімка — як для власних знімків, так і для запланованих.
 - Кілька контейнерів можуть спільно використовувати шлях: джерело ставиться на паузу, лише коли всі вони зупинені.
 - Очищає джерела видалених контейнерів так, як вимагає `kopia.cleanup-on-remove`, після `CLEANUP_GRACE`: пауза
@@ -179,7 +182,7 @@ docker compose run --rm watcher run --dry-run
 | `validate [--strict] --container NAME…` | Перевіряє мітки контейнерів. |
 | `validate [--strict] --all` | Перевіряє кожен контейнер із `kopia.enable`, зокрема й зупинені. |
 | `list [--json]` | Показує джерела, якими керує запущений watcher: шлях, контейнери, чи стоїть на паузі, хто планує знімки і коли наступний, останній повний знімок, стан у kopia server та останню проблему. |
-| `trigger [--force] [--no-wait] CONTAINER\|PATH` | Робить знімок кожного шляху контейнера або одного шляху через чергу запущеного watcher, із хуками, зупинкою/призупиненням і `kopia.min-interval`, і чекає на його результат. `--force` ігнорує `kopia.min-interval`; `--no-wait` повертає керування, щойно знімок запитано. |
+| `trigger [--force] [--no-wait] CONTAINER\|PATH` | Робить знімок кожного шляху контейнера або одного шляху через чергу запущеного watcher, із хуками, зупинкою/призупиненням і `kopia.min-interval`, і чекає на його результат. `--force` ігнорує `kopia.min-interval` і `kopia.require-healthy`; `--no-wait` повертає керування, щойно знімок запитано. |
 | `restore --target DIR [--overwrite] [--stop] CONTAINER\|PATH [SNAPSHOT]` | Відновлює знімок, типово найновіший повний, у `DIR` на kopia server через запущений watcher (`POST /api/v1/restore`) і стежить за завданням kopia server до кінця. Відмовляється працювати з непорожнім `DIR`, якщо не задано `--overwrite`; `--stop` зупиняє контейнери шляху на час виконання. Див. [docs/uk/restore.md](docs/uk/restore.md). |
 | `healthcheck` | Завершується з кодом 0, якщо watcher у тому самому контейнері відповідає 200 на `/healthz`, тобто не перебуває в стані unhealthy; його використовує `HEALTHCHECK` образу. |
 | `version` | Показує версію. |

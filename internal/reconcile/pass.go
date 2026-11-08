@@ -91,6 +91,13 @@ type pass struct {
 	// outside reports a path outside WATCHER_PATH_PREFIX, which the pass
 	// leaves alone.
 	outside bool
+	// unhealthy are the owners that hold back the snapshots of the source:
+	// they ask for health, run and are not healthy. returning are those
+	// the watcher brought back from a snapshot whose health Docker has not
+	// reported since, until returnUntil at the latest.
+	unhealthy, returning []owner
+	returnUntil          time.Time
+
 	// owned is what the record said about the owners when the pass began;
 	// ownersTaken reports that the pass has recorded its owners. Only
 	// passes change the owners of a record, so a pass that would not
@@ -219,6 +226,7 @@ func (ps *pass) fail(err error) (retry bool) {
 
 	var (
 		de *dockerError
+		ie *inspectError
 		se *stateError
 	)
 
@@ -226,6 +234,11 @@ func (ps *pass) fail(err error) (retry bool) {
 	case errors.As(err, &de):
 		ps.metrics.ReconcileError(ps.path, ReasonDocker)
 		ps.log.Warn("cannot list Docker containers; retrying", attrs...)
+
+		return true
+	case errors.As(err, &ie):
+		ps.metrics.ReconcileError(ps.path, ReasonDocker)
+		ps.log.Warn("cannot inspect a container for its health; retrying", attrs...)
 
 		return true
 	case errors.As(err, &se):
@@ -336,6 +349,10 @@ func (ps *pass) run() error {
 		return nil
 	}
 
+	if err := ps.checkHealth(); err != nil {
+		return err
+	}
+
 	plan, err := ps.planSource()
 	if err != nil {
 		return err
@@ -414,7 +431,7 @@ func (ps *pass) desire() bool {
 	}
 
 	ps.want.Paused = !anyRunning(ps.owners)
-	ps.want.OwnSchedule = hooked(ps.owners)
+	ps.want.OwnSchedule = hooked(ps.owners) || healthGated(ps.owners)
 
 	patch, err := commonPatch(policyOwners(ps.owners))
 	if err != nil {

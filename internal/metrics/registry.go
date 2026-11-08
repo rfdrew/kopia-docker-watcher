@@ -65,6 +65,8 @@ type Metrics struct {
 	hookDuration    *prometheus.HistogramVec
 	downtime        *prometheus.HistogramVec
 	returnFailures  *prometheus.CounterVec
+	unhealthy       *prometheus.GaugeVec
+	unhealthySkips  *prometheus.CounterVec
 
 	// mu guards sources, the sources reported as managed by path, and
 	// keeps the series of one source consistent with each other.
@@ -155,6 +157,18 @@ func New() *Metrics {
 			Help: "Failed attempts to start or unpause again a container the watcher stopped or paused for a snapshot " +
 				"of a source; the watcher keeps trying.",
 		}, []string{"path", "container"}),
+		unhealthy: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "source_unhealthy",
+			Help: "1 while the snapshots of a source are held back because a container that asks for it with " +
+				"require-healthy runs and is not healthy, 0 otherwise; only for sources with such a container.",
+		}, []string{"path"}),
+		unhealthySkips: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "unhealthy_skips_total",
+			Help: "Snapshots of a source the watcher did not take when they were asked for, because a container that " +
+				"asks for it with require-healthy was not healthy: snapshots at a start, scheduled times, manual triggers.",
+		}, []string{"path"}),
 	}
 
 	buildInfo := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
@@ -168,7 +182,7 @@ func New() *Metrics {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		buildInfo, m.lastSuccess, m.duration, m.failures, m.reconcileErrors, m.managed, m.paused, m.owner,
-		m.notifications, m.hookFailures, m.hookDuration, m.downtime, m.returnFailures,
+		m.notifications, m.hookFailures, m.hookDuration, m.downtime, m.returnFailures, m.unhealthy, m.unhealthySkips,
 	)
 
 	// Every kind and result starts at zero, so that the first shows as an
@@ -239,6 +253,19 @@ func (m *Metrics) Source(path string, s reconcile.SourceMetrics) {
 
 	m.paused.WithLabelValues(path).Set(paused)
 
+	if s.HealthGated {
+		unhealthy := 0.0
+		if s.Unhealthy {
+			unhealthy = 1
+		}
+
+		m.unhealthy.WithLabelValues(path).Set(unhealthy)
+		m.unhealthySkips.WithLabelValues(path)
+	} else {
+		m.unhealthy.DeleteLabelValues(path)
+		m.unhealthySkips.DeleteLabelValues(path)
+	}
+
 	s.Owners = slices.Clone(s.Owners)
 	m.sources[path] = s
 	m.countSources()
@@ -275,6 +302,8 @@ func (m *Metrics) ForgetSource(path string) {
 	m.owner.DeletePartialMatch(prometheus.Labels{"path": path})
 	m.hookFailures.DeletePartialMatch(prometheus.Labels{"path": path})
 	m.returnFailures.DeletePartialMatch(prometheus.Labels{"path": path})
+	m.unhealthy.DeleteLabelValues(path)
+	m.unhealthySkips.DeleteLabelValues(path)
 	m.countSources()
 }
 
@@ -305,6 +334,12 @@ func (m *Metrics) HookFinished(path string, res reconcile.HookResult) {
 	if res.Error != "" {
 		m.hookFailures.WithLabelValues(path, res.Hook).Inc()
 	}
+}
+
+// UnhealthySkip implements reconcile.Metrics: the snapshot counts as held
+// back for the source.
+func (m *Metrics) UnhealthySkip(path string) {
+	m.unhealthySkips.WithLabelValues(path).Inc()
 }
 
 // SnapshotFinished implements reconcile.Metrics: a snapshot that saved no

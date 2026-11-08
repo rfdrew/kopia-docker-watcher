@@ -43,8 +43,9 @@ Asks the running watcher for a snapshot of each path of a container, or of
 one source path, and waits until it has ended. The snapshot goes through
 the watcher's queue like the one at a container's start: with the
 pre-exec and post-exec hooks, stop-during-backup and pause-during-backup
-of the path's containers, and not before the min-interval label allows
-it. A snapshot that is pending or uploading already counts. Run it in the
+of the path's containers, not before the min-interval label allows it,
+and not while a container with the require-healthy label is not healthy.
+A snapshot that is pending or uploading already counts. Run it in the
 watcher's container:
 
   docker exec kopia-docker-watcher kopia-docker-watcher trigger app
@@ -53,7 +54,8 @@ CONTAINER is a container's name or the start of its ID; PATH a source
 path as list shows it, or a path label's path.
 
 Options:
-  --force    take the snapshot even if min-interval has not passed
+  --force    take the snapshot even if min-interval has not passed or a
+             container is not healthy
   --no-wait  return once the snapshot is asked for, without its result
 
 Interrupting the command stops the wait, not the snapshot.
@@ -266,7 +268,7 @@ func formatTime(t time.Time) string {
 
 func runTrigger(ctx context.Context, args []string, d deps) int {
 	fs := flag.NewFlagSet("trigger", flag.ContinueOnError)
-	force := fs.Bool("force", false, "take the snapshot even if min-interval has not passed")
+	force := fs.Bool("force", false, "take the snapshot even if min-interval has not passed or a container is not healthy")
 	noWait := fs.Bool("no-wait", false, "return once the snapshot is asked for")
 
 	pos, code, ok := controlFlags(fs, args, triggerUsage, d)

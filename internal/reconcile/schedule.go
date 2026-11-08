@@ -36,8 +36,9 @@ type nextSchedule struct {
 }
 
 // ownSchedule runs the watcher's schedule of a source whose owners run
-// hooks (Desired.OwnSchedule): kopia server's schedule of it is off, so
-// that the hooks run around every snapshot. It works out the next time from
+// hooks or ask for health (Desired.OwnSchedule): kopia server's schedule of
+// it is off, so that the hooks run around every snapshot and a snapshot
+// waits for the health. It works out the next time from
 // the policy the source would have without the hooks and the pause, with
 // policy/resolve, keeps it in the state, and returns the request for the
 // scheduled snapshot when it is due.
@@ -87,8 +88,8 @@ func (ps *pass) ownSchedule(rec state.Record) ([]snapRequest, error) {
 
 	switch {
 	case fresh:
-		ps.log.Info("the watcher takes the scheduled snapshots of the source, as its containers run hooks; "+
-			"kopia server's schedule of it stays off", attrs...)
+		ps.log.Info("the watcher takes the scheduled snapshots of the source, as its containers run hooks or ask "+
+			"for health; kopia server's schedule of it stays off", attrs...)
 	case ps.want.Paused && !sched.Paused:
 		ps.log.Info("scheduled snapshots paused: no container of the source runs", attrs...)
 	case !ps.want.Paused && sched.Paused:
@@ -333,10 +334,11 @@ func (r *Reconciler) armedAt(path string, t time.Time) bool {
 }
 
 // dropSchedule hands the schedule of a source whose containers no longer
-// have hooks back to kopia server: the policy step of the pass has put
-// back its scheduling section, unless the source is paused.
+// have hooks or ask for health back to kopia server: the policy step of the
+// pass has put back its scheduling section, unless the source is paused.
 func (ps *pass) dropSchedule() {
-	ps.log.Info("kopia server takes the scheduled snapshots of the source again: no container of it has hooks",
+	ps.log.Info("kopia server takes the scheduled snapshots of the source again: no container of it has hooks or "+
+		"asks for health",
 		"source", ps.src.String(), "owners", ownerNames(ps.owners), "paused", ps.want.Paused)
 
 	ps.updateRecord(ps.src, func(r *state.Record) bool {

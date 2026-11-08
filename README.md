@@ -59,6 +59,9 @@ watcher itself is not. See [docs/en/migration.md](docs/en/migration.md).
   (`kopia.stop-during-backup`, `kopia.pause-during-backup`), with the containers that depend on it
   (`kopia.depends-on`), and starts it again after, at the latest after `kopia.max-downtime`, also when the
   watcher stops; one the watcher left down when it crashed comes back when it starts again.
+- Holds back the snapshots of a container that Docker does not report healthy
+  ([`kopia.require-healthy`](docs/en/labels.md#health)): the snapshot at a start waits until the container is
+  healthy, and a scheduled one waits and then counts as a missed one.
 - Writes `kopia.description` and `kopia.tags` into the snapshot description, for its own snapshots and for
   scheduled ones.
 - Several containers may share a path: the source is paused only when all of them are stopped.
@@ -177,7 +180,7 @@ The image runs `kopia-docker-watcher run` by default.
 | `validate [--strict] --container NAME…` | Check the labels of containers. |
 | `validate [--strict] --all` | Check every container with `kopia.enable`, stopped ones included. |
 | `list [--json]` | List the sources the running watcher manages: path, containers, paused, who schedules the snapshots and the next one, the last complete snapshot, kopia server's status and the last problem. |
-| `trigger [--force] [--no-wait] CONTAINER\|PATH` | Take a snapshot of each path of a container, or of one path, through the running watcher's queue, with the hooks, stop/pause and `kopia.min-interval`, and wait for its result. `--force` ignores `kopia.min-interval`; `--no-wait` returns once it is asked for. |
+| `trigger [--force] [--no-wait] CONTAINER\|PATH` | Take a snapshot of each path of a container, or of one path, through the running watcher's queue, with the hooks, stop/pause and `kopia.min-interval`, and wait for its result. `--force` ignores `kopia.min-interval` and `kopia.require-healthy`; `--no-wait` returns once it is asked for. |
 | `restore --target DIR [--overwrite] [--stop] CONTAINER\|PATH [SNAPSHOT]` | Restore a snapshot, by default the newest complete one, into `DIR` on kopia server through the running watcher (`POST /api/v1/restore`), and follow kopia server's task to the end. Refuses a `DIR` that is not empty unless `--overwrite`; `--stop` stops the path's containers while it runs. See [docs/en/restore.md](docs/en/restore.md). |
 | `healthcheck` | Exit 0 if the watcher in the same container answers 200 on `/healthz`, that is, is not unhealthy; used by the image's `HEALTHCHECK`. |
 | `version` | Print the version. |
