@@ -921,18 +921,23 @@ checks in a row have failed; failures within `start_period` do not count.
   and the next time more than 30 minutes away, it is taken at once, otherwise skipped.
 - **At a stop.** The snapshot at a stop ([`kopia.snapshot-on-stop`](#kopiasnapshot-on-stop)) is taken regardless:
   Docker reports a stopped container with a health check `unhealthy`, and its files are at rest.
-- **By hand.** `trigger` ends without a snapshot, as "skipped" with the container and its status. `trigger
-  --force` takes the snapshot all the same, as it does before `kopia.min-interval` has passed.
+- **By hand.** `trigger` ends with "no snapshot taken: not healthy:" and the containers with their status, such as
+  `db (starting)`. `trigger --force` takes the snapshot all the same, as it does before `kopia.min-interval` has
+  passed.
 - **Paused.** Docker runs no checks in a paused container and reports it `unhealthy`, also after `docker unpause`
-  until a check succeeds again. A container the watcher stops or pauses for a snapshot
-  ([stopping and pausing](#stopping-and-pausing)) does not count while it is down: its health was looked at when
-  the snapshot began. Once it is back, Docker reports it `starting` or `unhealthy` until its next check, and
-  snapshots of its sources wait until then.
+  until a check succeeds again. A container the watcher stops or pauses for a snapshot ([stopping and
+  pausing](#stopping-and-pausing)) does not count while it is down: its health was looked at when the snapshot
+  began. Once it is back, Docker reports it `starting` or `unhealthy` until its next check. The snapshots of its
+  sources wait for that check, as they waited while it was down, for 5 minutes at most: a scheduled time is then
+  taken on time once the container is healthy. When Docker reports no new health within 5 minutes, the status
+  counts as it is.
 - **Several containers.** When containers share a path, every running one with the label must be healthy.
   Stopped containers, and those without the label, do not count.
-- **No health check.** A container without one has no health status, and the label has no effect on it. The
-  watcher logs "the container has no health check" once per container while it runs, and `validate --container`
-  warns about a running one.
+- **No health check.** A container without one has no health status, and the label holds back none of its
+  snapshots. Its sources still go on [the watcher's schedule](#the-watchers-schedule). The watcher logs "the
+  container has no health check" once per container while it runs. `validate --container` warns about a running
+  one; with `--strict` that is an error. `run --strict` only logs it, as it depends on the container, not on its
+  labels.
 
 Docker sends a `health_status` event when the health of a container changes, not at every check. The watcher
 looks at the paths of a container with the label then, so it does not poll. It reads the status from the

@@ -199,6 +199,10 @@ func TestHealthStopSnapshot(t *testing.T) {
 	if w := h.onlyWait(app); !w.Stop {
 		t.Fatalf("wait = %+v, want a stop", w)
 	}
+
+	if h.logged("taking the snapshot at the stop without hooks") {
+		t.Fatalf("a warning about hooks for a source without them:\n%s", h.logs)
+	}
 }
 
 // A scheduled time that comes while the container is not healthy is held
@@ -335,7 +339,9 @@ func TestHealthManualTrigger(t *testing.T) {
 	h.mustTriggers(app, 1)
 	h.mustSkips(app, 1)
 
-	if res := h.mustResult(forced); !res.OK() {
+	// The run has no hooks of its own: the label alone puts the source on
+	// the watcher's schedule.
+	if res := h.mustResult(forced); !res.OK() || res.Hooks {
 		t.Fatalf("forced result = %+v\nlog:\n%s", res, h.logs)
 	}
 
@@ -510,4 +516,124 @@ func TestHealthHeldContainer(t *testing.T) {
 	h.mustTriggers(app, 1)
 	h.mustSkips(app, 0)
 	h.mustState(id, docker.StateRunning)
+}
+
+// Docker reports a container the watcher paused for a snapshot unhealthy
+// until its next check. The snapshots of another source that waited for the
+// container wait for that check too, and the scheduled time is taken on
+// time; without a health event, the health counts as it is after
+// returnHealthWait.
+func TestHealthAfterReturn(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		healthy bool
+	}{
+		{"healthy at the next check", true},
+		{"no event", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			c := withClock(h)
+			withHooks(h)
+			other := "/data/other"
+			id := h.engine.run("db", enable, pathLabel(app+","+other), requireHealthy, noOnStart, pauseDuring,
+				"kopia.run-missed=false")
+			h.engine.setHealth(id, docker.HealthHealthy)
+
+			h.engine.setLifecycle(func(_ context.Context, action string, ctr docker.Container) error {
+				if action == "pause" {
+					h.engine.setHealth(ctr.ID, docker.HealthUnhealthy)
+				}
+
+				return nil
+			})
+
+			h.passAndSettle(app)
+			h.passAndSettle(other)
+			c.add(time.Hour)
+
+			h.fake.HoldSnapshots(h.src(app))
+			h.passAndSettle(app)
+			h.mustPass(app)
+			h.mustActions("pause db")
+
+			// The other source waits for the container held for the first.
+			h.mustPass(other)
+			h.mustTriggers(other, 0)
+
+			h.fake.ReleaseSnapshots(h.src(app))
+			h.settle()
+			h.runHooked(app, 2)
+			h.mustActions("pause db", "unpause db")
+
+			// Back, but Docker still reports it unhealthy: the other
+			// source waits for the next check, armed, and counts nothing.
+			res := h.passAndSettle(other)
+			h.mustTriggers(other, 0)
+			h.mustSkips(other, 0)
+			h.mustHealthMetrics(other, true, false)
+
+			due := t0.Add(time.Hour)
+			if !h.r.armedAt(other, due) || res.wake.IsZero() {
+				t.Fatalf("armed %v, wake %v", h.r.armed, res.wake)
+			}
+
+			if !tt.healthy {
+				c.add(returnHealthWait)
+				h.passAndSettle(other)
+				h.mustTriggers(other, 0)
+				h.mustSkips(other, 1)
+				h.mustHealthMetrics(other, true, true)
+
+				return
+			}
+
+			c.add(30 * time.Second)
+			h.r.HandleEvent(h.engine.setHealth(id, docker.HealthHealthy))
+			h.passAndSettle(other)
+
+			if run := h.record(other).HookRun; run == nil || run.Reason != "schedule" {
+				t.Fatalf("hook run %+v\nlog:\n%s", run, h.logs)
+			}
+
+			h.runHooked(other, 4)
+			h.mustTriggers(other, 1)
+			h.mustSkips(other, 0)
+			h.mustSkips(app, 0)
+		})
+	}
+}
+
+// A source on the watcher's schedule only for the label does not count as
+// one with hooks for the metrics, also once its containers are gone; one
+// whose containers had hooks still does.
+func TestHealthHooksMetricsWithoutOwners(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		extra []string
+		hooks bool
+	}{
+		{"health only", nil, false},
+		{"with hooks", []string{preExec}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			withClock(h)
+			withHooks(h)
+			id := h.runHealthy("db", docker.HealthHealthy, append([]string{noOnStart}, tt.extra...)...)
+
+			h.passAndSettle(app)
+
+			h.engine.remove(id)
+			h.passAndSettle(app)
+
+			if s, ok := h.metrics.source(app); !ok || s.Hooks != tt.hooks || len(s.Owners) != 0 || s.HealthGated {
+				t.Fatalf("metrics = %+v, managed %t; want hooks %t", s, ok, tt.hooks)
+			}
+
+			if s := h.schedule(app); s == nil {
+				t.Fatal("the source left the watcher's schedule")
+			}
+		})
+	}
 }

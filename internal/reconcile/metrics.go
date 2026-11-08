@@ -184,15 +184,25 @@ func (ps *pass) reportMetrics(err error) {
 }
 
 // hooksReported reports whether the source counts as one with hooks for
-// the metrics: an owner runs hooks, or stops or pauses around a snapshot,
-// or the source has lost its owners and stays on the watcher's schedule. A
-// source on it only for the require-healthy label has no hooks.
+// the metrics: an owner runs hooks, or stops or pauses around a snapshot.
+// A source that has lost its owners counts as its owners did when this
+// process last saw them; after a restart of the watcher, as one with hooks
+// while it stays on the watcher's schedule. A source on it only for the
+// require-healthy label has no hooks.
 func (ps *pass) hooksReported() bool {
-	if len(ps.owners) == 0 {
-		return ps.want.OwnSchedule
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if len(ps.owners) > 0 {
+		ps.hookedPaths[ps.path] = hooked(ps.owners)
+		return ps.hookedPaths[ps.path]
 	}
 
-	return hooked(ps.owners)
+	if h, ok := ps.hookedPaths[ps.path]; ok {
+		return h && ps.want.OwnSchedule
+	}
+
+	return ps.want.OwnSchedule
 }
 
 // lastComplete is the last complete snapshot of a source found by listing
@@ -263,6 +273,7 @@ func (ps *pass) lastSuccess() (start time.Time, ok bool) {
 func (ps *pass) forgetSource() {
 	ps.mu.Lock()
 	delete(ps.lastComplete, ps.path)
+	delete(ps.hookedPaths, ps.path)
 	ps.mu.Unlock()
 
 	ps.metrics.ForgetSource(ps.path)

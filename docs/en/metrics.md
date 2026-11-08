@@ -119,7 +119,7 @@ The problems the reconciler ran into, by `kind`. Every kind is there from the st
 |---|---|---|
 | `unavailable` | kopia server cannot be reached, or has no repository connected | at every attempt; the path is retried with a growing delay |
 | `temporary` | kopia server failed in a way that is retried, or its identity changed | at every attempt |
-| `docker` | the containers could not be listed | at every attempt, a full reconcile's too |
+| `docker` | the containers could not be listed, a container could not be inspected for its health, or stopped or paused for a snapshot | at every attempt, a full reconcile's too |
 | `config` | kopia server rejects the schedule, the policy or the path the labels ask for | once when it comes up, and again at every full reconcile while it lasts |
 | `labels` | labels of a container have errors | once per container and set of labels; for the source of a running container also the way `config` is |
 | `owners_disagree` | running containers that share a path ask for different policies | as `config` |
@@ -153,11 +153,11 @@ kopia_watcher_source_owner * on(path) group_left kopia_watcher_last_success_time
 not report it healthy, so the watcher holds back the source's snapshots, but for one at a stop; 0 otherwise. A
 source without such a container, running or stopped, has no series.
 
-It changes with the passes over the path: Docker reports every change of the health, the watcher looks at the
-path then, and again at every full reconcile. Docker sends no health event when it pauses a container, which then
-counts as not healthy, so a pause shows at the next pass. Once the watcher has brought back a container it stopped
-or paused for a snapshot, the series is 1 for a short while: Docker reports the container `starting` or
-`unhealthy` until its next check.
+It changes with the passes over the path: Docker reports every change of the health, the watcher looks at the path
+then, and again at every full reconcile. Docker sends no health event when it pauses a container, which then counts
+as not healthy, so a pause shows at the next pass. A container the watcher stopped or paused for a snapshot does
+not count, neither while it is down nor once it is back until Docker reports its health again, for 5 minutes at
+most.
 
 ### `kopia_watcher_unhealthy_skips_total`
 

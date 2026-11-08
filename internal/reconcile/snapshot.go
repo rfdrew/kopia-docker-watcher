@@ -923,7 +923,7 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 		}
 	}
 
-	if stop && ps.want.OwnSchedule {
+	if stop && hooked(ps.owners) {
 		ps.log.Warn("taking the snapshot at the stop without hooks: hooks do not run around a snapshot at a stop", attrs...)
 	}
 
@@ -997,7 +997,7 @@ func (ps *pass) triggerHooked(reqs []snapRequest, status *backend.SourceStatus, 
 		ps.log.Debug("deciding on the snapshot after the policy write has settled", attrs...)
 
 		return nil
-	case ps.holdForHealth(reqs, attrs):
+	case ps.holdForHealth(reqs, attrs), ps.waitsForReturn(reqs, attrs):
 		return nil
 	case scheduled:
 	case st == backend.StatusPending || st == backend.StatusUploading:

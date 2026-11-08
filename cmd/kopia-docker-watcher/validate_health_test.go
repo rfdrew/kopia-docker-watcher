@@ -8,14 +8,15 @@ import (
 )
 
 // validate shows require-healthy and warns about a running container
-// without a health check, on which the label has no effect.
+// without a health check, for which the label holds back no snapshot.
 func TestValidateRequireHealthy(t *testing.T) {
 	const (
 		row  = "kopia.require-healthy true"
 		note = "health: the snapshots of these sources wait while the container runs and Docker does not report it " +
 			"healthy, but for one at a stop; the watcher takes the scheduled snapshots itself, kopia server's schedule " +
 			"of them stays off"
-		problem = "kopia.require-healthy: the container has no health check (HEALTHCHECK); the label has no effect"
+		problem = "kopia.require-healthy: the container has no health check (HEALTHCHECK); the label holds back none of " +
+			"its snapshots, but the watcher still takes the scheduled ones itself"
 	)
 
 	tests := []struct {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
 	"github.com/rfdrew/kopia-docker-watcher/internal/labels"
@@ -24,6 +25,17 @@ import (
 // stopped container unhealthy. Docker sends an event only when the health
 // changes, so HandleEvent queues the paths of a container that asks for it
 // at every change.
+//
+// Docker marks a container the watcher paused or stopped for a snapshot
+// unhealthy, or starting once started again, until its next check, and
+// sends no event for that. So once the watcher has brought a container
+// back, the snapshots wait for the next change of its health, for
+// returnHealthWait at most, instead of taking that status for the
+// container's own.
+
+// returnHealthWait is how long the snapshots wait for a health event of a
+// container the watcher brought back before its health counts as it is.
+const returnHealthWait = 5 * time.Minute
 
 // healthGated reports whether an owner asks with the require-healthy label
 // that the snapshots of the source wait while it is not healthy.
@@ -42,6 +54,8 @@ func (r *Reconciler) requiresHealthy(pc parsed) bool {
 // label, those its mounts made when it was last seen, which a change of the
 // health does not change.
 func (r *Reconciler) handleHealthEvent(ev docker.Event, pc parsed, volumes bool) {
+	r.forgetReturned(ev.ContainerID)
+
 	if !r.requiresHealthy(pc) {
 		return
 	}
@@ -60,14 +74,63 @@ func (r *Reconciler) handleHealthEvent(ev docker.Event, pc parsed, volumes bool)
 	r.queueEvent(ev, paths, nil)
 }
 
+// noteReturned records that the watcher brought the container back after
+// a snapshot, and forgets the containers it brought back longer ago than
+// returnHealthWait.
+func (r *Reconciler) noteReturned(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := r.now()
+
+	for x, at := range r.returned {
+		if !now.Before(at.Add(returnHealthWait)) {
+			delete(r.returned, x)
+		}
+	}
+
+	r.returned[id] = now
+}
+
+// forgetReturned forgets that the watcher brought the container back:
+// Docker reported its health since, or it is gone.
+func (r *Reconciler) forgetReturned(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.returned, id)
+}
+
+// returnedUntil returns until when the health of a container the watcher
+// brought back is not taken as it is; false once that has passed, or when
+// the watcher did not bring it back.
+func (r *Reconciler) returnedUntil(id string) (time.Time, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	at, ok := r.returned[id]
+	if !ok {
+		return time.Time{}, false
+	}
+
+	until := at.Add(returnHealthWait)
+	if !r.now().Before(until) {
+		delete(r.returned, id)
+		return time.Time{}, false
+	}
+
+	return until, true
+}
+
 // checkHealth finds the owners that hold back the snapshots of the source:
 // those that ask for health, run and are not healthy. One held down by the
 // watcher for a snapshot does not count: Docker reports it unhealthy or
-// starting, but its health was looked at before it went down. An owner
-// whose health the listing does not tell is inspected. A container without
-// a health check is logged once.
+// starting, but its health was looked at before it went down. One the
+// watcher brought back goes to the returning owners until Docker reports
+// its health again. An owner whose health the listing does not tell is
+// inspected. A container without a health check is logged once.
 func (ps *pass) checkHealth() error {
-	ps.unhealthy = nil
+	ps.unhealthy, ps.returning, ps.returnUntil = nil, nil, time.Time{}
 
 	for i := range ps.owners {
 		o := &ps.owners[i]
@@ -93,8 +156,18 @@ func (ps *pass) checkHealth() error {
 		case docker.HealthHealthy:
 		case docker.HealthNone:
 			ps.warnOnce("no health check "+o.id, "the container has no health check; "+
-				labels.Name(ps.labelPrefix, labels.KeyRequireHealthy)+" has no effect", "container", o.name)
+				labels.Name(ps.labelPrefix, labels.KeyRequireHealthy)+" holds back none of its snapshots", "container", o.name)
 		default:
+			if until, ok := ps.returnedUntil(o.id); ok {
+				ps.returning = append(ps.returning, *o)
+
+				if ps.returnUntil.IsZero() || until.Before(ps.returnUntil) {
+					ps.returnUntil = until
+				}
+
+				continue
+			}
+
 			ps.unhealthy = append(ps.unhealthy, *o)
 		}
 	}
@@ -127,7 +200,7 @@ func (ps *pass) holdForHealth(reqs []snapRequest, attrs []any) bool {
 
 	attrs = append(slices.Clone(attrs), "containers", healthNames(ps.unhealthy))
 
-	if slices.ContainsFunc(reqs, func(r snapRequest) bool { return r.manual != nil && r.manual.force }) {
+	if forced(reqs) {
 		ps.log.Info("taking the snapshot asked for by hand with force, although a container is not healthy", attrs...)
 		return false
 	}
@@ -156,6 +229,31 @@ func (ps *pass) holdForHealth(reqs []snapRequest, attrs []any) bool {
 	}
 
 	return true
+}
+
+// waitsForReturn holds back the snapshot reqs ask for while an owner that
+// asks for health is back from a snapshot of the watcher and Docker has not
+// reported its health since, and reports whether it did. As while the
+// container is held down, the start events and manual triggers are kept
+// and the scheduled time stays due and armed, so that it is taken on time
+// once the container is healthy; the next pass comes with the health event,
+// or once the wait is over.
+func (ps *pass) waitsForReturn(reqs []snapRequest, attrs []any) bool {
+	if len(ps.returning) == 0 || forced(reqs) {
+		return false
+	}
+
+	ps.keepEvents(reqs)
+	ps.wakeAt(ps.returnUntil)
+	ps.log.Debug("the snapshot waits for the next health check of a container the watcher brought back",
+		append(attrs, "containers", healthNames(ps.returning), "until", ps.returnUntil.Format(timeFormat))...)
+
+	return true
+}
+
+// forced reports whether reqs have a manual trigger with force.
+func forced(reqs []snapRequest) bool {
+	return slices.ContainsFunc(reqs, func(r snapRequest) bool { return r.manual != nil && r.manual.force })
 }
 
 // holdDue keeps the scheduled time of the pass due while owners are not

@@ -368,7 +368,8 @@ const (
 	// ReasonFailed: kopia server failed in a way that does not go away by
 	// itself, such as wrong credentials.
 	ReasonFailed Reason = "failed"
-	// ReasonDocker: the containers could not be listed.
+	// ReasonDocker: the containers could not be listed, a container could
+	// not be inspected for its health, or stopped or paused for a snapshot.
 	ReasonDocker Reason = "docker"
 	// ReasonState: the state store refused a change.
 	ReasonState Reason = "state"
@@ -524,6 +525,9 @@ type Reconciler struct {
 	// run kopia server lost, which is rare.
 	lastComplete map[string]lastComplete
 	reportedLost map[waitKey]bool
+	// hookedPaths holds per path whether its owners had hooks when a pass
+	// last saw any, for the metrics of a source that lost them all.
+	hookedPaths map[string]bool
 
 	// mounts holds the volume paths of the containers last listed or
 	// inspected, removed the containers removed since the last full
@@ -549,6 +553,10 @@ type Reconciler struct {
 	// logged and counted once. See health.go.
 	armed   map[string]time.Time
 	heldDue map[string]time.Time
+	// returned holds by container ID when the watcher brought the
+	// container back from a snapshot, until Docker reports its health
+	// again. See health.go.
+	returned map[string]time.Time
 
 	// expected holds by container ID the events that the watcher's own
 	// stops and starts of the container cause, which HandleEvent drops;
@@ -676,6 +684,7 @@ func New(opts Options) (*Reconciler, error) {
 		warned:         map[string]bool{},
 		lastComplete:   map[string]lastComplete{},
 		reportedLost:   map[waitKey]bool{},
+		hookedPaths:    map[string]bool{},
 		deferred:       map[string]bool{},
 		sweepDue:       map[string]bool{},
 		mounts:         map[string][]string{},
@@ -684,6 +693,7 @@ func New(opts Options) (*Reconciler, error) {
 		hooksRunning:   map[backend.Source]string{},
 		armed:          map[string]time.Time{},
 		heldDue:        map[string]time.Time{},
+		returned:       map[string]time.Time{},
 		expected:       map[string][]expectation{},
 		heldWaiters:    map[string][]string{},
 		dependsLogged:  map[string]string{},
@@ -932,6 +942,8 @@ func (r *Reconciler) HandleEvent(ev docker.Event) {
 	}
 
 	if ev.Kind == docker.KindRemoved {
+		r.forgetReturned(ev.ContainerID)
+
 		r.mu.Lock()
 		r.reports++
 		r.reported[ev.ContainerID] = labelReport{seq: r.reports, gone: true}

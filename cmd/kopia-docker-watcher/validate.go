@@ -493,7 +493,8 @@ func (v *validator) check(ctx context.Context, input map[string]string, c *docke
 
 		if spec.RequireHealthy && c.State.Running() && c.Health == docker.HealthNone {
 			r.issues = append(r.issues, labels.Issue{Label: labels.Name(v.prefix, labels.KeyRequireHealthy),
-				Severity: v.severity(), Message: "the container has no health check (HEALTHCHECK); the label has no effect"})
+				Severity: v.severity(), Message: "the container has no health check (HEALTHCHECK); the label holds back none " +
+					"of its snapshots, but the watcher still takes the scheduled ones itself"})
 		}
 
 		slices.SortStableFunc(r.issues, func(a, b labels.Issue) int { return strings.Compare(a.Label, b.Label) })
@@ -587,8 +588,6 @@ func (v *validator) checkSource(ctx context.Context, r *report, src *sourceRepor
 	src.scheduled = true
 }
 
-// addError adds an error unless the same one is there already: kopia
-// server finds the same schedule error for every path.
 // severity is the severity of a warning: an error in strict mode.
 func (v *validator) severity() labels.Severity {
 	if v.strict {
@@ -598,6 +597,8 @@ func (v *validator) severity() labels.Severity {
 	return labels.Warning
 }
 
+// addError adds an error unless the same one is there already: kopia
+// server finds the same schedule error for every path.
 func (r *report) addError(label, msg string) {
 	is := labels.Issue{Label: label, Severity: labels.Error, Message: msg}
 	if !slices.Contains(r.issues, is) {

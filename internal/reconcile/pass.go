@@ -92,8 +92,11 @@ type pass struct {
 	// leaves alone.
 	outside bool
 	// unhealthy are the owners that hold back the snapshots of the source:
-	// they ask for health, run and are not healthy.
-	unhealthy []owner
+	// they ask for health, run and are not healthy. returning are those
+	// the watcher brought back from a snapshot whose health Docker has not
+	// reported since, until returnUntil at the latest.
+	unhealthy, returning []owner
+	returnUntil          time.Time
 
 	// owned is what the record said about the owners when the pass began;
 	// ownersTaken reports that the pass has recorded its owners. Only
