@@ -17,7 +17,8 @@ type Desired struct {
 	// Paused is true when no owner is running.
 	Paused bool
 	// OwnSchedule is true when the watcher takes the scheduled snapshots of
-	// the source itself, because its owners run hooks around them. kopia
+	// the source itself, because its owners run hooks around them or ask
+	// that they wait while the owner is not healthy. kopia
 	// server's schedule is then kept off as by the pause: the scheduling
 	// section is {"manual": true}, and the one it replaces is kept in
 	// Applied.SavedScheduling. Merged.Unpaused has that section, so the

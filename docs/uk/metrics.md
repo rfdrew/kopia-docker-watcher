@@ -23,6 +23,8 @@ Prometheus. `run --dry-run` не обслуговує HTTP, а отже, й ме
 | [`kopia_watcher_managed_sources`](#kopia_watcher_managed_sources-and-kopia_watcher_source_paused) | gauge | `state` | Керовані джерела, активні й на паузі |
 | [`kopia_watcher_source_paused`](#kopia_watcher_managed_sources-and-kopia_watcher_source_paused) | gauge | `path` | 1, поки джерело на паузі, 0, поки воно активне |
 | [`kopia_watcher_source_owner`](#kopia_watcher_source_owner) | gauge | `path`, `container` | 1 для кожного контейнера, який робить резервну копію джерела |
+| [`kopia_watcher_source_unhealthy`](#kopia_watcher_source_unhealthy) | gauge | `path` | 1, поки контейнер із `kopia.require-healthy` працює й не в стані `healthy` |
+| [`kopia_watcher_unhealthy_skips_total`](#kopia_watcher_unhealthy_skips_total) | counter | `path` | Знімки, не зроблені через те, що такий контейнер не був у стані `healthy` |
 | [`kopia_watcher_hook_failures_total`](#kopia_watcher_hook_failures_total) | counter | `path`, `hook` | Команди хуків, що завершилися помилкою |
 | [`kopia_watcher_hook_duration_seconds`](#kopia_watcher_hook_duration_seconds) | histogram | `hook` | Скільки тривали команди хуків |
 | [`kopia_watcher_backup_downtime_seconds`](#kopia_watcher_backup_downtime_seconds) | histogram | `mode` | Скільки тривав простій контейнерів, зупинених чи призупинених для знімка |
@@ -72,16 +74,17 @@ Prometheus. `run --dry-run` не обслуговує HTTP, а отже, й ме
 ### `kopia_watcher_snapshot_duration_seconds`
 
 Скільки тривали знімки, які watcher поставив у чергу: під час запуску чи зупинки контейнера, під час запуску
-watcher із [`SNAPSHOT_ON_WATCHER_START`](configuration.md#snapshot_on_watcher_start), за власним розкладом watcher
-для джерела з [хуками](labels.md#hooks) або повторно після того, як kopia server втратив запуск. Це час від
+watcher із [`SNAPSHOT_ON_WATCHER_START`](configuration.md#snapshot_on_watcher_start), за
+[власним розкладом watcher](labels.md#the-watchers-schedule) для джерела з хуками або `kopia.require-healthy` чи
+повторно після того, як kopia server втратив запуск. Це час від
 початку до кінця завдання знімка в kopia server, тож знімок, який чекав на слот вивантаження, час очікування не
 враховує.
 
 Враховуються лише знімки, що дійшли до кінця: ті, що зберегли знімок, повний, неповний чи з помилками, і ті, що
 не зберегли жодного, бо нічого не змінилося (з `ignoreIdenticalSnapshots` у політиці). Невдалі й скасовані знімки
 та втрачені запуски враховуються лише в `kopia_watcher_snapshot_failures_total`. Знімки, які kopia server робить
-за розкладом, не враховуються: watcher за ними не стежить. Заплановані знімки джерела з хуками враховуються:
-їх робить watcher.
+за розкладом, не враховуються: watcher за ними не стежить. Заплановані знімки джерела на розкладі watcher
+враховуються: їх робить watcher.
 
 Кошики гістограми: 1 с, 5 с, 15 с, 30 с, 1 хв, 5 хв, 15 хв, 30 хв, 1 год, 2 год, 4 год і 8 год. Мітки `path`
 немає, щоб кількість рядів лишалася малою; список завдань kopia server показує час кожного знімка.
@@ -106,7 +109,8 @@ watcher із [`SNAPSHOT_ON_WATCHER_START`](configuration.md#snapshot_on_watcher_
 
 Знімки, які kopia server робить за розкладом, не враховуються. Про їхні збої kopia server повідомляє у своєму
 списку завдань і своїх профілях сповіщень; у метриках відстає `kopia_watcher_last_success_timestamp_seconds`.
-Заплановані знімки джерела з [хуками](labels.md#hooks) враховуються, бо їх робить watcher. Знімок із хуками, у
+Заплановані знімки джерела на [розкладі watcher](labels.md#the-watchers-schedule) враховуються, бо їх робить
+watcher. Знімок із хуками, у
 якого `kopia.pre-exec` завершився помилкою, знімка не робить і натомість враховується в
 `kopia_watcher_hook_failures_total`.
 
@@ -147,6 +151,31 @@ watcher із [`SNAPSHOT_ON_WATCHER_START`](configuration.md#snapshot_on_watcher_
 ```promql
 kopia_watcher_source_owner * on(path) group_left kopia_watcher_last_success_timestamp_seconds
 ```
+
+### `kopia_watcher_source_unhealthy`
+
+1, поки контейнер із [`kopia.require-healthy`](labels.md#health), що робить резервну копію джерела, працює, а Docker
+не повідомляє, що він у стані `healthy`, тож watcher стримує знімки джерела, крім знімка під час зупинки; інакше 0.
+Джерело без такого контейнера, запущеного чи зупиненого, ряду не має.
+
+Значення змінюється з проходами по шляху: Docker повідомляє про кожну зміну стану, watcher тоді переглядає шлях, а
+також під час кожного повного звіряння. Коли Docker призупиняє контейнер, події про стан немає, хоча такий
+контейнер вважається не в стані `healthy`, тож призупинення видно після наступного проходу. Щойно watcher повернув
+контейнер, який зупинив чи призупинив для знімка, ряд недовго дорівнює 1: Docker повідомляє про контейнер `starting`
+або `unhealthy` до його наступної перевірки.
+
+### `kopia_watcher_unhealthy_skips_total`
+
+Знімки джерела, яких watcher не зробив, коли їх було запитано, бо контейнер із
+[`kopia.require-healthy`](labels.md#health) не був у стані `healthy`:
+
+- знімок під час запуску, який не зроблено, бо контейнер був у стані `unhealthy`. Знімок, що чекає, поки контейнер
+  у стані `starting`, і робиться, щойно контейнер у стані `healthy`, не враховується;
+- запланований час, який стримано, — один раз для кожного часу, хоч би як довго його стримують;
+- ручний `trigger`, що завершився без знімка.
+
+Ряд джерела починається з 0, коли джерело з таким контейнером стає керованим, і зникає, коли такого контейнера
+більше немає.
 
 ### `kopia_watcher_hook_failures_total`
 
@@ -253,6 +282,14 @@ groups:
             or (kopia_watcher_hook_failures_total > 0 unless kopia_watcher_hook_failures_total offset 1h)
         annotations:
           summary: "The {{ $labels.hook }} hook of {{ $labels.path }} failed; see the watcher's log"
+
+      # A container with kopia.require-healthy has not been healthy for an
+      # hour, so the watcher takes no snapshots of its sources.
+      - alert: KopiaSourceUnhealthy
+        expr: kopia_watcher_source_unhealthy == 1
+        for: 1h
+        annotations:
+          summary: "Snapshots of {{ $labels.path }} are held back: a container is not healthy"
 
       # Fires when a problem comes up. Most are counted again at every full
       # reconcile while they last, label errors only while they hold back

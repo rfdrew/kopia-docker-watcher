@@ -38,7 +38,8 @@ type Engine interface {
 	Inspect(ctx context.Context, id string) (Container, error)
 
 	// Events opens one subscription to the container events that matter:
-	// create, start, die, stop, destroy and rename. With a non-zero since
+	// create, start, die, stop, destroy, rename and health_status. With a
+	// non-zero since
 	// the daemon first replays what it still holds of its latest 256 events
 	// (of all types, health-check execs included), in the order it added
 	// them, back to the first one stamped before since. That order can
@@ -88,7 +89,31 @@ type Container struct {
 	// StartedAt is when Docker last started the container, by the daemon's
 	// clock; zero if it never ran. Only Inspect sets it.
 	StartedAt time.Time
+	// Health is the status of the container's health check. Containers
+	// leaves it HealthUnknown where the listing does not tell; Inspect
+	// always sets it.
+	Health Health
 }
+
+// Health is the status of a container's health check, as Docker reports
+// it. Docker runs the check only while the container runs and is not
+// paused: a start sets it to starting, and a pause or a stop sets it to
+// unhealthy without an event, which stays until the next check succeeds.
+type Health string
+
+// Health statuses.
+const (
+	// HealthUnknown means the listing did not tell: a daemon before API
+	// 1.52 writes the health only into the status text of a running
+	// container, and not while it is paused or restarting.
+	HealthUnknown Health = ""
+	// HealthNone is a container without a health check, or one whose
+	// check never ran.
+	HealthNone      Health = "none"
+	HealthStarting  Health = "starting"
+	HealthHealthy   Health = "healthy"
+	HealthUnhealthy Health = "unhealthy"
+)
 
 // Mount is a volume or bind mount of a container.
 type Mount struct {
@@ -183,6 +208,10 @@ const (
 	// KindRemoved is a removed container. Its labels are only known from
 	// the event.
 	KindRemoved
+	// KindHealth is a change of the health status of a container, which
+	// Docker reports only when the status changes, not at every check.
+	// The status is in Action, e.g. "health_status: healthy".
+	KindHealth
 )
 
 func (k Kind) String() string {
@@ -197,6 +226,8 @@ func (k Kind) String() string {
 		return "died"
 	case KindRemoved:
 		return "removed"
+	case KindHealth:
+		return "health"
 	default:
 		return "unknown"
 	}

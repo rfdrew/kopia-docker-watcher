@@ -959,15 +959,16 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 	return nil
 }
 
-// triggerHooked takes the snapshot reqs ask for of a source whose owners
-// run hooks, unless it is one at a stop: as a snapshot with hooks, which
-// startHookRun begins. The rules of trigger hold, but for a scheduled
-// snapshot, which neither the minimum interval nor a snapshot that is
-// pending or uploading holds back, as with kopia server's own schedule:
-// the snapshot is queued once the pre-exec hooks have run, behind the one
-// under way. While a snapshot with hooks is under way, the start events
-// are kept, and a scheduled time stays due, until it ends: there is one at
-// a time.
+// triggerHooked takes the snapshot reqs ask for of a source on the
+// watcher's own schedule, whose owners run hooks or ask for health, unless
+// it is one at a stop: as a snapshot with hooks, which startHookRun begins.
+// The rules of trigger hold, but for a scheduled snapshot, which neither
+// the minimum interval nor a snapshot that is pending or uploading holds
+// back, as with kopia server's own schedule: the snapshot is queued once
+// the pre-exec hooks have run, behind the one under way. While a snapshot
+// with hooks is under way, the start events are kept, and a scheduled time
+// stays due, until it ends: there is one at a time. While an owner that
+// asks for health is not healthy, holdForHealth holds the snapshot back.
 func (ps *pass) triggerHooked(reqs []snapRequest, status *backend.SourceStatus, reasons []string, attrs []any) error {
 	scheduled := slices.ContainsFunc(reqs, func(r snapRequest) bool { return r.scheduled })
 	rec, _ := ps.store.Get(ps.src)
@@ -995,6 +996,8 @@ func (ps *pass) triggerHooked(reqs []snapRequest, status *backend.SourceStatus, 
 		ps.deferStart = true
 		ps.log.Debug("deciding on the snapshot after the policy write has settled", attrs...)
 
+		return nil
+	case ps.holdForHealth(reqs, attrs):
 		return nil
 	case scheduled:
 	case st == backend.StatusPending || st == backend.StatusUploading:

@@ -176,6 +176,19 @@
 // the watcher's own stops and starts cause, die, stop and start, are
 // dropped, so they take no snapshot at a start or a stop either.
 //
+// # Health
+//
+// A container's require-healthy label holds back the snapshots of its
+// sources while it runs and Docker does not report it healthy; it puts the
+// sources on the watcher's schedule as a hook does, so that a change of
+// the health writes nothing to kopia server. A snapshot at a start waits
+// while such an owner is starting, and is not taken once one is unhealthy;
+// a scheduled time stays due and is judged as a missed one once they are
+// healthy; a manual trigger is declined unless forced. A snapshot at a stop
+// is taken regardless. Docker sends health_status only when the health
+// changes; the paths of a container that asks for health are queued then.
+// See health.go.
+//
 // # Manual requests
 //
 // Trigger asks for a snapshot of the paths of a container, or of one path,
@@ -531,8 +544,11 @@ type Reconciler struct {
 	hooksRunning map[backend.Source]string
 	// armed holds per path the scheduled snapshot time this process armed
 	// a timer for: a time that passes while it is armed is taken late,
-	// one that passed before is a missed one.
-	armed map[string]time.Time
+	// one that passed before is a missed one. heldDue holds per path the
+	// scheduled time held back while a container is not healthy, which is
+	// logged and counted once. See health.go.
+	armed   map[string]time.Time
+	heldDue map[string]time.Time
 
 	// expected holds by container ID the events that the watcher's own
 	// stops and starts of the container cause, which HandleEvent drops;
@@ -667,6 +683,7 @@ func New(opts Options) (*Reconciler, error) {
 		inspectWake:    make(chan struct{}, 1),
 		hooksRunning:   map[backend.Source]string{},
 		armed:          map[string]time.Time{},
+		heldDue:        map[string]time.Time{},
 		expected:       map[string][]expectation{},
 		heldWaiters:    map[string][]string{},
 		dependsLogged:  map[string]string{},
@@ -889,10 +906,12 @@ func (r *Reconciler) Enqueue(paths ...string) {
 // destroy. They are queued whether or not the labels enable the backup, so
 // a container recreated without it frees its paths. An event the watcher
 // caused itself, by stopping or starting a container around a snapshot, is
-// dropped: it asks for no snapshot and changes no pause. The event is kept with
-// each path until a pass over it ends without an error, and that pass logs
-// it. Problems with the labels of a container that is not gone are logged
-// here already, once per set of labels.
+// dropped: it asks for no snapshot and changes no pause. So is a change of
+// the health of a container whose labels do not ask for health, which
+// decides nothing. The event is kept with each path until a pass over it
+// ends without an error, and that pass logs it. Problems with the labels of
+// a container that is not gone are logged here already, once per set of
+// labels.
 func (r *Reconciler) HandleEvent(ev docker.Event) {
 	if ev.Kind == docker.KindResync {
 		r.ReconcileAll()
@@ -906,6 +925,11 @@ func (r *Reconciler) HandleEvent(ev docker.Event) {
 
 	pc := r.parseLabels(docker.Container{ID: ev.ContainerID, Name: ev.Name, Labels: ev.Labels})
 	volumes := r.hasVolumes(ev.Labels)
+
+	if ev.Kind == docker.KindHealth {
+		r.handleHealthEvent(ev, pc, volumes)
+		return
+	}
 
 	if ev.Kind == docker.KindRemoved {
 		r.mu.Lock()

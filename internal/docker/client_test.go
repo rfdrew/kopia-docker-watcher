@@ -134,6 +134,48 @@ func TestContainersIncludesStoppedOnes(t *testing.T) {
 	}
 }
 
+// The health comes from the listing's Health field from API 1.52 on, and
+// from the status text before.
+func TestContainersHealth(t *testing.T) {
+	tests := []struct {
+		name   string
+		state  container.ContainerState
+		status string
+		health *container.HealthSummary
+		want   Health
+	}{
+		{name: "field healthy", state: container.StateRunning, status: "Up 5 minutes", health: &container.HealthSummary{Status: container.Healthy}, want: HealthHealthy},
+		{name: "field none", state: container.StateRunning, status: "Up 5 minutes", health: &container.HealthSummary{Status: container.NoHealthcheck}, want: HealthNone},
+		{name: "field of paused", state: container.StatePaused, status: "Up 5 minutes (Paused)", health: &container.HealthSummary{Status: container.Unhealthy}, want: HealthUnhealthy},
+		{name: "text healthy", state: container.StateRunning, status: "Up 5 minutes (healthy)", want: HealthHealthy},
+		{name: "text unhealthy", state: container.StateRunning, status: "Up About an hour (unhealthy)", want: HealthUnhealthy},
+		{name: "text starting", state: container.StateRunning, status: "Up 2 seconds (health: starting)", want: HealthStarting},
+		{name: "text without check", state: container.StateRunning, status: "Up Less than a second", want: HealthNone},
+		{name: "text paused", state: container.StatePaused, status: "Up 5 minutes (Paused)", want: HealthUnknown},
+		{name: "text restarting", state: container.StateRestarting, status: "Restarting (1) 3 seconds ago", want: HealthUnknown},
+		{name: "text exited", state: container.StateExited, status: "Exited (0) 2 hours ago", want: HealthUnknown},
+		{name: "text of a newer daemon", state: container.StateRunning, status: "Up 5 minutes (degraded)", want: HealthUnknown},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeDocker()
+			f.set(func(f *fakeDocker) {
+				f.containers = []container.Summary{{ID: "c1", Names: []string{"/app"}, State: tt.state, Status: tt.status, Health: tt.health}}
+			})
+
+			got, err := newFakeDockerClient(t, f).Containers(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(got) != 1 || got[0].Health != tt.want {
+				t.Errorf("containers = %+v, want health %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestInspect(t *testing.T) {
 	f := newFakeDocker()
 	f.set(func(f *fakeDocker) {
@@ -145,6 +187,11 @@ func TestInspect(t *testing.T) {
 			Mounts: []container.MountPoint{{Type: mount.TypeTmpfs, Destination: "/run"}},
 		}
 		f.inspect["bare"] = container.InspectResponse{ID: "bare", Name: "/bare"}
+		f.inspect["checked"] = container.InspectResponse{
+			ID:    "checked",
+			Name:  "/checked",
+			State: &container.State{Status: container.StateRunning, Running: true, Health: &container.Health{Status: container.Starting}},
+		}
 	})
 
 	c := newFakeDockerClient(t, f)
@@ -160,13 +207,19 @@ func TestInspect(t *testing.T) {
 		Labels: map[string]string{"kopia.enable": "true"},
 		State:  StateRestarting,
 		Mounts: []Mount{{Type: "tmpfs", Destination: "/run"}},
+		// Docker has no health state for a container without a check.
+		Health: HealthNone,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("container = %+v, want %+v", got, want)
 	}
 
-	if got, err := c.Inspect(t.Context(), "bare"); err != nil || !reflect.DeepEqual(got, Container{ID: "bare", Name: "bare"}) {
+	if got, err := c.Inspect(t.Context(), "bare"); err != nil || !reflect.DeepEqual(got, Container{ID: "bare", Name: "bare", Health: HealthNone}) {
 		t.Errorf("bare container = %+v, %v", got, err)
+	}
+
+	if got, err := c.Inspect(t.Context(), "checked"); err != nil || got.Health != HealthStarting {
+		t.Errorf("container with a health check = %+v, %v; want health starting", got, err)
 	}
 
 	if _, err := c.Inspect(t.Context(), "gone"); !errors.Is(err, ErrNotFound) {
@@ -199,7 +252,7 @@ func TestEventsQuery(t *testing.T) {
 
 	want := map[string]map[string]bool{
 		"type":  {"container": true},
-		"event": {"create": true, "start": true, "die": true, "stop": true, "destroy": true, "rename": true},
+		"event": {"create": true, "start": true, "die": true, "stop": true, "destroy": true, "rename": true, "health_status": true},
 	}
 	if !reflect.DeepEqual(filters, want) {
 		t.Errorf("filters = %v, want %v", filters, want)
@@ -227,7 +280,9 @@ func TestEventsStream(t *testing.T) {
 		// The daemon filters these out; the client drops them too.
 		{Type: events.ContainerEventType, Action: events.ActionKill, Actor: events.Actor{ID: "c1", Attributes: attrs}, TimeNano: 2},
 		{Type: events.NetworkEventType, Action: events.ActionConnect, Actor: events.Actor{ID: "n1"}, TimeNano: 3},
-		{Type: events.ContainerEventType, Action: events.ActionDestroy, Actor: events.Actor{ID: "c1", Attributes: attrs}, TimeNano: 4},
+		{Type: events.ContainerEventType, Action: events.ActionHealthStatusHealthy, Actor: events.Actor{ID: "c1", Attributes: attrs}, TimeNano: 4},
+		{Type: events.ContainerEventType, Action: events.ActionExecStart + ": pg_isready", Actor: events.Actor{ID: "c1", Attributes: attrs}, TimeNano: 5},
+		{Type: events.ContainerEventType, Action: events.ActionDestroy, Actor: events.Actor{ID: "c1", Attributes: attrs}, TimeNano: 6},
 	}
 
 	go func() {
@@ -241,7 +296,7 @@ func TestEventsStream(t *testing.T) {
 	for _, want := range []struct {
 		kind Kind
 		nano int64
-	}{{KindStarted, 1}, {KindRemoved, 4}} {
+	}{{KindStarted, 1}, {KindHealth, 4}, {KindRemoved, 6}} {
 		select {
 		case ev := <-evs:
 			if ev.Kind != want.kind || ev.ContainerID != "c1" || ev.Name != "db" || ev.Time.UnixNano() != want.nano {

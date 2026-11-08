@@ -490,6 +490,12 @@ func (v *validator) check(ctx context.Context, input map[string]string, c *docke
 	vols, volIssues := labels.VolumePaths(spec, *c, opts)
 	if spec.Enable {
 		r.issues = append(r.issues, volIssues...)
+
+		if spec.RequireHealthy && c.State.Running() && c.Health == docker.HealthNone {
+			r.issues = append(r.issues, labels.Issue{Label: labels.Name(v.prefix, labels.KeyRequireHealthy),
+				Severity: v.severity(), Message: "the container has no health check (HEALTHCHECK); the label has no effect"})
+		}
+
 		slices.SortStableFunc(r.issues, func(a, b labels.Issue) int { return strings.Compare(a.Label, b.Label) })
 	}
 
@@ -583,6 +589,15 @@ func (v *validator) checkSource(ctx context.Context, r *report, src *sourceRepor
 
 // addError adds an error unless the same one is there already: kopia
 // server finds the same schedule error for every path.
+// severity is the severity of a warning: an error in strict mode.
+func (v *validator) severity() labels.Severity {
+	if v.strict {
+		return labels.Error
+	}
+
+	return labels.Warning
+}
+
 func (r *report) addError(label, msg string) {
 	is := labels.Issue{Label: label, Severity: labels.Error, Message: msg}
 	if !slices.Contains(r.issues, is) {
@@ -846,11 +861,21 @@ func printSpec(w io.Writer, prefix string, spec labels.ContainerSpec) {
 		row(labels.KeyDependsOn, strings.Join(spec.DependsOn, ", "))
 	}
 
+	if spec.RequireHealthy {
+		row(labels.KeyRequireHealthy, "true")
+	}
+
 	_ = tw.Flush()
 
 	if spec.Hooks {
 		_, _ = fmt.Fprintln(w, "\nhooks: the watcher takes the scheduled snapshots of these sources itself and runs the hooks around them; "+
 			"kopia server's schedule of them stays off")
+	}
+
+	if spec.RequireHealthy {
+		_, _ = fmt.Fprintln(w, "\nhealth: the snapshots of these sources wait while the container runs and Docker does not report it "+
+			"healthy, but for one at a stop; the watcher takes the scheduled snapshots itself, kopia server's schedule of "+
+			"them stays off")
 	}
 
 	switch {
