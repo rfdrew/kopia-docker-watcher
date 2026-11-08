@@ -1,4 +1,4 @@
-<!-- translated-from: docs/en/metrics.md @ d509c06f4f196a937bfeeb3284a671d52c490a3b -->
+<!-- translated-from: docs/en/metrics.md @ acc608bdd59ddf5e30e623678ee11dec802a1314 -->
 [English](../en/metrics.md) | Українська
 
 # <a id="metrics"></a>Метрики

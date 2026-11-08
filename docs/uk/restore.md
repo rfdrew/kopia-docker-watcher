@@ -1,4 +1,4 @@
-<!-- translated-from: docs/en/restore.md @ d509c06f4f196a937bfeeb3284a671d52c490a3b -->
+<!-- translated-from: docs/en/restore.md @ acc608bdd59ddf5e30e623678ee11dec802a1314 -->
 [English](../en/restore.md) | Українська
 
 # <a id="list-trigger-and-restore"></a>list, trigger і restore
