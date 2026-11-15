@@ -26,7 +26,7 @@ the port.
 | [`kopia_watcher_hook_duration_seconds`](#kopia_watcher_hook_duration_seconds) | histogram | `hook` | How long the hook commands ran |
 | [`kopia_watcher_backup_downtime_seconds`](#kopia_watcher_backup_downtime_seconds) | histogram | `mode` | How long the containers stopped or paused for a snapshot were down |
 | [`kopia_watcher_return_failures_total`](#kopia_watcher_return_failures_total) | counter | `path`, `container` | Failed attempts to start or unpause such a container again |
-| [`kopia_watcher_notifications_total`](#kopia_watcher_notifications_total) | counter | `result` | Notifications to `NOTIFY_WEBHOOK_URL`: sent, failed, dropped |
+| [`kopia_watcher_notifications_total`](#kopia_watcher_notifications_total) | counter | `channel`, `result` | Notifications by webhook and e-mail: sent, failed, dropped |
 | `kopia_watcher_build_info` | gauge | `version` | Always 1; the version of the watcher |
 
 The metrics of the Go runtime (`go_*`) and of the process (`process_*`) come with them.
@@ -183,14 +183,19 @@ failure and goes with the source. An increase means a container is down that sho
 
 ### `kopia_watcher_notifications_total`
 
-The notifications to [`NOTIFY_WEBHOOK_URL`](configuration.md#notifications), by what became of them. Every
-`result` starts at 0, also without a webhook.
+The [notifications](configuration.md#notifications), by channel and by what became of them. Each channel that is
+set up has every `result`, starting at 0; without notifications there are no series.
+
+| `channel` | Notifications |
+|---|---|
+| `webhook` | posted to [`NOTIFY_WEBHOOK_URL`](configuration.md#notify_webhook_url) |
+| `smtp` | e-mailed through [`NOTIFY_SMTP_HOST`](configuration.md#notify_smtp_host-and-notify_smtp_port) |
 
 | `result` | Counted when |
 |---|---|
-| `sent` | the webhook answered with a 2xx |
-| `failed` | every attempt failed, or the webhook answered in a way that trying again does not fix, such as 400 or 404; the log tells why |
-| `dropped` | 64 notifications were waiting already, or the watcher stopped before it was sent |
+| `sent` | the webhook answered with a 2xx, or the SMTP server took the e-mail |
+| `failed` | every attempt failed, or the answer was one that trying again does not fix, such as a 400 or 404 of the webhook, or a login or recipient the SMTP server refuses; the log tells why |
+| `dropped` | 64 notifications of the channel were waiting already, or the watcher stopped before it was sent |
 
 ## Scraping
 
@@ -259,11 +264,11 @@ groups:
         annotations:
           summary: "The watcher cannot apply the labels ({{ $labels.kind }}); see its log"
 
-      # The notifications do not reach the webhook.
+      # The notifications of a channel do not get through.
       - alert: KopiaWatcherNotificationsFailing
         expr: increase(kopia_watcher_notifications_total{result!="sent"}[1h]) > 0
         annotations:
-          summary: "Notifications to NOTIFY_WEBHOOK_URL were {{ $labels.result }}; see the watcher's log"
+          summary: "Notifications by {{ $labels.channel }} were {{ $labels.result }}; see the watcher's log"
 
       - alert: KopiaWatcherDown
         expr: up{job="kopia-docker-watcher"} == 0

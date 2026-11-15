@@ -126,9 +126,9 @@ func New() *Metrics {
 		notifications: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "notifications_total",
-			Help: "Notifications to NOTIFY_WEBHOOK_URL by result: sent, failed after every attempt or at once " +
-				"on an error that trying again cannot fix, or dropped as too many waited or the watcher stopped.",
-		}, []string{"result"}),
+			Help: "Notifications by channel, webhook or smtp, and by result: sent, failed after every attempt or at " +
+				"once on an error that trying again cannot fix, or dropped as too many waited or the watcher stopped.",
+		}, []string{"channel", "result"}),
 		hookFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "hook_failures_total",
@@ -171,14 +171,11 @@ func New() *Metrics {
 		m.notifications, m.hookFailures, m.hookDuration, m.downtime, m.returnFailures,
 	)
 
-	// Every kind and result starts at zero, so that the first shows as an
-	// increase.
+	// Every kind starts at zero, so that the first shows as an increase;
+	// so do the results of each channel of the notifications, once it is
+	// set up.
 	for _, r := range reconcile.Reasons() {
 		m.reconcileErrors.WithLabelValues(string(r))
-	}
-
-	for _, r := range notify.Results() {
-		m.notifications.WithLabelValues(string(r))
 	}
 
 	for _, h := range hooks {
@@ -194,9 +191,17 @@ func New() *Metrics {
 	return m
 }
 
+// NotificationChannel implements notify.Metrics: every result of the
+// channel starts at zero.
+func (m *Metrics) NotificationChannel(c notify.Channel) {
+	for _, r := range notify.Results() {
+		m.notifications.WithLabelValues(string(c), string(r))
+	}
+}
+
 // Notification implements notify.Metrics.
-func (m *Metrics) Notification(r notify.Result) {
-	m.notifications.WithLabelValues(string(r)).Inc()
+func (m *Metrics) Notification(c notify.Channel, r notify.Result) {
+	m.notifications.WithLabelValues(string(c), string(r)).Inc()
 }
 
 // ReconcileError implements reconcile.Metrics: it counts the error by its

@@ -1,4 +1,4 @@
-<!-- translated-from: docs/en/metrics.md @ d509c06f4f196a937bfeeb3284a671d52c490a3b -->
+<!-- translated-from: docs/en/metrics.md @ 21917df235e3560b6f7978cddb9e317b2dc46272 -->
 [English](../en/metrics.md) | Українська
 
 # <a id="metrics"></a>Метрики
@@ -27,7 +27,7 @@ Prometheus. `run --dry-run` не обслуговує HTTP, а отже, й ме
 | [`kopia_watcher_hook_duration_seconds`](#kopia_watcher_hook_duration_seconds) | histogram | `hook` | Скільки тривали команди хуків |
 | [`kopia_watcher_backup_downtime_seconds`](#kopia_watcher_backup_downtime_seconds) | histogram | `mode` | Скільки тривав простій контейнерів, зупинених чи призупинених для знімка |
 | [`kopia_watcher_return_failures_total`](#kopia_watcher_return_failures_total) | counter | `path`, `container` | Невдалі спроби знову запустити чи відновити такий контейнер |
-| [`kopia_watcher_notifications_total`](#kopia_watcher_notifications_total) | counter | `result` | Сповіщення на `NOTIFY_WEBHOOK_URL`: надіслані, невдалі, відкинуті |
+| [`kopia_watcher_notifications_total`](#kopia_watcher_notifications_total) | counter | `channel`, `result` | Сповіщення на вебхук і поштою: надіслані, невдалі, відкинуті |
 | `kopia_watcher_build_info` | gauge | `version` | Завжди 1; версія watcher |
 
 Разом із ними віддаються метрики середовища виконання Go (`go_*`) і процесу (`process_*`).
@@ -188,14 +188,19 @@ Docker відмовив у виконанні exec або його мітки м
 
 ### `kopia_watcher_notifications_total`
 
-Сповіщення на [`NOTIFY_WEBHOOK_URL`](configuration.md#notifications), за тим, що з ними сталося. Кожен
-`result` починається з 0, навіть без вебхука.
+[Сповіщення](configuration.md#notifications) за каналом і за тим, що з ними сталося. Кожен налаштований канал
+має всі значення `result`, що починаються з 0; без сповіщень рядів немає.
+
+| `channel` | Сповіщення |
+|---|---|
+| `webhook` | надіслані на [`NOTIFY_WEBHOOK_URL`](configuration.md#notify_webhook_url) |
+| `smtp` | надіслані листом через [`NOTIFY_SMTP_HOST`](configuration.md#notify_smtp_host-and-notify_smtp_port) |
 
 | `result` | Коли враховується |
 |---|---|
-| `sent` | вебхук відповів кодом 2xx |
-| `failed` | усі спроби завершилися помилкою або вебхук відповів так, що повторна спроба не допоможе, як-от 400 чи 404; причину вказано в логу |
-| `dropped` | уже чекали 64 сповіщення або watcher зупинився раніше, ніж сповіщення було надіслано |
+| `sent` | вебхук відповів кодом 2xx або SMTP-сервер прийняв лист |
+| `failed` | усі спроби завершилися помилкою або відповідь була така, що повторна спроба не допоможе, як-от 400 чи 404 від вебхука або вхід чи одержувач, яких відхиляє SMTP-сервер; причину вказано в логу |
+| `dropped` | уже чекали 64 сповіщення цього каналу або watcher зупинився раніше, ніж сповіщення було надіслано |
 
 ## <a id="scraping"></a>Збирання метрик
 
@@ -264,11 +269,11 @@ groups:
         annotations:
           summary: "The watcher cannot apply the labels ({{ $labels.kind }}); see its log"
 
-      # The notifications do not reach the webhook.
+      # The notifications of a channel do not get through.
       - alert: KopiaWatcherNotificationsFailing
         expr: increase(kopia_watcher_notifications_total{result!="sent"}[1h]) > 0
         annotations:
-          summary: "Notifications to NOTIFY_WEBHOOK_URL were {{ $labels.result }}; see the watcher's log"
+          summary: "Notifications by {{ $labels.channel }} were {{ $labels.result }}; see the watcher's log"
 
       - alert: KopiaWatcherDown
         expr: up{job="kopia-docker-watcher"} == 0

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/mail"
 	"net/url"
 	"os"
 	"path"
@@ -41,6 +42,13 @@ const (
 	EnvNotifyWebhookURL              = "NOTIFY_WEBHOOK_URL"
 	EnvNotifyWebhookFormat           = "NOTIFY_WEBHOOK_FORMAT"
 	EnvNotifyErrorAfter              = "NOTIFY_ERROR_AFTER"
+	EnvNotifySMTPHost                = "NOTIFY_SMTP_HOST"
+	EnvNotifySMTPPort                = "NOTIFY_SMTP_PORT"
+	EnvNotifySMTPTLS                 = "NOTIFY_SMTP_TLS"
+	EnvNotifySMTPUsername            = "NOTIFY_SMTP_USERNAME"
+	EnvNotifySMTPPassword            = "NOTIFY_SMTP_PASSWORD" //nolint:gosec // variable name, not a credential
+	EnvNotifySMTPFrom                = "NOTIFY_SMTP_FROM"
+	EnvNotifySMTPTo                  = "NOTIFY_SMTP_TO"
 	EnvLabelPrefix                   = "LABEL_PREFIX"
 
 	// Limits of kopia server's repository storage, for PUT
@@ -80,6 +88,12 @@ const (
 	DefaultCleanupGrace        = 24 * time.Hour
 	DefaultNotifyWebhookFormat = WebhookJSON
 	DefaultNotifyErrorAfter    = 15 * time.Minute
+	// DefaultNotifySMTPPort is the submission port, where the server
+	// starts in plain text and offers STARTTLS; DefaultNotifySMTPTLSPort
+	// is the port of implicit TLS, the default with NOTIFY_SMTP_TLS=tls.
+	DefaultNotifySMTPPort    = 587
+	DefaultNotifySMTPTLSPort = 465
+	DefaultNotifySMTPTLS     = SMTPStartTLS
 
 	// MinReconcileInterval keeps a typo such as "5s" from turning every full
 	// reconcile into a burst of policy writes, each of which makes kopia
@@ -107,6 +121,23 @@ const (
 // WebhookFormats returns every webhook format.
 func WebhookFormats() []string {
 	return []string{WebhookJSON, WebhookNtfy, WebhookSlack, WebhookTelegram}
+}
+
+// TLS modes of NOTIFY_SMTP_TLS.
+const (
+	// SMTPStartTLS: the connection starts in plain text and switches to
+	// TLS with STARTTLS before anything else; a server that does not offer
+	// it is an error.
+	SMTPStartTLS = "starttls"
+	// SMTPTLS: the connection is TLS from the start (implicit TLS, SMTPS).
+	SMTPTLS = "tls"
+	// SMTPNoTLS: the connection stays in plain text.
+	SMTPNoTLS = "none"
+)
+
+// SMTPTLSModes returns every TLS mode of NOTIFY_SMTP_TLS.
+func SMTPTLSModes() []string {
+	return []string{SMTPStartTLS, SMTPTLS, SMTPNoTLS}
 }
 
 // MigrationGuideURL points to the guide for users of the Python version.
@@ -139,14 +170,17 @@ type Config struct {
 	ControlSocket string
 	ListenAddr    string
 
-	// NotifyWebhookURL is where notifications go; empty sends none. It may
-	// carry a token, so it is never logged as a whole.
+	// NotifyWebhookURL is where notifications are posted; empty posts
+	// none. It may carry a token, so it is never logged as a whole.
 	NotifyWebhookURL string
 	// NotifyWebhookFormat is one of WebhookFormats.
 	NotifyWebhookFormat string
 	// NotifyErrorAfter is how long an error the watcher retries must last
 	// before it is notified.
 	NotifyErrorAfter time.Duration
+	// NotifySMTP sends the notifications by e-mail; its Host is empty when
+	// it sends none.
+	NotifySMTP SMTP
 
 	LabelPrefix string
 
@@ -176,6 +210,40 @@ type Throttle struct {
 func (t Throttle) Set() bool {
 	return t.UploadBytesPerSecond != nil || t.DownloadBytesPerSecond != nil || t.ReadsPerSecond != nil ||
 		t.WritesPerSecond != nil || t.ListsPerSecond != nil || t.ConcurrentReads != nil || t.ConcurrentWrites != nil
+}
+
+// SMTP is how the watcher sends the notifications by e-mail.
+type SMTP struct {
+	// Host is the SMTP server: a host name or an IP address. Empty sends
+	// no e-mail; then the other fields are zero.
+	Host string
+	Port int
+	// TLS is one of SMTPTLSModes.
+	TLS string
+
+	// Username and Password log in to the server; both are empty when it
+	// needs no login. The password is never logged.
+	Username string
+	Password string
+
+	// From is the sender, To the recipients, at least one.
+	From *mail.Address
+	To   []*mail.Address
+}
+
+// LogValue implements slog.LogValuer: only the server, the TLS mode and
+// the number of recipients, none when no e-mail is sent.
+func (s SMTP) LogValue() slog.Value {
+	if s.Host == "" {
+		return slog.GroupValue()
+	}
+
+	return slog.GroupValue(
+		slog.String("host", s.Host),
+		slog.Int("port", s.Port),
+		slog.String("tls", s.TLS),
+		slog.Int("recipients", len(s.To)),
+	)
 }
 
 // KopiaServer describes how to reach kopia server.
@@ -305,6 +373,7 @@ func Load(getenv func(string) string) (*Config, error) {
 	}
 
 	l.loadNotify(cfg)
+	l.loadSMTP(&cfg.NotifySMTP)
 	l.loadThrottle(&cfg.Throttle)
 
 	if v := l.get(EnvLabelPrefix); v != "" {
@@ -352,7 +421,7 @@ func (l *loader) loadNotify(cfg *Config) {
 	v := l.get(EnvNotifyWebhookURL)
 	if v == "" {
 		if l.get(EnvNotifyWebhookFormat) != "" {
-			l.warnf("%s is set but %s is not: no notifications are sent", EnvNotifyWebhookFormat, EnvNotifyWebhookURL)
+			l.warnf("%s is set but %s is not: no notifications are posted to a webhook", EnvNotifyWebhookFormat, EnvNotifyWebhookURL)
 		}
 
 		return
@@ -389,6 +458,139 @@ func checkTelegramURL(u *url.URL) error {
 }
 
 var telegramPathRE = regexp.MustCompile(`^(/.*)?/bot[^/]+/sendMessage$`)
+
+// smtpVars are the variables that mean nothing without NOTIFY_SMTP_HOST.
+var smtpVars = []string{
+	EnvNotifySMTPPort, EnvNotifySMTPTLS, EnvNotifySMTPUsername, EnvNotifySMTPPassword, EnvNotifySMTPFrom, EnvNotifySMTPTo,
+}
+
+func (l *loader) loadSMTP(s *SMTP) {
+	host := l.get(EnvNotifySMTPHost)
+	if host == "" {
+		var set []string
+
+		for _, name := range smtpVars {
+			if l.get(name) != "" {
+				set = append(set, name)
+			}
+		}
+
+		if len(set) > 0 {
+			l.warnf("%s set without %s: no e-mail is sent", strings.Join(set, ", "), EnvNotifySMTPHost)
+		}
+
+		return
+	}
+
+	h, err := ParseSMTPHost(host)
+	if err != nil {
+		l.errorf("%s: %v", EnvNotifySMTPHost, err)
+	}
+
+	s.Host = h
+
+	s.TLS = DefaultNotifySMTPTLS
+	if v := l.get(EnvNotifySMTPTLS); v != "" {
+		m := strings.ToLower(v)
+		if !slices.Contains(SMTPTLSModes(), m) {
+			l.errorf("%s: unknown mode %q, use %s", EnvNotifySMTPTLS, v, strings.Join(SMTPTLSModes(), ", "))
+		}
+
+		s.TLS = m
+	}
+
+	s.Port = DefaultNotifySMTPPort
+	if s.TLS == SMTPTLS {
+		s.Port = DefaultNotifySMTPTLSPort
+	}
+
+	if v := l.get(EnvNotifySMTPPort); v != "" {
+		if n, err := strconv.Atoi(v); err != nil || n < 1 || n > 65535 {
+			l.errorf("%s: invalid port %q, use a number from 1 to 65535", EnvNotifySMTPPort, v)
+		} else {
+			s.Port = n
+		}
+	}
+
+	// A TLS mode that does not fit the port only shows as a connection
+	// that fails or hangs until it times out.
+	switch {
+	case s.Port == DefaultNotifySMTPTLSPort && s.TLS == SMTPStartTLS:
+		l.warnf("%s is %d, the port of implicit TLS, but %s is %s: set %s=%s if the server expects TLS from the start",
+			EnvNotifySMTPPort, s.Port, EnvNotifySMTPTLS, s.TLS, EnvNotifySMTPTLS, SMTPTLS)
+	case s.TLS == SMTPTLS && (s.Port == DefaultNotifySMTPPort || s.Port == 25):
+		l.warnf("%s is %s, but port %d usually starts in plain text: set %s=%s if the server offers STARTTLS",
+			EnvNotifySMTPTLS, s.TLS, s.Port, EnvNotifySMTPTLS, SMTPStartTLS)
+	}
+
+	// Credentials are taken verbatim: spaces may be part of a password.
+	s.Username = l.getenv(EnvNotifySMTPUsername)
+	s.Password = l.getenv(EnvNotifySMTPPassword)
+
+	switch {
+	case s.Username != "" && s.Password == "":
+		l.errorf("%s is set but %s is empty", EnvNotifySMTPUsername, EnvNotifySMTPPassword)
+	case s.Username == "" && s.Password != "":
+		l.errorf("%s is set but %s is empty", EnvNotifySMTPPassword, EnvNotifySMTPUsername)
+	case s.Username != "" && s.TLS == SMTPNoTLS && !IsLocalhost(s.Host):
+		l.errorf("%s with %s=%s would send the password unencrypted: use %s or %s, or a server on localhost",
+			EnvNotifySMTPUsername, EnvNotifySMTPTLS, SMTPNoTLS, SMTPStartTLS, SMTPTLS)
+	}
+
+	if v := l.get(EnvNotifySMTPFrom); v == "" {
+		l.errorf("%s is required with %s", EnvNotifySMTPFrom, EnvNotifySMTPHost)
+	} else if a, err := mail.ParseAddress(v); err != nil {
+		l.errorf("%s: %q is not an e-mail address such as backups@example.com or "+
+			"\"Backups\" <backups@example.com>: %v", EnvNotifySMTPFrom, v, err)
+	} else {
+		s.From = a
+	}
+
+	if v := l.get(EnvNotifySMTPTo); v == "" {
+		l.errorf("%s is required with %s", EnvNotifySMTPTo, EnvNotifySMTPHost)
+	} else if to, err := mail.ParseAddressList(v); err != nil || len(to) == 0 {
+		l.errorf("%s: %q is not a list of e-mail addresses separated by commas", EnvNotifySMTPTo, v)
+	} else {
+		s.To = to
+	}
+}
+
+// ParseSMTPHost checks a NOTIFY_SMTP_HOST value: a host name or an IP
+// address, without a scheme, a login or a port. Brackets around an IPv6
+// address are dropped. Errors do not echo a value written as a URL or
+// with a login: it may hold the password.
+func ParseSMTPHost(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	ip := strings.TrimSuffix(strings.TrimPrefix(s, "["), "]")
+
+	switch {
+	case strings.Contains(s, "://"):
+		return "", fmt.Errorf("a URL is not a host name; set the host name alone, and %s and %s for the rest",
+			EnvNotifySMTPPort, EnvNotifySMTPTLS)
+	case strings.Contains(s, "@"):
+		return "", fmt.Errorf("a login does not belong in the host name; set %s and %s",
+			EnvNotifySMTPUsername, EnvNotifySMTPPassword)
+	case net.ParseIP(ip) != nil:
+		return ip, nil
+	case strings.Contains(s, ":"):
+		return "", fmt.Errorf("a port does not belong in the host name; set it in %s", EnvNotifySMTPPort)
+	case !hostNameRE.MatchString(s):
+		return "", fmt.Errorf("%q is not a host name or an IP address", s)
+	}
+
+	return s, nil
+}
+
+// hostNameRE matches a host name, with the underscores Docker allows in
+// the names of containers.
+var hostNameRE = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$`)
+
+// IsLocalhost reports whether an SMTP host is this machine, the only one
+// the watcher sends a password to over a connection without TLS, as
+// net/smtp does.
+func IsLocalhost(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
 
 func (l *loader) loadThrottle(t *Throttle) {
 	t.UploadBytesPerSecond = l.byteRate(EnvThrottleUploadBytesPerSecond)
@@ -638,8 +840,9 @@ func ParseWatcherPathPrefix(s string) (string, error) {
 
 // LogValue implements slog.LogValuer. Durations are logged as Go duration
 // strings (5m0s): the JSON handler would print slog.Duration as nanoseconds.
-// Secrets are never logged: only whether
-// the password is set and the webhook's scheme and host.
+// Secrets are never logged: only whether the password is set, the
+// webhook's scheme and host, and of the e-mail the server, the TLS mode
+// and the number of recipients.
 func (c *Config) LogValue() slog.Value {
 	webhook := ""
 	if u, err := url.Parse(c.NotifyWebhookURL); err == nil && c.NotifyWebhookURL != "" {
@@ -667,6 +870,7 @@ func (c *Config) LogValue() slog.Value {
 		slog.String("notify_webhook", webhook),
 		slog.String("notify_webhook_format", c.NotifyWebhookFormat),
 		slog.String("notify_error_after", c.NotifyErrorAfter.String()),
+		slog.Any("notify_smtp", c.NotifySMTP),
 		slog.Any("throttle", c.Throttle),
 		slog.String("label_prefix", c.LabelPrefix),
 	)

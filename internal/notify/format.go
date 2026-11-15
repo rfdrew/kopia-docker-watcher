@@ -64,6 +64,15 @@ func (e Event) Failing() bool {
 	return e.Kind == SnapshotFailed || e.Kind == ReconcileFailed || e.Kind == HookFailed || e.Kind == ReturnFailed
 }
 
+// status is failing or resolved.
+func (e Event) status() string {
+	if e.Failing() {
+		return "failing"
+	}
+
+	return "resolved"
+}
+
 // Title is a one-line summary of e.
 func (e Event) Title() string {
 	switch e.Kind {
@@ -190,9 +199,9 @@ const (
 // telegramMaxText is the Bot API's limit on the text of a message.
 const telegramMaxText = 4096
 
-// request builds the request that delivers e in the Notifier's format.
-func (n *Notifier) request(ctx context.Context, e Event) (*http.Request, error) {
-	target := *n.url
+// request builds the request that delivers e in the webhook's format.
+func (w *webhook) request(ctx context.Context, e Event) (*http.Request, error) {
+	target := *w.url
 
 	var (
 		body        []byte
@@ -201,7 +210,7 @@ func (n *Notifier) request(ctx context.Context, e Event) (*http.Request, error) 
 		err         error
 	)
 
-	switch n.opts.Format {
+	switch w.format {
 	case config.WebhookNtfy:
 		// https://docs.ntfy.sh/publish/: the message is the body, the rest
 		// goes into headers, which carry non-ASCII text RFC 2047 encoded.
@@ -240,18 +249,13 @@ func (n *Notifier) request(ctx context.Context, e Event) (*http.Request, error) 
 		target.RawQuery = ""
 		body, err = json.Marshal(msg)
 	default:
-		status := "resolved"
-		if e.Failing() {
-			status = "failing"
-		}
-
 		containers := e.Containers
 		if containers == nil {
 			containers = []string{}
 		}
 
 		body, err = json.Marshal(payload{
-			Event: e.Kind, Status: status, Title: e.Title(), Message: e.Message(), Path: e.Path,
+			Event: e.Kind, Status: e.status(), Title: e.Title(), Message: e.Message(), Path: e.Path,
 			Containers: containers, Host: e.Host, Reason: e.Reason, Container: e.Container, Error: e.Error,
 			Since: e.Since.UTC(), Time: e.Time.UTC(), Version: version.Version,
 		})
@@ -263,7 +267,7 @@ func (n *Notifier) request(ctx context.Context, e Event) (*http.Request, error) 
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), bytes.NewReader(body))
 	if err != nil {
-		return nil, n.redact(err)
+		return nil, w.redact(err)
 	}
 
 	req.Header = header

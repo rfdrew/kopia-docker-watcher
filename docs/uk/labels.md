@@ -1,4 +1,4 @@
-<!-- translated-from: docs/en/labels.md @ d509c06f4f196a937bfeeb3284a671d52c490a3b -->
+<!-- translated-from: docs/en/labels.md @ 21917df235e3560b6f7978cddb9e317b2dc46272 -->
 [English](../en/labels.md) | Українська
 
 # <a id="container-labels"></a>Мітки контейнерів
@@ -677,9 +677,9 @@ services:
 «pre-exec hook failed» на рівні error, із контейнером, тривалістю та останніми 4 KiB того, що команда вивела в
 stdout і stderr, — для хука, якому забракло часу, до цього моменту. Сама команда в лог не записується: вона може
 містити пароль. Невдача враховується в
-[`kopia_watcher_hook_failures_total`](metrics.md#kopia_watcher_hook_failures_total) і, з `NOTIFY_WEBHOOK_URL`,
-про неї один раз [надсилається сповіщення](configuration.md#notifications), як і про наступний успіх цього хука в
-цьому контейнері.
+[`kopia_watcher_hook_failures_total`](metrics.md#kopia_watcher_hook_failures_total) і, якщо сповіщення
+налаштовано, про неї один раз [надсилається сповіщення](configuration.md#notifications), як і про наступний успіх
+цього хука в цьому контейнері.
 
 Хуки виконуються довкола знімків, які робить watcher: запланованих (див. нижче) і тих, що робляться під час запуску
 контейнера (`kopia.snapshot-on-start`, `SNAPSHOT_ON_WATCHER_START`). Вони не виконуються довкола знімка під час
@@ -823,9 +823,9 @@ services:
   повертаються. Контейнер, який неможливо запустити знову, скажімо, бо його порт зайнятий, пробують запустити
   знову з дедалі більшою затримкою, до 5 хвилин, доки він не запрацює або хтось інший не запустить чи не видалить
   його. Кожна невдача записується в лог на рівні error і враховується в
-  [`kopia_watcher_return_failures_total`](metrics.md#kopia_watcher_return_failures_total); з
-  `NOTIFY_WEBHOOK_URL` про першу з них [надсилається сповіщення](configuration.md#notifications), як і про
-  повернення контейнера.
+  [`kopia_watcher_return_failures_total`](metrics.md#kopia_watcher_return_failures_total); якщо сповіщення
+  налаштовано, про першу з них [надсилається сповіщення](configuration.md#notifications), як і про повернення
+  контейнера.
 - **Власні події.** Зупинка й запуск контейнера, які виконує watcher, не вважаються запусками й зупинками контейнера для
   решти міток: вони не спричиняють знімка `kopia.snapshot-on-stop` чи `kopia.snapshot-on-start`, не додають
   закріплення `kopia.pin-on-stop`, а поки контейнер зупинено, він і далі вважається запущеним, тож його джерела
