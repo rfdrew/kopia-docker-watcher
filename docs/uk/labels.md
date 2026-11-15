@@ -1,4 +1,4 @@
-<!-- translated-from: docs/en/labels.md @ acc608bdd59ddf5e30e623678ee11dec802a1314 -->
+<!-- translated-from: docs/en/labels.md @ 5f18db6c2fcac63582158e5dbec344c785f5e8f2 -->
 [English](../en/labels.md) | Українська
 
 # <a id="container-labels"></a>Мітки контейнерів
