@@ -82,9 +82,11 @@ type Trigger struct {
 	result TriggerResult
 
 	// snapshot is the result of the snapshot of the snapshot with hooks
-	// the trigger is part of, until the run ends; guarded by
-	// Reconciler.mu.
+	// the trigger is part of, until the run ends; hooks reports that the
+	// owners had hooks, or were stopped or paused, when it began, rather
+	// than only asking for health. Both are guarded by Reconciler.mu.
 	snapshot *state.SnapshotResult
+	hooks    bool
 }
 
 // Path returns the source path the trigger is for.
@@ -389,6 +391,8 @@ func (ps *pass) attachRun(reqs []snapRequest, id string) {
 		return
 	}
 
+	hooks := ps.hasHooks()
+
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
@@ -396,6 +400,7 @@ func (ps *pass) attachRun(reqs []snapRequest, id string) {
 
 	for _, t := range ts {
 		ps.handled[t] = true
+		t.hooks = hooks
 		ps.manualRuns[key] = append(ps.manualRuns[key], t)
 	}
 }
@@ -478,8 +483,10 @@ func (r *Reconciler) runEnded(src backend.Source, run state.HookRun, postError s
 	}
 
 	snaps := make([]*state.SnapshotResult, len(ts))
+	hooks := make([]bool, len(ts))
+
 	for i, t := range ts {
-		snaps[i] = t.snapshot
+		snaps[i], hooks[i] = t.snapshot, t.hooks
 	}
 	r.mu.Unlock()
 
@@ -501,7 +508,7 @@ func (r *Reconciler) runEnded(src backend.Source, run state.HookRun, postError s
 				Message: "no snapshot was taken; the watcher's log says why"}
 		}
 
-		res.Hooks, res.PostError = true, postError
+		res.Hooks, res.PostError = hooks[i], postError
 		t.resolve(res)
 	}
 }

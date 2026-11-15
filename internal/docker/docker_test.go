@@ -104,7 +104,12 @@ func TestEventFromDocker(t *testing.T) {
 		{"unpause", msg(events.ActionUnPause, attrs()), 0},
 		{"update", msg(events.ActionUpdate, attrs()), 0},
 		{"exec_start", msg("exec_start: pg_isready", attrs()), 0},
-		{"health_status", msg(events.ActionHealthStatusHealthy, attrs()), 0},
+		// Only a change of the health status, not every check.
+		{"health_status healthy", msg(events.ActionHealthStatusHealthy, attrs()), KindHealth},
+		{"health_status unhealthy", msg(events.ActionHealthStatusUnhealthy, attrs()), KindHealth},
+		{"health_status starting", msg("health_status: starting", attrs()), KindHealth},
+		{"health_status without status", msg(events.ActionHealthStatus, attrs()), 0},
+		{"health_statusx", msg("health_statusx: healthy", attrs()), 0},
 		{"no actor", events.Message{Type: events.ContainerEventType, Action: events.ActionStart}, 0},
 		{"network", events.Message{
 			Type:   events.NetworkEventType,

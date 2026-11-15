@@ -39,7 +39,8 @@ For every source the watcher manages, and every path whose last reconcile had a 
 - `CONTAINERS`: the containers that back the path up, stopped ones included.
 - `PAUSED`: whether the source is paused because none of them runs.
 - `SCHEDULE`: who takes the scheduled snapshots. `kopia`: kopia server, by the policy. `watcher`: the watcher
-  itself, for a source with [hooks](labels.md#hooks) or [stop or pause](labels.md#stopping-and-pausing).
+  itself, for a source with [hooks](labels.md#hooks), [stop or pause](labels.md#stopping-and-pausing) or
+  [`kopia.require-healthy`](labels.md#health).
   `NEXT SNAPSHOT` is when the next is due; `-` when none is, as while paused.
 - `LAST SUCCESS`: the start of the last complete snapshot.
 - `STATUS`: kopia server's status of the source (`IDLE`, `PENDING`, `UPLOADING`, …), followed by the phase of a
@@ -65,6 +66,8 @@ snapshot goes through the watcher's queue like the snapshot at a container's sta
   the result comes once the post-exec hooks have run. When a pre-exec hook fails, no snapshot is taken;
 - not before `kopia.min-interval` has passed since the last snapshot or the watcher's last trigger, unless
   `--force` is given. For a path, the shortest `kopia.min-interval` of its containers counts;
+- not while a running container of the path with [`kopia.require-healthy`](labels.md#health) is not healthy,
+  unless `--force` is given: `trigger` says `no snapshot taken: not healthy:` with the containers;
 - not while a snapshot of the source is pending or uploading: that one counts, and `trigger` says so;
 - after a snapshot with hooks of the source that is under way, and after a [restore](#restore) with `--stop`
   of it.
@@ -163,10 +166,10 @@ docker compose exec watcher kopia-docker-watcher restore --stop --overwrite --ta
 
 - The watcher records the containers it stopped in `STATE_FILE` before it stops them. Their stop and start
   events are its own: the source is not paused, and no snapshot is taken at the stop or the start.
-- While the restore runs, the watcher takes no snapshot of the source: snapshots it is asked for, scheduled ones
-  of a source with hooks included, wait until the restore has ended. **kopia server's own schedule is not held
-  back**: a source on kopia server's schedule (`SCHEDULE kopia` in `list`) can be snapshotted in the middle of the
-  restore. Restore when no snapshot is due, as `list` shows.
+- While the restore runs, the watcher takes no snapshot of the source: snapshots it is asked for, scheduled ones of
+  a source on the watcher's schedule included, wait until the restore has ended. **kopia server's own schedule is
+  not held back**: a source on kopia server's schedule (`SCHEDULE kopia` in `list`) can be snapshotted in the
+  middle of the restore. Restore when no snapshot is due, as `list` shows.
 - Interrupting `restore` stops only the output: the watcher follows the restore and starts the containers when
   it has ended. To stop the restore, cancel its task in KopiaUI; the containers come back then.
 - No container comes back while kopia server's restore task still runs: the watcher stores the task with the

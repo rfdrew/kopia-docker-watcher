@@ -209,6 +209,85 @@ func TestIntegrationDocker(t *testing.T) {
 			t.Errorf("after stop: state %q", ctr.State)
 		}
 	})
+
+	t.Run("health", func(t *testing.T) {
+		// The check passes while /tmp/ok exists; one failure makes the
+		// container unhealthy.
+		id := createContainer(t, c, run+"-c", &container.Config{
+			Image:  testImage,
+			Cmd:    []string{"sh", "-c", "touch /tmp/ok && exec sleep 600"},
+			Labels: labels,
+			Healthcheck: &container.HealthConfig{
+				Test: []string{"CMD", "test", "-e", "/tmp/ok"}, Interval: time.Second, Timeout: 5 * time.Second, Retries: 1,
+			},
+		}, nil)
+
+		waitEvent(t, evs, id, KindChanged)
+
+		if _, err := c.api.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
+			t.Fatal(err)
+		}
+
+		waitEvent(t, evs, id, KindStarted)
+
+		healthIs := func(want Health) {
+			t.Helper()
+
+			if ctr, err := c.Inspect(ctx, id); err != nil || ctr.Health != want {
+				t.Errorf("inspect: health %q, %v; want %q", ctr.Health, err, want)
+			}
+
+			// A daemon before API 1.52 writes the health into the status
+			// text only while the container runs and is not paused.
+			if ctr, ok := findContainer(ctx, t, c, id); !ok || ctr.Health != want && ctr.Health != HealthUnknown {
+				t.Errorf("listed: health %q; want %q", ctr.Health, want)
+			}
+		}
+
+		if ev := waitEvent(t, evs, id, KindHealth); ev.Action != "health_status: healthy" {
+			t.Fatalf("health event %q", ev.Action)
+		}
+
+		healthIs(HealthHealthy)
+
+		// Checks that change nothing send no event the subscription
+		// passes on: health_status comes only with a change, and the exec
+		// events of each check are filtered out.
+		noEvent(t, evs, id, 3*time.Second)
+
+		if _, err := c.Exec(ctx, id, []string{"rm", "/tmp/ok"}); err != nil {
+			t.Fatal(err)
+		}
+
+		if ev := waitEvent(t, evs, id, KindHealth); ev.Action != "health_status: unhealthy" {
+			t.Fatalf("health event %q", ev.Action)
+		}
+
+		healthIs(HealthUnhealthy)
+
+		if _, err := c.Exec(ctx, id, []string{"touch", "/tmp/ok"}); err != nil {
+			t.Fatal(err)
+		}
+
+		waitAction(t, evs, id, "health_status: healthy")
+
+		// A pause stops the checks and makes the container unhealthy
+		// without an event; the first check after the unpause makes it
+		// healthy again, with one.
+		if err := c.Pause(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+
+		healthIs(HealthUnhealthy)
+		noEvent(t, evs, id, 2*time.Second)
+
+		if err := c.Unpause(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+
+		waitAction(t, evs, id, "health_status: healthy")
+		healthIs(HealthHealthy)
+	})
 }
 
 func startIntegrationWatcher(t *testing.T, c *Client) <-chan Event {

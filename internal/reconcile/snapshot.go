@@ -154,7 +154,7 @@ var errNoChange = errors.New("no change")
 // for a source kopia server knows: it sets the description mark of a
 // source that has none, follows the snapshots the state lists as queued,
 // acts on those that ended, moves a snapshot with hooks on, runs the
-// watcher's own schedule of a source with hooks, takes the snapshot the
+// watcher's own schedule of a source on it, takes the snapshot the
 // events, the owners' states and that schedule ask for and, in a full
 // reconcile, describes the snapshots that have no description. Only a
 // failure to queue a snapshot or to work the schedule out fails the pass,
@@ -759,7 +759,7 @@ func (ps *pass) requests() []snapRequest {
 // retry, which no longer sees the change of the pause, asks again.
 //
 // The policy tells whether the source was paused, unless the watcher's own
-// schedule was in force: the policy of a source with hooks stays manual
+// schedule was in force: the policy of a source on it stays manual
 // while its owners run, and the schedule records the pause.
 func (ps *pass) unseenRequests(startAsked, stopAsked bool) []snapRequest {
 	// A source that goes on the watcher's schedule keeps a manual policy,
@@ -923,7 +923,7 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 		}
 	}
 
-	if stop && ps.want.OwnSchedule {
+	if stop && ps.hasHooks() {
 		ps.log.Warn("taking the snapshot at the stop without hooks: hooks do not run around a snapshot at a stop", attrs...)
 	}
 
@@ -959,15 +959,16 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 	return nil
 }
 
-// triggerHooked takes the snapshot reqs ask for of a source whose owners
-// run hooks, unless it is one at a stop: as a snapshot with hooks, which
-// startHookRun begins. The rules of trigger hold, but for a scheduled
-// snapshot, which neither the minimum interval nor a snapshot that is
-// pending or uploading holds back, as with kopia server's own schedule:
-// the snapshot is queued once the pre-exec hooks have run, behind the one
-// under way. While a snapshot with hooks is under way, the start events
-// are kept, and a scheduled time stays due, until it ends: there is one at
-// a time.
+// triggerHooked takes the snapshot reqs ask for of a source on the
+// watcher's own schedule, whose owners run hooks or ask for health, unless
+// it is one at a stop: as a snapshot with hooks, which startHookRun begins.
+// The rules of trigger hold, but for a scheduled snapshot, which neither
+// the minimum interval nor a snapshot that is pending or uploading holds
+// back, as with kopia server's own schedule: the snapshot is queued once
+// the pre-exec hooks have run, behind the one under way. While a snapshot
+// with hooks is under way, the start events are kept, and a scheduled time
+// stays due, until it ends: there is one at a time. While an owner that
+// asks for health is not healthy, holdForHealth holds the snapshot back.
 func (ps *pass) triggerHooked(reqs []snapRequest, status *backend.SourceStatus, reasons []string, attrs []any) error {
 	scheduled := slices.ContainsFunc(reqs, func(r snapRequest) bool { return r.scheduled })
 	rec, _ := ps.store.Get(ps.src)
@@ -995,6 +996,8 @@ func (ps *pass) triggerHooked(reqs []snapRequest, status *backend.SourceStatus, 
 		ps.deferStart = true
 		ps.log.Debug("deciding on the snapshot after the policy write has settled", attrs...)
 
+		return nil
+	case ps.holdForHealth(reqs, attrs), ps.waitsForReturn(reqs, attrs):
 		return nil
 	case scheduled:
 	case st == backend.StatusPending || st == backend.StatusUploading:

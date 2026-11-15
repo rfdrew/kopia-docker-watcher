@@ -19,6 +19,7 @@ const (
 	KeyTags            = "tags"
 	KeyMinInterval     = "min-interval"
 	KeyPinOnStop       = "pin-on-stop"
+	KeyRequireHealthy  = "require-healthy"
 
 	KeyCleanupOnRemove     = "cleanup-on-remove"
 	KeyCleanupDeletePinned = "cleanup-delete-pinned"
@@ -50,6 +51,7 @@ var coreKeys = []key{
 	{KeyTags, (*parser).tags},
 	{KeyMinInterval, (*parser).minInterval},
 	{KeyPinOnStop, (*parser).pinOnStop},
+	{KeyRequireHealthy, func(p *parser, v string) { p.spec.RequireHealthy = p.bool(v) }},
 	{KeyCleanupOnRemove, (*parser).cleanup},
 	{KeyCleanupDeletePinned, func(p *parser, v string) { p.spec.CleanupDeletePinned = p.bool(v) }},
 }

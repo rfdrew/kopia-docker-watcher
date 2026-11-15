@@ -1144,6 +1144,8 @@ func (r *Reconciler) bringBackOne(ctx context.Context, log *slog.Logger, h state
 		return r.returnFailed(log, h, attrs, err)
 	}
 
+	r.noteReturned(h.ID)
+
 	downtime := max(r.now().Sub(h.At), 0)
 	log.Info("container "+verb+" again after the snapshot", append(attrs, "downtime", downtime.String())...)
 	r.metrics.ContainerReturned(h.Source.Path, ReturnResult{Container: h.Name, Mode: h.Mode, Downtime: downtime})

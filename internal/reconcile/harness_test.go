@@ -286,6 +286,8 @@ type recordedMetrics struct {
 	finished map[string][]backend.SnapshotResult
 	hooks    map[string][]HookResult
 	returns  map[string][]ReturnResult
+	// skips counts the snapshots held back for health per path.
+	skips map[string]int
 	// calls are all calls but ReconcileError, as "Method path", in order.
 	calls []string
 }
@@ -400,6 +402,27 @@ func (m *recordedMetrics) ContainerReturned(path string, res ReturnResult) {
 
 	m.returns[path] = append(m.returns[path], res)
 	m.call("ContainerReturned", path)
+}
+
+func (m *recordedMetrics) UnhealthySkip(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.skips == nil {
+		m.skips = map[string]int{}
+	}
+
+	m.skips[path]++
+	m.call("UnhealthySkip", path)
+}
+
+// unhealthySkips returns how many snapshots of p were held back for the
+// health of a container.
+func (m *recordedMetrics) unhealthySkips(p string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.skips[p]
 }
 
 // returnResults returns the returns reported for p.

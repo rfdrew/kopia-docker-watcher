@@ -71,6 +71,7 @@ func (c *Client) Containers(ctx context.Context) ([]Container, error) {
 			Labels: s.Labels,
 			State:  State(s.State),
 			Mounts: mountsFromDocker(s.Mounts),
+			Health: healthFromSummary(s),
 		})
 	}
 
@@ -93,10 +94,15 @@ func (c *Client) Inspect(ctx context.Context, id string) (Container, error) {
 		ID:     r.ID,
 		Name:   strings.TrimPrefix(r.Name, "/"),
 		Mounts: mountsFromDocker(r.Mounts),
+		Health: HealthNone,
 	}
 
 	if r.State != nil {
 		ctr.State = State(r.State.Status)
+
+		if h := r.State.Health; h != nil && h.Status != "" {
+			ctr.Health = Health(h.Status)
+		}
 
 		// Docker reports a container that never ran as started at the
 		// zero time, 0001-01-01T00:00:00Z.
@@ -162,9 +168,11 @@ func (c *Client) Events(ctx context.Context, since time.Time) (<-chan Event, <-c
 // is among them because a container stopped while it waits for its restart
 // policy gets no die. The rest either come with one of these (kill and oom
 // before die, restart with start) or change nothing that matters for
-// backups (pause keeps the container a running owner); exec and
-// health_status events, which every health check produces, are kept out by
-// the daemon-side filter.
+// backups (pause keeps the container a running owner); the exec events,
+// which every health check produces, are kept out by the daemon-side
+// filter. health_status, whose action carries the status after a colon,
+// is subscribed to as well: the daemon sends it only when the status
+// changes.
 var eventKinds = map[events.Action]Kind{
 	events.ActionCreate:  KindChanged,
 	events.ActionRename:  KindChanged,
@@ -184,7 +192,9 @@ func eventFilters() client.Filters {
 		f.Add("event", string(a))
 	}
 
-	return f
+	// The daemon matches health_status against "health_status: healthy"
+	// and the other statuses.
+	return f.Add("event", string(events.ActionHealthStatus))
 }
 
 // eventFromDocker converts a container event; ok is false for any event the
@@ -195,6 +205,10 @@ func eventFromDocker(m events.Message) (ev Event, ok bool) {
 	}
 
 	kind, ok := eventKinds[m.Action]
+	if prefix, _, found := strings.Cut(string(m.Action), ":"); found && events.Action(prefix) == events.ActionHealthStatus {
+		kind, ok = KindHealth, true
+	}
+
 	if !ok {
 		return Event{}, false
 	}
@@ -217,6 +231,34 @@ func eventFromDocker(m events.Message) (ev Event, ok bool) {
 		Labels:      labels,
 		Time:        t,
 	}, true
+}
+
+// healthFromSummary returns the health of a listed container. A daemon
+// from API 1.52 on reports it in the listing; an older one writes it only
+// into the status text of a running container, "Up 5 minutes (healthy)",
+// and not while the container is paused or restarting.
+func healthFromSummary(s container.Summary) Health {
+	if s.Health != nil && s.Health.Status != "" {
+		return Health(s.Health.Status)
+	}
+
+	if s.State != container.StateRunning || !strings.HasPrefix(s.Status, "Up ") {
+		return HealthUnknown
+	}
+
+	switch {
+	case strings.HasSuffix(s.Status, " (healthy)"):
+		return HealthHealthy
+	case strings.HasSuffix(s.Status, " (unhealthy)"):
+		return HealthUnhealthy
+	case strings.HasSuffix(s.Status, " (health: starting)"):
+		return HealthStarting
+	case strings.HasSuffix(s.Status, ")"):
+		// "(Paused)", or a status of a newer daemon.
+		return HealthUnknown
+	default:
+		return HealthNone
+	}
 }
 
 // primaryName picks the container's own name from the list, which also
