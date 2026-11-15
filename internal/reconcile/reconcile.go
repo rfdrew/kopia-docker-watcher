@@ -526,7 +526,7 @@ type Reconciler struct {
 	lastComplete map[string]lastComplete
 	reportedLost map[waitKey]bool
 	// hookedPaths holds per path whether its owners had hooks when a pass
-	// last saw any, for the metrics of a source that lost them all.
+	// last saw any, for a source that lost them all. See hasHooks.
 	hookedPaths map[string]bool
 
 	// mounts holds the volume paths of the containers last listed or
@@ -549,10 +549,12 @@ type Reconciler struct {
 	// armed holds per path the scheduled snapshot time this process armed
 	// a timer for: a time that passes while it is armed is taken late,
 	// one that passed before is a missed one. heldDue holds per path the
-	// scheduled time held back while a container is not healthy, which is
-	// logged and counted once. See health.go.
-	armed   map[string]time.Time
-	heldDue map[string]time.Time
+	// scheduled time held back while a container is not healthy, until it
+	// is judged again; countedDue the last one logged and counted, which
+	// is not counted again if it is held back again. See health.go.
+	armed      map[string]time.Time
+	heldDue    map[string]time.Time
+	countedDue map[string]time.Time
 	// returned holds by container ID when the watcher brought the
 	// container back from a snapshot, until Docker reports its health
 	// again. See health.go.
@@ -693,6 +695,7 @@ func New(opts Options) (*Reconciler, error) {
 		hooksRunning:   map[backend.Source]string{},
 		armed:          map[string]time.Time{},
 		heldDue:        map[string]time.Time{},
+		countedDue:     map[string]time.Time{},
 		returned:       map[string]time.Time{},
 		expected:       map[string][]expectation{},
 		heldWaiters:    map[string][]string{},
@@ -868,7 +871,7 @@ func (r *Reconciler) schedule(ctx context.Context, p string, res passResult) {
 		r.queue.addAfter(p, r.eventDelay)
 	}
 
-	// The watcher's own schedule of a source with hooks.
+	// The watcher's own schedule of the source.
 	if !res.nextRun.IsZero() {
 		r.queue.addAfter(p, res.nextRun.Sub(r.now()))
 	}

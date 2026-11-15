@@ -154,7 +154,7 @@ var errNoChange = errors.New("no change")
 // for a source kopia server knows: it sets the description mark of a
 // source that has none, follows the snapshots the state lists as queued,
 // acts on those that ended, moves a snapshot with hooks on, runs the
-// watcher's own schedule of a source with hooks, takes the snapshot the
+// watcher's own schedule of a source on it, takes the snapshot the
 // events, the owners' states and that schedule ask for and, in a full
 // reconcile, describes the snapshots that have no description. Only a
 // failure to queue a snapshot or to work the schedule out fails the pass,
@@ -759,7 +759,7 @@ func (ps *pass) requests() []snapRequest {
 // retry, which no longer sees the change of the pause, asks again.
 //
 // The policy tells whether the source was paused, unless the watcher's own
-// schedule was in force: the policy of a source with hooks stays manual
+// schedule was in force: the policy of a source on it stays manual
 // while its owners run, and the schedule records the pause.
 func (ps *pass) unseenRequests(startAsked, stopAsked bool) []snapRequest {
 	// A source that goes on the watcher's schedule keeps a manual policy,
@@ -923,7 +923,7 @@ func (ps *pass) trigger(reqs []snapRequest, status *backend.SourceStatus) error 
 		}
 	}
 
-	if stop && hooked(ps.owners) {
+	if stop && ps.hasHooks() {
 		ps.log.Warn("taking the snapshot at the stop without hooks: hooks do not run around a snapshot at a stop", attrs...)
 	}
 

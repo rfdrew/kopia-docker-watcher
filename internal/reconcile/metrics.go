@@ -169,7 +169,7 @@ func (ps *pass) reportMetrics(err error) {
 		return
 	}
 
-	ps.metrics.Source(ps.path, SourceMetrics{Paused: ps.want.Paused, Owners: ownerNames(ps.owners), Hooks: ps.hooksReported(),
+	ps.metrics.Source(ps.path, SourceMetrics{Paused: ps.want.Paused, Owners: ownerNames(ps.owners), Hooks: ps.hasHooks(),
 		HealthGated: healthGated(ps.owners), Unhealthy: len(ps.unhealthy) > 0})
 	ps.noteSource(ps.path, ps.src, ps.want.Paused, ownerNames(ps.owners))
 
@@ -183,20 +183,33 @@ func (ps *pass) reportMetrics(err error) {
 	}
 }
 
-// hooksReported reports whether the source counts as one with hooks for
-// the metrics: an owner runs hooks, or stops or pauses around a snapshot.
-// A source that has lost its owners counts as its owners did when this
-// process last saw them; after a restart of the watcher, as one with hooks
-// while it stays on the watcher's schedule. A source on it only for the
-// require-healthy label has no hooks.
-func (ps *pass) hooksReported() bool {
+// noteHooks remembers whether the owners the pass sees have hooks, for a
+// later pass that sees none.
+func (ps *pass) noteHooks() {
+	if len(ps.owners) == 0 {
+		return
+	}
+
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
+	ps.hookedPaths[ps.path] = hooked(ps.owners)
+}
+
+// hasHooks reports whether the source counts as one with hooks, for the
+// metrics, the result of a manual trigger and the warning about a snapshot
+// at a stop: an owner runs hooks, or stops or pauses around a snapshot. A
+// source that has lost its owners counts as its owners did when this
+// process last saw them; after a restart of the watcher, as one with hooks
+// while it stays on the watcher's schedule. A source on it only for the
+// require-healthy label has no hooks.
+func (ps *pass) hasHooks() bool {
 	if len(ps.owners) > 0 {
-		ps.hookedPaths[ps.path] = hooked(ps.owners)
-		return ps.hookedPaths[ps.path]
+		return hooked(ps.owners)
 	}
+
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
 
 	if h, ok := ps.hookedPaths[ps.path]; ok {
 		return h && ps.want.OwnSchedule
@@ -274,6 +287,8 @@ func (ps *pass) forgetSource() {
 	ps.mu.Lock()
 	delete(ps.lastComplete, ps.path)
 	delete(ps.hookedPaths, ps.path)
+	delete(ps.heldDue, ps.path)
+	delete(ps.countedDue, ps.path)
 	ps.mu.Unlock()
 
 	ps.metrics.ForgetSource(ps.path)

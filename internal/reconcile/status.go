@@ -30,8 +30,9 @@ type SourceReport struct {
 	// Paused reports that the source is paused, as no owner runs.
 	Paused bool `json:"paused"`
 	// Schedule says who takes the scheduled snapshots: ScheduleKopia, or
-	// ScheduleWatcher for a source with hooks or downtime; empty when not
-	// known yet. NextSnapshot is when the next is due; zero if none is.
+	// ScheduleWatcher for a source with hooks, downtime or require-healthy;
+	// empty when not known yet. NextSnapshot is when the next is due; zero
+	// if none is.
 	Schedule     string    `json:"schedule,omitempty"`
 	NextSnapshot time.Time `json:"nextSnapshot,omitzero"`
 	// LastSuccess is the start of the last complete snapshot; zero if none

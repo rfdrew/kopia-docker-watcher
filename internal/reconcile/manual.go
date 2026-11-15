@@ -391,11 +391,12 @@ func (ps *pass) attachRun(reqs []snapRequest, id string) {
 		return
 	}
 
+	hooks := ps.hasHooks()
+
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
 	key := runKey{src: ps.src, id: id}
-	hooks := hooked(ps.owners)
 
 	for _, t := range ts {
 		ps.handled[t] = true

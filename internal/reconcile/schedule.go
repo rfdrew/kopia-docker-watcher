@@ -260,7 +260,7 @@ func (ps *pass) nextScheduled(after time.Time) (nextSchedule, error) {
 
 		ns.next = firstAfter(far.Times, after)
 		ps.warnOnce("clock "+ps.path, "kopia server's clock is behind the watcher's by more than the time between two "+
-			"scheduled snapshots; the watcher's schedule of sources with hooks follows the watcher's clock",
+			"scheduled snapshots; the watcher's own schedule follows the watcher's clock",
 			"source", ps.src.String(), "watcher_time", after.Format(timeFormat), "next_by_kopia", formatTime(preview.Times[0]))
 	}
 

@@ -172,7 +172,10 @@ func (ps *pass) checkHealth() error {
 		}
 	}
 
-	if len(ps.unhealthy) == 0 {
+	// A held time is judged again once no owner holds it back for its
+	// health or waits for its first check after a return, and an owner
+	// runs: while none does, the schedule is paused and nothing is taken.
+	if len(ps.unhealthy) == 0 && len(ps.returning) == 0 && !ps.want.Paused {
 		ps.endHeldDue()
 	}
 
@@ -258,7 +261,9 @@ func forced(reqs []snapRequest) bool {
 
 // holdDue keeps the scheduled time of the pass due while owners are not
 // healthy. It is no longer armed, so it counts as missed when they are
-// healthy again. A time is logged and counted once.
+// healthy again. A time is logged and counted once, also when it is held
+// back again after the hold ended: after the container stopped and started
+// again unhealthy, say.
 func (ps *pass) holdDue(attrs []any) {
 	if ps.due.IsZero() {
 		return
@@ -267,8 +272,9 @@ func (ps *pass) holdDue(attrs []any) {
 	ps.disarm()
 
 	ps.mu.Lock()
-	counted := ps.heldDue[ps.path].Equal(ps.due)
+	counted := ps.countedDue[ps.path].Equal(ps.due)
 	ps.heldDue[ps.path] = ps.due
+	ps.countedDue[ps.path] = ps.due
 	ps.mu.Unlock()
 
 	if counted {
@@ -281,7 +287,7 @@ func (ps *pass) holdDue(attrs []any) {
 }
 
 // endHeldDue forgets the scheduled time held back for unhealthy owners, and
-// says so, once they are healthy.
+// says so, once it is judged again.
 func (ps *pass) endHeldDue() {
 	ps.mu.Lock()
 	due, ok := ps.heldDue[ps.path]

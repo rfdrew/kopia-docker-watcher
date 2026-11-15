@@ -432,6 +432,7 @@ func (ps *pass) desire() bool {
 
 	ps.want.Paused = !anyRunning(ps.owners)
 	ps.want.OwnSchedule = hooked(ps.owners) || healthGated(ps.owners)
+	ps.noteHooks()
 
 	patch, err := commonPatch(policyOwners(ps.owners))
 	if err != nil {

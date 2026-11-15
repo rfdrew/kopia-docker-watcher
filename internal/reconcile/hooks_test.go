@@ -612,6 +612,35 @@ func TestHooksStopSnapshot(t *testing.T) {
 	}
 }
 
+// A container with hooks that is gone by the time of the pass, removed
+// right after its stop, still has its stop snapshot taken without hooks
+// with the warning: the pass sees no owner, but the last one it saw had
+// hooks.
+func TestHooksStopSnapshotOfRemovedContainer(t *testing.T) {
+	h := newHarness(t)
+	withClock(h)
+	withHooks(h)
+	id := h.engine.run("db", enable, pathLabel(app), noOnStart, onStop, preExec)
+
+	h.passAndSettle(app)
+
+	h.engine.setState(id, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+	h.r.HandleEvent(h.engine.remove(id))
+	h.passAndSettle(app)
+
+	h.mustTriggers(app, 1)
+	h.mustExecs()
+
+	if w := h.onlyWait(app); !w.Stop {
+		t.Fatalf("wait = %+v, want a stop", w)
+	}
+
+	if !h.logged("taking the snapshot at the stop without hooks") {
+		t.Fatalf("no warning:\n%s", h.logs)
+	}
+}
+
 // A stop that no event told of shows in the watcher's own pause of a
 // source with hooks, as it shows in the policy of one without.
 func TestHooksUnseenStop(t *testing.T) {

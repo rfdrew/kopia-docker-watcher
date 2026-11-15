@@ -179,29 +179,40 @@ func TestHealthStartDropped(t *testing.T) {
 }
 
 // A snapshot at a stop is taken whatever the health: Docker reports a
-// stopped container unhealthy.
+// stopped container unhealthy. The source has no hooks, so there is no
+// warning about them, also when the container is gone by the time of the
+// pass.
 func TestHealthStopSnapshot(t *testing.T) {
-	h := newHarness(t)
-	withClock(h)
-	withHooks(h)
-	id := h.runHealthy("db", docker.HealthHealthy, onStop)
+	for _, removed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "stopped", true: "removed"}[removed], func(t *testing.T) {
+			h := newHarness(t)
+			withClock(h)
+			withHooks(h)
+			id := h.runHealthy("db", docker.HealthHealthy, onStop)
 
-	h.passAndSettle(app)
+			h.passAndSettle(app)
 
-	h.engine.setHealth(id, docker.HealthUnhealthy)
-	h.engine.setState(id, docker.StateExited)
-	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
-	h.passAndSettle(app)
+			h.engine.setHealth(id, docker.HealthUnhealthy)
+			h.engine.setState(id, docker.StateExited)
+			h.r.HandleEvent(h.engine.event(docker.KindDied, id))
 
-	h.mustTriggers(app, 1)
-	h.mustSkips(app, 0)
+			if removed {
+				h.r.HandleEvent(h.engine.remove(id))
+			}
 
-	if w := h.onlyWait(app); !w.Stop {
-		t.Fatalf("wait = %+v, want a stop", w)
-	}
+			h.passAndSettle(app)
 
-	if h.logged("taking the snapshot at the stop without hooks") {
-		t.Fatalf("a warning about hooks for a source without them:\n%s", h.logs)
+			h.mustTriggers(app, 1)
+			h.mustSkips(app, 0)
+
+			if w := h.onlyWait(app); !w.Stop {
+				t.Fatalf("wait = %+v, want a stop", w)
+			}
+
+			if h.logged("taking the snapshot at the stop without hooks") {
+				t.Fatalf("a warning about hooks for a source without them:\n%s", h.logs)
+			}
+		})
 	}
 }
 
@@ -310,6 +321,136 @@ func TestHealthScheduleWhileStarting(t *testing.T) {
 
 	h.mustTriggers(app, 1)
 	h.mustNext(app, t0.Add(2*time.Hour))
+}
+
+// A scheduled time held back stays held, and is logged and counted once,
+// while the container stops and starts again still not healthy: the
+// schedule is paused meanwhile, and the time is judged once the container
+// is healthy.
+func TestHealthScheduleHeldAcrossStop(t *testing.T) {
+	h := newHarness(t)
+	c := withClock(h)
+	withHooks(h)
+	id := h.runHealthy("db", docker.HealthHealthy, noOnStart)
+
+	h.passAndSettle(app)
+
+	h.r.HandleEvent(h.engine.setHealth(id, docker.HealthUnhealthy))
+	h.passAndSettle(app)
+
+	c.add(time.Hour)
+	h.passAndSettle(app)
+	h.mustSkips(app, 1)
+
+	c.add(10 * time.Minute)
+	h.engine.setState(id, docker.StateExited)
+	h.r.HandleEvent(h.engine.event(docker.KindDied, id))
+	h.passAndSettle(app)
+
+	if h.logged("the scheduled snapshot is no longer held back") {
+		t.Fatalf("the hold ended at the stop:\n%s", h.logs)
+	}
+
+	c.add(10 * time.Minute)
+	h.engine.setHealth(id, docker.HealthStarting)
+	h.engine.setState(id, docker.StateRunning)
+	h.r.HandleEvent(h.engine.event(docker.KindStarted, id))
+	h.passAndSettle(app)
+
+	h.mustTriggers(app, 0)
+	h.mustSkips(app, 1)
+
+	if h.count("the scheduled snapshot is held back") != 1 {
+		t.Fatalf("hold not logged once:\n%s", h.logs)
+	}
+
+	c.add(time.Minute)
+	h.r.HandleEvent(h.engine.setHealth(id, docker.HealthHealthy))
+	h.passAndSettle(app)
+
+	if h.count("the scheduled snapshot is no longer held back") != 1 {
+		t.Fatalf("end of the hold not logged once:\n%s", h.logs)
+	}
+
+	if run := h.record(app).HookRun; run == nil || run.Reason != "missed schedule at "+t0.Add(time.Hour).Format(timeFormat) {
+		t.Fatalf("hook run %+v\nlog:\n%s", run, h.logs)
+	}
+
+	h.runHooked(app, 4)
+	h.mustTriggers(app, 1)
+	h.mustSkips(app, 1)
+}
+
+// A scheduled time held back is not counted again when it is held back
+// again after the watcher brought the container back from a snapshot of
+// another source and Docker sent no health event within returnHealthWait.
+// A pass while the watcher holds the container down ends the hold: the
+// container does not count then, and the time waits for it as for any
+// held container. Without such a pass, the hold goes on while the
+// container is back.
+func TestHealthScheduleHeldAcrossReturn(t *testing.T) {
+	for _, passHeld := range []bool{false, true} {
+		t.Run(map[bool]string{false: "no pass while held", true: "pass while held"}[passHeld], func(t *testing.T) {
+			h := newHarness(t)
+			c := withClock(h)
+			withHooks(h)
+			other := "/data/other"
+			id := h.engine.run("db", enable, pathLabel(app+","+other), requireHealthy, noOnStart, pauseDuring)
+			h.engine.setHealth(id, docker.HealthHealthy)
+
+			h.passAndSettle(app)
+			h.passAndSettle(other)
+
+			h.r.HandleEvent(h.engine.setHealth(id, docker.HealthUnhealthy))
+			h.passAndSettle(app)
+			h.passAndSettle(other)
+
+			c.add(time.Hour)
+			h.passAndSettle(other)
+			h.mustSkips(other, 1)
+
+			// A snapshot of the first source taken by hand with force
+			// pauses the container and brings it back; Docker still
+			// reports it unhealthy.
+			h.mustTrigger(app, true)
+			h.fake.HoldSnapshots(h.src(app))
+			h.passAndSettle(app)
+			h.mustPass(app)
+			h.mustActions("pause db")
+
+			if passHeld {
+				h.mustPass(other)
+				h.mustTriggers(other, 0)
+
+				if !h.logged("the scheduled snapshot is no longer held back") {
+					t.Fatalf("the hold did not end while the container was held:\n%s", h.logs)
+				}
+			}
+
+			h.fake.ReleaseSnapshots(h.src(app))
+			h.settle()
+			h.runHooked(app, 2)
+			h.mustActions("pause db", "unpause db")
+
+			h.passAndSettle(other)
+			h.mustTriggers(other, 0)
+
+			if !passHeld && h.logged("the scheduled snapshot is no longer held back") {
+				t.Fatalf("the hold ended while the container was back:\n%s", h.logs)
+			}
+
+			c.add(returnHealthWait)
+			h.passAndSettle(other)
+
+			h.mustTriggers(other, 0)
+			h.mustSkips(other, 1)
+			h.mustHealthMetrics(other, true, true)
+
+			if h.count("the scheduled snapshot is held back") != 1 {
+				t.Fatalf("hold not logged once:\n%s", h.logs)
+			}
+		})
+	}
 }
 
 // A manual trigger is declined while a container is not healthy, unless
