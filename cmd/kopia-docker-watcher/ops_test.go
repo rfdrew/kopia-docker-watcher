@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/mail"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/rfdrew/kopia-docker-watcher/internal/docker"
 	"github.com/rfdrew/kopia-docker-watcher/internal/health"
 	"github.com/rfdrew/kopia-docker-watcher/internal/kopiaclient"
+	"github.com/rfdrew/kopia-docker-watcher/internal/smtptest"
 )
 
 // get requests a path of the watcher's HTTP server; a status of 0 means it
@@ -158,12 +160,76 @@ func TestRunNotifies(t *testing.T) {
 	}
 
 	_, metrics := wr.get(t, "/metrics")
-	if !strings.Contains(metrics, "\nkopia_watcher_notifications_total{result=\"sent\"} 2\n") {
+	if !strings.Contains(metrics, "\nkopia_watcher_notifications_total{channel=\"webhook\",result=\"sent\"} 2\n") ||
+		strings.Contains(metrics, `channel="smtp"`) {
 		t.Errorf("metrics:\n%s", metrics)
 	}
 
 	if strings.Contains(wr.td.stderr.String(), "secret-token") {
 		t.Errorf("the log shows the token:\n%s", wr.td.stderr)
+	}
+
+	wr.cancel()
+
+	if code := wr.wait(t, 10*time.Second); code != 0 {
+		t.Fatalf("exit code = %d; log:\n%s", code, wr.td.stderr)
+	}
+}
+
+// With a webhook and SMTP, each channel gets the notification and counts
+// it; the log shows the SMTP server but not the password.
+func TestRunNotifiesByEmail(t *testing.T) {
+	a, b := appContainer(), appContainer()
+	b.ID, b.Name = "beef", "app-2"
+	b.Labels = map[string]string{"kopia.enable": "true", "kopia.path": "/srv/app", "kopia.schedule": "0 3 * * *"}
+
+	srv := &smtptest.Server{StartTLS: true, Auth: []string{"PLAIN"}, Username: "watcher", Password: "smtp-secret"}
+	hook := &hookRecorder{}
+
+	wr := startWatcher(t, newRunKopia(t), newWatchEngine(a, b), watcherOptions{
+		env: []string{
+			"NOTIFY_WEBHOOK_URL", "https://hooks.example.com/hook",
+			"NOTIFY_SMTP_HOST", smtptest.Hostname,
+			"NOTIFY_SMTP_USERNAME", "watcher",
+			"NOTIFY_SMTP_PASSWORD", "smtp-secret",
+			"NOTIFY_SMTP_FROM", "Backups <backups@example.com>",
+			"NOTIFY_SMTP_TO", "ops@example.com",
+		},
+		webhook: hook,
+		smtp:    srv,
+	})
+
+	waitFor(t, "the e-mail", func() bool { return len(srv.Mails()) == 1 })
+	waitFor(t, "the webhook", func() bool { return len(hook.events()) == 1 })
+
+	m := srv.Mails()[0]
+
+	msg, err := mail.ReadMessage(strings.NewReader(m.Data))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !m.TLS || m.Username != "watcher" || strings.Join(m.To, ",") != "ops@example.com" ||
+		msg.Header.Get("Subject") != "Backup labels cannot be applied: /srv/app" {
+		t.Errorf("mail = %+v", m)
+	}
+
+	waitFor(t, "the counts", func() bool {
+		_, metrics := wr.get(t, "/metrics")
+
+		return strings.Contains(metrics, "\nkopia_watcher_notifications_total{channel=\"smtp\",result=\"sent\"} 1\n") &&
+			strings.Contains(metrics, "\nkopia_watcher_notifications_total{channel=\"webhook\",result=\"sent\"} 1\n")
+	})
+
+	start := findLog(wr.td.stderr.String(), "starting kopia-docker-watcher")
+	cfg, _ := start["config"].(map[string]any)
+
+	if got, _ := json.Marshal(cfg["notify_smtp"]); string(got) != `{"host":"mail.example.com","port":587,"recipients":1,"tls":"starttls"}` {
+		t.Errorf("notify_smtp = %s", got)
+	}
+
+	if strings.Contains(wr.td.stderr.String(), "smtp-secret") {
+		t.Errorf("the log shows the password:\n%s", wr.td.stderr)
 	}
 
 	wr.cancel()

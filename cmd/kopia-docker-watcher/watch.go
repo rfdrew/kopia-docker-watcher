@@ -139,7 +139,7 @@ type watcher struct {
 	// health checks the components for /healthz; nil in a dry run.
 	health *health.Checker
 	// notifier sends the notifications; nil in a dry run and without
-	// NOTIFY_WEBHOOK_URL.
+	// NOTIFY_WEBHOOK_URL and NOTIFY_SMTP_HOST.
 	notifier *notify.Notifier
 	// control serves the control socket; nil in a dry run and when it
 	// cannot be served.
@@ -153,15 +153,8 @@ func (w *watcher) run(ctx context.Context) int {
 	w.health = health.New(health.Options{Interval: w.d.healthInterval, Logger: w.log},
 		componentDocker, componentKopia, componentReconcile)
 
-	if w.cfg.NotifyWebhookURL != "" {
-		n, err := notify.New(notify.Options{
-			URL:        w.cfg.NotifyWebhookURL,
-			Format:     w.cfg.NotifyWebhookFormat,
-			ErrorAfter: w.cfg.NotifyErrorAfter,
-			Transport:  w.d.webhookTransport,
-			Logger:     w.log,
-			Metrics:    w.metrics,
-		})
+	if opts, ok := w.notifyOptions(); ok {
+		n, err := notify.New(opts)
 		if err != nil {
 			w.log.Error("cannot set up the notifications", "error", err.Error())
 			return 1
@@ -250,6 +243,30 @@ func (w *watcher) run(ctx context.Context) int {
 	w.log.Info("stopped")
 
 	return code
+}
+
+// notifyOptions are the options of the notifier; false without a channel.
+func (w *watcher) notifyOptions() (notify.Options, bool) {
+	opts := notify.Options{ErrorAfter: w.cfg.NotifyErrorAfter, Logger: w.log, Metrics: w.metrics}
+
+	if w.cfg.NotifyWebhookURL != "" {
+		opts.Webhook = &notify.WebhookOptions{
+			URL:       w.cfg.NotifyWebhookURL,
+			Format:    w.cfg.NotifyWebhookFormat,
+			Transport: w.d.webhookTransport,
+		}
+	}
+
+	if s := w.cfg.NotifySMTP; s.Host != "" {
+		opts.SMTP = &notify.SMTPOptions{
+			Host: s.Host, Port: s.Port, TLS: s.TLS,
+			Username: s.Username, Password: s.Password,
+			From: s.From, To: s.To,
+			Dial: w.d.smtpDial, TLSConfig: w.d.smtpTLS,
+		}
+	}
+
+	return opts, opts.Webhook != nil || opts.SMTP != nil
 }
 
 // watch waits for kopia server, sets up the reconciler and runs it until

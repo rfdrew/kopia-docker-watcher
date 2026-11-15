@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log/slog"
@@ -55,8 +56,12 @@ type deps struct {
 	// of run and validate; nil means the default one.
 	kopiaTransport http.RoundTripper
 	// webhookTransport replaces the HTTP transport of the notifications of
-	// run; nil means the default one.
+	// run; nil means the default one. smtpDial replaces the connections of
+	// its e-mail and smtpTLS the base of their TLS configuration; nil means
+	// a net.Dialer and the system's roots.
 	webhookTransport http.RoundTripper
+	smtpDial         func(ctx context.Context, network, address string) (net.Conn, error)
+	smtpTLS          *tls.Config
 	// listenControl serves the control socket of run at a path; nil means
 	// control.Listen. dialControl connects list, trigger and restore to
 	// it; nil means control.DialUnix.

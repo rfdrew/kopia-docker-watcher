@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -21,9 +22,9 @@ import (
 
 const token = "123456:ABC-secret-token"
 
-// webhook is a fake webhook: it records the requests and answers with the
-// statuses the test queues, then 200.
-type webhook struct {
+// fakeHook is a fake webhook: it records the requests and answers with
+// the statuses the test queues, then 200.
+type fakeHook struct {
 	mu       sync.Mutex
 	requests []recorded
 	statuses []int
@@ -40,7 +41,7 @@ type recorded struct {
 	Body   []byte
 }
 
-func (w *webhook) RoundTrip(req *http.Request) (*http.Response, error) {
+func (w *fakeHook) RoundTrip(req *http.Request) (*http.Response, error) {
 	if w.block != nil {
 		select {
 		case <-w.block:
@@ -76,34 +77,54 @@ func (w *webhook) RoundTrip(req *http.Request) (*http.Response, error) {
 	return rec.Result(), nil
 }
 
-func (w *webhook) recorded() []recorded {
+func (w *fakeHook) recorded() []recorded {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	return append([]recorded(nil), w.requests...)
 }
 
+// counter is a fake Metrics.
 type counter struct {
-	mu sync.Mutex
-	n  map[Result]int
+	mu       sync.Mutex
+	channels []Channel
+	n        map[Channel]map[Result]int
 }
 
-func (c *counter) Notification(r Result) {
+func (c *counter) NotificationChannel(ch Channel) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.channels = append(c.channels, ch)
+}
+
+func (c *counter) Notification(ch Channel, r Result) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.n == nil {
-		c.n = map[Result]int{}
+		c.n = map[Channel]map[Result]int{}
 	}
 
-	c.n[r]++
+	if c.n[ch] == nil {
+		c.n[ch] = map[Result]int{}
+	}
+
+	c.n[ch][r]++
 }
 
-func (c *counter) get(r Result) int {
+func (c *counter) get(ch Channel, r Result) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return c.n[r]
+	return c.n[ch][r]
+}
+
+func (c *counter) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return fmt.Sprint(c.n)
 }
 
 type syncBuffer struct {
@@ -146,7 +167,7 @@ func (c *testClock) advance(d time.Duration) {
 
 type fixture struct {
 	n       *Notifier
-	hook    *webhook
+	hook    *fakeHook
 	metrics *counter
 	logs    *syncBuffer
 	clock   *testClock
@@ -156,19 +177,17 @@ func newFixture(t *testing.T, format, rawURL string, mod ...func(*Options)) *fix
 	t.Helper()
 
 	f := &fixture{
-		hook:    &webhook{},
+		hook:    &fakeHook{},
 		metrics: &counter{},
 		logs:    &syncBuffer{},
 		clock:   &testClock{now: time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)},
 	}
 
 	opts := Options{
-		URL:        rawURL,
-		Format:     format,
+		Webhook:    &WebhookOptions{URL: rawURL, Format: format, Transport: f.hook},
 		ErrorAfter: 15 * time.Minute,
 		Timeout:    time.Second,
 		RetryDelay: time.Millisecond,
-		Transport:  f.hook,
 		Logger:     slog.New(slog.NewTextHandler(f.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Metrics:    f.metrics,
 		Now:        f.clock.Now,
@@ -206,8 +225,16 @@ func (f *fixture) run(t *testing.T) {
 	})
 }
 
-// waitResults waits until the metrics count want of each result.
+// waitResults waits until the metrics count want of each result of the
+// webhook.
 func (f *fixture) waitResults(t *testing.T, want map[Result]int) {
+	t.Helper()
+	f.waitChannel(t, ChannelWebhook, want)
+}
+
+// waitChannel waits until the metrics count want of each result of a
+// channel.
+func (f *fixture) waitChannel(t *testing.T, ch Channel, want map[Result]int) {
 	t.Helper()
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -215,7 +242,7 @@ func (f *fixture) waitResults(t *testing.T, want map[Result]int) {
 	for {
 		ok := true
 		for r, n := range want {
-			ok = ok && f.metrics.get(r) == n
+			ok = ok && f.metrics.get(ch, r) == n
 		}
 
 		if ok {
@@ -223,20 +250,20 @@ func (f *fixture) waitResults(t *testing.T, want map[Result]int) {
 		}
 
 		if time.Now().After(deadline) {
-			t.Fatalf("results = %v, want %v\nlog:\n%s", f.metrics.n, want, f.logs)
+			t.Fatalf("%s results = %v, want %v\nlog:\n%s", ch, f.metrics, want, f.logs)
 		}
 
 		time.Sleep(time.Millisecond)
 	}
 }
 
-// queued takes the events waiting for the sender.
+// queued takes the events waiting for the sender of the first channel.
 func (f *fixture) queued() []Event {
 	var out []Event
 
 	for {
 		select {
-		case e := <-f.n.queue:
+		case e := <-f.n.outboxes[0].queue:
 			out = append(out, e)
 		default:
 			return out
@@ -620,7 +647,7 @@ func TestTokenNotLogged(t *testing.T) {
 		t.Errorf("the log lacks the error:\n%s", logs)
 	}
 
-	if _, err := New(Options{URL: "ftp://x/" + token}); err == nil || strings.Contains(err.Error(), token) {
+	if _, err := New(Options{Webhook: &WebhookOptions{URL: "ftp://x/" + token}}); err == nil || strings.Contains(err.Error(), token) {
 		t.Errorf("New: %v", err)
 	}
 }

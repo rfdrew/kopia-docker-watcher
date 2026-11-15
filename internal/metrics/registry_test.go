@@ -294,24 +294,45 @@ func TestReconcileError(t *testing.T) {
 	}
 }
 
-// Notifications count by result, each starting at zero.
+// Notifications count by channel and result. Only a channel that is set
+// up has series, each result starting at zero.
 func TestNotification(t *testing.T) {
 	m := New()
 
+	for s := range scrape(t, m) {
+		if strings.HasPrefix(s, "kopia_watcher_notifications_total") {
+			t.Errorf("a notification series without a channel set up: %s", s)
+		}
+	}
+
+	m.NotificationChannel(notify.ChannelSMTP)
+
 	assertSamples(t, scrape(t, m), map[string]float64{
-		`kopia_watcher_notifications_total{result="sent"}`:    0,
-		`kopia_watcher_notifications_total{result="failed"}`:  0,
-		`kopia_watcher_notifications_total{result="dropped"}`: 0,
+		`kopia_watcher_notifications_total{channel="smtp",result="sent"}`:    0,
+		`kopia_watcher_notifications_total{channel="smtp",result="failed"}`:  0,
+		`kopia_watcher_notifications_total{channel="smtp",result="dropped"}`: 0,
 	})
 
-	m.Notification(notify.ResultSent)
-	m.Notification(notify.ResultSent)
-	m.Notification(notify.ResultFailed)
+	m.Notification(notify.ChannelSMTP, notify.ResultSent)
+	m.Notification(notify.ChannelSMTP, notify.ResultSent)
+	m.Notification(notify.ChannelSMTP, notify.ResultFailed)
+
+	got := scrape(t, m)
+	assertSamples(t, got, map[string]float64{
+		`kopia_watcher_notifications_total{channel="smtp",result="sent"}`:    2,
+		`kopia_watcher_notifications_total{channel="smtp",result="failed"}`:  1,
+		`kopia_watcher_notifications_total{channel="smtp",result="dropped"}`: 0,
+	})
+	assertAbsent(t, got, `kopia_watcher_notifications_total{channel="webhook",result="sent"}`)
+
+	m.NotificationChannel(notify.ChannelWebhook)
+	m.Notification(notify.ChannelWebhook, notify.ResultDropped)
 
 	assertSamples(t, scrape(t, m), map[string]float64{
-		`kopia_watcher_notifications_total{result="sent"}`:    2,
-		`kopia_watcher_notifications_total{result="failed"}`:  1,
-		`kopia_watcher_notifications_total{result="dropped"}`: 0,
+		`kopia_watcher_notifications_total{channel="webhook",result="sent"}`:    0,
+		`kopia_watcher_notifications_total{channel="webhook",result="failed"}`:  0,
+		`kopia_watcher_notifications_total{channel="webhook",result="dropped"}`: 1,
+		`kopia_watcher_notifications_total{channel="smtp",result="sent"}`:       2,
 	})
 }
 

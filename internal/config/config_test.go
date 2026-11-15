@@ -468,7 +468,7 @@ func TestNotifyDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := "NOTIFY_WEBHOOK_FORMAT is set but NOTIFY_WEBHOOK_URL is not: no notifications are sent"
+	want := "NOTIFY_WEBHOOK_FORMAT is set but NOTIFY_WEBHOOK_URL is not: no notifications are posted to a webhook"
 	if !slices.Contains(cfg.Warnings, want) {
 		t.Errorf("Warnings = %q, want %q among them", cfg.Warnings, want)
 	}
@@ -510,6 +510,152 @@ func TestNotifyErrors(t *testing.T) {
 
 	if cfg.NotifyWebhookFormat != WebhookTelegram {
 		t.Errorf("format = %q", cfg.NotifyWebhookFormat)
+	}
+}
+
+// smtpEnv is a valid e-mail configuration followed by extra pairs.
+func smtpEnv(extra ...string) func(string) string {
+	return base(append([]string{
+		EnvNotifySMTPHost, "mail.example.com",
+		EnvNotifySMTPUsername, "watcher@example.com",
+		EnvNotifySMTPPassword, " smtp-secret ",
+		EnvNotifySMTPFrom, `"Kopia Backups" <backups@example.com>`,
+		EnvNotifySMTPTo, "ops@example.com, On call <oncall@example.com>",
+	}, extra...)...)
+}
+
+func TestSMTP(t *testing.T) {
+	cfg, err := Load(smtpEnv(EnvNotifyWebhookURL, "https://ntfy.example.com/backups"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := cfg.NotifySMTP
+	if s.Host != "mail.example.com" || s.Port != 587 || s.TLS != SMTPStartTLS || s.Username != "watcher@example.com" ||
+		s.Password != " smtp-secret " {
+		t.Errorf("SMTP = %+v", s)
+	}
+
+	if s.From.Name != "Kopia Backups" || s.From.Address != "backups@example.com" || len(s.To) != 2 ||
+		s.To[0].Address != "ops@example.com" || s.To[1].Name != "On call" || s.To[1].Address != "oncall@example.com" {
+		t.Errorf("From = %v, To = %v", s.From, s.To)
+	}
+
+	// The webhook stays on next to it.
+	if cfg.NotifyWebhookURL == "" || len(cfg.Warnings) != 0 {
+		t.Errorf("webhook %q, warnings %q", cfg.NotifyWebhookURL, cfg.Warnings)
+	}
+
+	// Only the server, the TLS mode and the number of recipients are
+	// logged.
+	var buf bytes.Buffer
+
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", "config", cfg)
+
+	out := buf.String()
+	if want := `"notify_smtp":{"host":"mail.example.com","port":587,"tls":"starttls","recipients":2}`; !strings.Contains(out, want) {
+		t.Errorf("log output lacks %s: %s", want, out)
+	}
+
+	for _, secret := range []string{"smtp-secret", "watcher@example.com", "backups@example.com", "ops@example.com"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("log output shows %q: %s", secret, out)
+		}
+	}
+
+	// Implicit TLS defaults to its port; an IPv6 address loses its
+	// brackets.
+	cfg, err = Load(smtpEnv(EnvNotifySMTPTLS, "TLS", EnvNotifySMTPHost, "[2001:db8::25]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if s := cfg.NotifySMTP; s.TLS != SMTPTLS || s.Port != 465 || s.Host != "2001:db8::25" {
+		t.Errorf("SMTP = %+v", s)
+	}
+
+	// A relay without a login, and a login without TLS on localhost.
+	for _, e := range []func(string) string{
+		base(EnvNotifySMTPHost, "postfix", EnvNotifySMTPPort, "25", EnvNotifySMTPTLS, "none",
+			EnvNotifySMTPFrom, "backups@example.com", EnvNotifySMTPTo, "ops@example.com"),
+		smtpEnv(EnvNotifySMTPHost, "localhost", EnvNotifySMTPTLS, "none"),
+	} {
+		cfg, err := Load(e)
+		if err != nil || cfg.NotifySMTP.TLS != SMTPNoTLS {
+			t.Errorf("Load = %+v, %v", cfg, err)
+		}
+	}
+
+	// No SMTP: nothing logged, and variables without the host warn.
+	cfg, err = Load(base(EnvNotifySMTPTo, "ops@example.com", EnvNotifySMTPPassword, "smtp-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "NOTIFY_SMTP_PASSWORD, NOTIFY_SMTP_TO set without NOTIFY_SMTP_HOST: no e-mail is sent"
+	if cfg.NotifySMTP.Host != "" || !slices.Contains(cfg.Warnings, want) {
+		t.Errorf("SMTP = %+v, warnings %q", cfg.NotifySMTP, cfg.Warnings)
+	}
+
+	buf.Reset()
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", "config", cfg)
+
+	if strings.Contains(buf.String(), "notify_smtp") || strings.Contains(buf.String(), "smtp-secret") {
+		t.Errorf("log output: %s", buf.String())
+	}
+}
+
+func TestSMTPWarnings(t *testing.T) {
+	for _, tc := range []struct {
+		env  []string
+		want string
+	}{
+		{[]string{EnvNotifySMTPPort, "465"}, "NOTIFY_SMTP_PORT is 465, the port of implicit TLS, but NOTIFY_SMTP_TLS is starttls"},
+		{[]string{EnvNotifySMTPTLS, "tls", EnvNotifySMTPPort, "587"}, "NOTIFY_SMTP_TLS is tls, but port 587 usually starts in plain text"},
+	} {
+		cfg, err := Load(smtpEnv(tc.env...))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(cfg.Warnings) != 1 || !strings.HasPrefix(cfg.Warnings[0], tc.want) {
+			t.Errorf("Warnings = %q, want %q", cfg.Warnings, tc.want)
+		}
+	}
+}
+
+func TestSMTPErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  func(string) string
+		want string
+	}{
+		{"URL", smtpEnv(EnvNotifySMTPHost, "smtps://watcher:smtp-secret@mail.example.com:465"), "NOTIFY_SMTP_HOST: a URL is not a host name"},
+		{"login in the host", smtpEnv(EnvNotifySMTPHost, "watcher:smtp-secret@mail.example.com"), "NOTIFY_SMTP_HOST: a login does not belong"},
+		{"port in the host", smtpEnv(EnvNotifySMTPHost, "mail.example.com:587"), "NOTIFY_SMTP_HOST: a port does not belong in the host name; set it in NOTIFY_SMTP_PORT"},
+		{"bad host", smtpEnv(EnvNotifySMTPHost, "mail example"), "NOTIFY_SMTP_HOST: \"mail example\" is not a host name"},
+		{"bad port", smtpEnv(EnvNotifySMTPPort, "smtp"), "NOTIFY_SMTP_PORT: invalid port"},
+		{"port out of range", smtpEnv(EnvNotifySMTPPort, "70000"), "NOTIFY_SMTP_PORT: invalid port"},
+		{"unknown TLS mode", smtpEnv(EnvNotifySMTPTLS, "ssl"), "NOTIFY_SMTP_TLS: unknown mode \"ssl\", use starttls, tls, none"},
+		{"username without password", smtpEnv(EnvNotifySMTPPassword, ""), "NOTIFY_SMTP_USERNAME is set but NOTIFY_SMTP_PASSWORD is empty"},
+		{"password without username", smtpEnv(EnvNotifySMTPUsername, ""), "NOTIFY_SMTP_PASSWORD is set but NOTIFY_SMTP_USERNAME is empty"},
+		{"login without TLS", smtpEnv(EnvNotifySMTPTLS, "none"), "would send the password unencrypted"},
+		{"no sender", smtpEnv(EnvNotifySMTPFrom, ""), "NOTIFY_SMTP_FROM is required with NOTIFY_SMTP_HOST"},
+		{"bad sender", smtpEnv(EnvNotifySMTPFrom, "backups"), "NOTIFY_SMTP_FROM: \"backups\" is not an e-mail address"},
+		{"two senders", smtpEnv(EnvNotifySMTPFrom, "a@example.com, b@example.com"), "NOTIFY_SMTP_FROM"},
+		{"no recipient", smtpEnv(EnvNotifySMTPTo, ""), "NOTIFY_SMTP_TO is required with NOTIFY_SMTP_HOST"},
+		{"bad recipients", smtpEnv(EnvNotifySMTPTo, "a@example.com b@example.com"), "NOTIFY_SMTP_TO: \"a@example.com b@example.com\" is not a list"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(tc.env)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+
+			if strings.Contains(err.Error(), "smtp-secret") {
+				t.Errorf("the error shows the password: %v", err)
+			}
+		})
 	}
 }
 
