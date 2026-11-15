@@ -478,8 +478,8 @@ kopia.time-of-day: "02:30,14:00"
 server was down. Written to `scheduling.runMissed`. kopia's default is `true`.
 
 As in kopia server, a missed run is taken only when the next scheduled time is more than 30 minutes away, and an
-interval takes a missed run anyway. The watcher's own schedule of a source with [hooks](#hooks) follows the same
-rules for the times it missed.
+interval takes a missed run anyway. [The watcher's own schedule](#the-watchers-schedule) of a source with hooks,
+stop or pause labels or `kopia.require-healthy` follows the same rules for the times it missed.
 
 ### Schedule, pause and checks
 
@@ -930,7 +930,14 @@ checks in a row have failed; failures within `start_period` do not count.
   began. Once it is back, Docker reports it `starting` or `unhealthy` until its next check. The snapshots of its
   sources wait for that check, as they waited while it was down, for 5 minutes at most: a scheduled time is then
   taken on time once the container is healthy. When Docker reports no new health within 5 minutes, the status
-  counts as it is.
+  counts as it is. The watcher remembers the containers it brought back in memory only. When it restarts before
+  their next check (the `interval` of the health check, 30 seconds by default), for example right after it brought
+  back the containers it held down as it stopped, the new process takes the status Docker still reports for the
+  container's own. For a container that was paused, that is `unhealthy`: a snapshot at the start of the watcher
+  ([`SNAPSHOT_ON_WATCHER_START`](configuration.md#snapshot_on_watcher_start)) is not taken, and a scheduled time in
+  that window is held back and then counts as a missed one; both are counted in
+  `kopia_watcher_unhealthy_skips_total`. A container that was stopped is `starting`, and the snapshots wait for its
+  check.
 - **Several containers.** When containers share a path, every running one with the label must be healthy.
   Stopped containers, and those without the label, do not count.
 - **No health check.** A container without one has no health status, and the label holds back none of its

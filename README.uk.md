@@ -20,7 +20,7 @@ kopia-docker-watcher керує резервним копіюванням [Kopia
  (start, die, destroy, …)       one reconcile pass per path              sources/upload, snapshots/edit
  container list    ◀──────────  full reconcile every RECONCILE_INTERVAL  snapshots/delete, policy/resolve
  exec (hooks)      ◀──────────  STATE_FILE: what was applied, owners,
-                                the schedule of sources with hooks
+                                the watcher's own schedules
 ```
 
 - Watcher спілкується з kopia server лише через його HTTP API — той самий, яким користується вебінтерфейс Kopia.
