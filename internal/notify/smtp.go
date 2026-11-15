@@ -174,7 +174,15 @@ func (s *smtpSender) deliver(ctx context.Context, msg []byte) error {
 	if s.opts.TLS == config.SMTPTLS {
 		tc := tls.Client(conn, s.tls)
 		if err := tc.HandshakeContext(ctx); err != nil {
-			return fmt.Errorf("TLS handshake (does the server start in plain text and offer STARTTLS?): %w", err)
+			// Bytes that are not TLS, such as a greeting in plain text, point
+			// at the mode; any other failure, such as a certificate that
+			// does not verify, is about TLS itself.
+			var re tls.RecordHeaderError
+			if errors.As(err, &re) {
+				return fmt.Errorf("TLS handshake (does the server start in plain text and offer STARTTLS?): %w", err)
+			}
+
+			return fmt.Errorf("TLS handshake: %w", err)
 		}
 
 		conn = tc

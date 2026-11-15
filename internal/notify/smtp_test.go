@@ -237,6 +237,8 @@ func TestSMTPPermanentFailures(t *testing.T) {
 		srv  *smtptest.Server
 		mod  func(*SMTPOptions)
 		want string
+		// notWant must not be in the log.
+		notWant string
 	}{
 		{
 			name: "no STARTTLS",
@@ -279,6 +281,16 @@ func TestSMTPPermanentFailures(t *testing.T) {
 			want: "STARTTLS: tls: failed to verify certificate",
 		},
 		{
+			name: "untrusted certificate with TLS from the start",
+			srv:  &smtptest.Server{ImplicitTLS: true, Auth: []string{"PLAIN"}, Username: "watcher", Password: smtpPassword},
+			mod: func(o *SMTPOptions) {
+				o.TLS = config.SMTPTLS
+				o.TLSConfig = &tls.Config{RootCAs: x509.NewCertPool(), MinVersion: tls.VersionTLS12}
+			},
+			want:    "TLS handshake: tls: failed to verify certificate",
+			notWant: "offer STARTTLS?",
+		},
+		{
 			name: "TLS to a server in plain text",
 			srv:  smtpServer(),
 			mod:  func(o *SMTPOptions) { o.TLS = config.SMTPTLS },
@@ -308,6 +320,10 @@ func TestSMTPPermanentFailures(t *testing.T) {
 			logs := f.logs.String()
 			if !strings.Contains(logs, tc.want) || !strings.Contains(logs, "smtp=mail.example.com:") {
 				t.Errorf("the log lacks %q:\n%s", tc.want, logs)
+			}
+
+			if tc.notWant != "" && strings.Contains(logs, tc.notWant) {
+				t.Errorf("the log shows %q:\n%s", tc.notWant, logs)
 			}
 
 			if strings.Contains(logs, smtpPassword) {
